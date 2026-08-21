@@ -1,16 +1,21 @@
 # Windows / Linux port — state and remaining work
 
-Branch: `testing/windows_linux`. Four commits on top of `main`:
+Branch: `testing/windows_linux`.
 
-```
-45cf570  fix: GGUF inference on Windows -- zero-layer KV shell, host-aware model ids
-99ff538  docs: windows-plan.md
-9f5566f  feat: GGUF-only Windows build (llama.cpp + CUDA), MLX gated out
-f947fb5  build: cross-platform toolchain fetch (Windows/Linux hosts)
-```
+**§3 is what is left. §6 is the traps** — none of them are guessable. §6.9–§6.12
+came out of serving real traffic and running the shell suite; §6.13–§6.14 came
+out of building on a second host. Read §6 before touching anything; read §3 to
+pick up work.
 
-Read this whole file before touching anything. The traps in **§6** are the ones
-that cost the most time the first time round, and none of them are guessable.
+| | |
+|---|---|
+| §3.1 WSL packages | **blocked on the user** — one apt line, unblocks §3.2 + §3.3 |
+| §3.2 Linux build | script written, refusals verified; **build never run** |
+| §3.3 LAN transport | not started; interop contract **verified against a live Mac** |
+| §3.4 Vision (mtmd) | not started |
+| §3.5 Spec decode | not started |
+| §3.6 CI | windows job added, **never run on a runner** |
+| §7 macOS | **never compiled since this branch** — merge gate |
 
 ---
 
@@ -33,224 +38,181 @@ can build the portable configuration with `-Dgguf-only` to check it.
 
 ---
 
-## 2. Verified working today
+## 2. Verified working today (Windows)
 
-`zig build` and `zig build test` both pass on Windows. **910 tests pass, 18
-skipped, 0 fail.**
+`zig build` and `zig build test` both pass. **920 tests pass, 15 skipped, 0
+fail** with `LLAMA_TEST_MODEL` + `LLAMA_TEST_EMBED_MODEL` pointed at real GGUFs
+(915/20 with neither set). CUDA is live end to end (RTX 5060 Ti, sm_120).
 
-```
-$ mlx-serve.exe --version
-mlx-serve 26.8.10
-mlx unknown                       <- honestly absent
-nax unavailable (built without MLX)
-ggml 0.20.1 (60eeeb608)
-llama.cpp b10472
+Exercised against real models, non-streaming and streaming:
 
-$ mlx-serve.exe --serve --host 127.0.0.1 --port 18093
-$ curl /health     -> {"status":"ok"}
-$ curl /v1/models  -> {"object":"list","data":[]}
-$ curl /v1/nope    -> 404                       (route-existence rule intact)
-$ curl /props      -> available_bytes: 16022376448
-```
+- `/v1/chat/completions` — tool calling, `continue_final_message`,
+  `json_schema` grammar mode, 4-way concurrency, mid-stream cancellation
+- `/v1/messages` (Anthropic / Claude Code) — SSE lifecycle + `tool_use` blocks
+- `/v1/responses` — including the WebSocket upgrade and its error turns
+- `/v1/completions`, `/api/chat`, `/api/generate`, `/api/tags`
+- `/v1/embeddings` — GGUF embedders serve it; `tests/test_embeddings.sh` 10/10
+  against nomic-embed
+- shell suite: **54 pass / 88 skip / 11 fail** of 166 (`tests/run.sh <script>`);
+  all 11 are missing prerequisites that fail the same on a Mac
 
-CUDA is live end to end — a test binary linked against the staged `llama.dll`
-reported `ggml_cuda_init: found 1 CUDA devices … RTX 5060 Ti, compute
-capability 12.0`. The prebuilt binary covers sm_120 (Blackwell).
+Five real bugs were found this way, every one of which produced **plausible
+output rather than an error** — the lessons are §6.8–§6.10:
 
-**Inference works.** Verified against `Qwen3.8-27B-UD-IQ3_XXS` (11.9 GB IQ3_XXS)
-on an RTX 5060 Ti:
+| Bug | Symptom |
+|---|---|
+| Discarded `llama_memory_seq_rm` refusal | repeat requests echoed the prompt, then returned empty; multi-turn broken on every hybrid checkpoint (Qwen3.5/3.8) |
+| `startsWith(id, "/")` as "is absolute" | register-by-path unreachable on Windows |
+| `homeDir` ignored `HOME` | six test scripts read and WROTE the real `~/.mlx-serve` |
+| `n_ctx_train` never asked | a 2048-window embedder accepted 8192-token inputs |
+| pooling type never asked | an embedding model advertised `chat` and answered with garbage |
 
-- non-streaming completion returns the right text, with sane usage + timings
-- SSE streaming emits the correct chunk lifecycle
-- tool calling returns a well-formed `tool_call`, valid JSON arguments,
-  `finish_reason: "tool_calls"`
+Plus `fetch-zig.sh` was downloading `zig.tar` and extracting `zig.tar.xz`, so
+**macOS and Linux could not stage a toolchain at all** since commit `f947fb5`.
+Windows was unaffected by luck (`zig.zip` matched). Fixed; guarded by
+`tests/test_toolchain_fetch.sh`.
 
-Two bugs stood between "model loaded" and "token produced", both found by
-serving a real model and reading the response rather than the code — see §6.8.
-Expect more of the same shape: things that compile and load but have never
-executed on this host.
+Two embedding contracts worth not re-breaking: results are **L2-normalized**
+(the MLX encoder normalizes, and `dimensions` truncates-then-renormalizes
+assuming unit input), and **encoder-only is detected from the declared pooling
+type**, not `llama_model_has_encoder` — llama.cpp reserves that for T5-style
+encoder-decoders and answers false for every BERT-family embedder.
 
 ---
 
-## 3. Remaining work, in priority order
+## 3. What is left
 
-### 3.1 Widen the surface that has actually run  <- DO THIS FIRST
+### 3.1 Install the WSL packages — blocks §3.2 and §3.3
 
-chat/completions (streaming and not) and tool calling are proven. Everything
-else on the HTTP surface has never executed on Windows. In rough value order:
-
-- `/v1/messages` (Anthropic -- this is what Claude Code speaks)
-- `/api/chat`, `/api/generate`, `/api/tags` (Ollama)
-- `/v1/responses` (+ its WebSocket upgrade -- `ws.zig` is untested here)
-- `/v1/completions`, `continue_final_message`, JSON-schema / grammar mode
-- multi-turn with the prefix cache, concurrent requests, cancellation mid-stream
+One line, needs a password so it cannot be automated:
 
 ```bash
-./zig-out/bin/mlx-serve.exe --model <abs .gguf> --serve --host 127.0.0.1 --port 8080
-curl -s http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' \
-  -d '{"model":"<id>","messages":[{"role":"user","content":"hi"}],"stream":false}'
+wsl.exe -d Ubuntu -- sudo apt-get update && \
+wsl.exe -d Ubuntu -- sudo apt-get install -y cmake g++ pkg-config \
+    libavahi-compat-libdnssd-dev avahi-daemon
 ```
 
-Expect trouble in the **connection lifecycle** rather than in llama.cpp -- see
-6.2, the accept loop does not behave the way it does on POSIX. Cancellation is
-the one to watch: it runs through `peerClosed`, which is rewritten on this host.
+Already prepared and waiting on it:
 
-`n_gpu_layers` defaults to 999 (`arch/llama.zig` `OpenOptions`), so offload
-should be automatic -- confirm it in the log rather than assuming.
+- `~/mlx-serve-linux` — a separate Linux clone with the branch's working tree
+  applied, and Zig staged and working. Separate on purpose: see §6.14.
+- `tests/probe_avahi_dnssd.c` — the Avahi probe (§3.3), never compiled.
 
+WSL2 Ubuntu 26.04 here has systemd and dbus, so avahi-daemon can actually run.
 
-### 3.2 Run the shell integration suite
+### 3.2 Linux
 
-166 scripts in `tests/`, none of which have been run on Windows. They are bash,
-so Git Bash should carry most of them, but they assume POSIX tools and paths.
-Start with the ones that do not need MLX models:
+`scripts/build-llama-cuda.sh` exists and both its refusal paths are verified
+(wrong host, missing cmake — each exits 1 and names the fix). **The build
+itself has never run**, so the compile, the staging layout and the Zig-side
+Linux link are all UNVERIFIED — `build.zig`'s `else` arm gained
+`linkSystemLibrary("ggml")` + `("ggml-base")` and that line has never been fed
+to a linker.
 
-```
-tests/test_index_page.sh          tests/test_route_404_no_load.sh
-tests/test_models_capabilities.sh tests/test_model_rescan.sh
-tests/test_multi_model_dir.sh     tests/test_loop_stop_signal.sh
-```
+With cmake + g++ (§3.1) a CPU-only llama.cpp build into a scratch dir is enough
+to compile-check the Zig side. A real CUDA build needs the toolkit (~4 GB).
 
-Triage each into: passes / needs a portable fix / genuinely macOS-only (gate it
-by name, do not delete).
+Then: `status_linux.zig` does not exist. It cannot be a zero-returning stub —
+those numbers feed the model-load admission gate and the auto-context sizer
+(§6.3). The NVML code in `status_windows.zig` ports nearly verbatim; only
+`LoadLibraryA` becomes `dlopen`.
 
-### 3.3 Linux
+### 3.3 LAN sharing — transport only, the contract is settled
 
-**Upstream publishes no prebuilt Linux CUDA binary** — only cpu, vulkan, sycl
-and openvino. `scripts/fetch-llama.sh` already refuses Linux **by name** and
-points at `scripts/build-llama-cuda.sh`, which does not exist yet. Write it:
-fetch the source at `LLAMA_TAG`, `cmake -DGGML_CUDA=ON`, stage
-`lib/llama/lib/libllama.so` + headers to match the layout `verifyLlamaStage`
-expects.
+`--lan-share` / `--lan-discover` are no-ops off Apple and say so at boot.
+`lan_transport_stub.zig` is unchanged: `sharing()` false, `lookupRemote()`
+`.peer_unknown`.
 
-Then the code side, which should be small — `build.zig` already has the `else`
-arm with `$ORIGIN` rpaths, and `status.zig` needs a `status_linux.zig` sibling
-(`/proc/meminfo`, `/proc/stat`, NVML — the NVML code in `status_windows.zig`
-ports almost verbatim, only `LoadLibraryA` becomes `dlopen`).
+**Verified 2026-08-21 against a live macOS mlx-serve (main, `--lan-share` on),
+from this Windows box.** This settles the design questions before any code:
 
-Do NOT quietly fall back to the cpu tarball. A build that reports CUDA support
-it does not have is worse than one that refuses.
+1. **Apple's `dnssd.dll` is not needed.** `tests/probe_mdns_browse.py` — plain
+   UDP multicast, no Bonjour, no zeroconf — queried `_mlxserve._tcp.local` and
+   got the whole record set back. That is a working miniature of zig-ai's
+   `mdns.zig`.
+2. **`lan_policy.txtBuild` is byte-correct against a real peer:**
+   `03 "v=1"  12 "t=053c24c3f2a2ec00"` — exactly `buf[0]=3`, `"v=1"`,
+   `buf[4]=2+token.len`, `"t="`, token.
+3. **The keyless gate already agrees across hosts.** `routeClass` × `SharedSet`
+   lives in the portable `lan_policy.zig` and already runs on Windows. The
+   Mac's peer-facing surface answers exactly what the source says: `/health`,
+   `/v1/models`, `/api/version` → 200; `/props`, `/metrics`,
+   `/v1/models/rescan` → **403**; `POST /v1/chat/completions` served. The
+   security half is done and cross-checked, not remaining work.
 
-While here: Linux may also get LAN discovery nearly free via
-`avahi-compat-libdns_sd`, which exposes the identical `DNSService*` API our
-`lan_bonjour.zig` already calls. Unverified — see §3.5.
+So what is left is the **transport only**: advertise, browse, resolve, proxy
+tunnel. Two routes, in this order:
 
-### 3.4 Claw back the three features the user asked for
+1. **Linux may be nearly free** — `avahi-compat-libdns_sd` exposes the
+   *identical* `DNSService*` C API, so `lan_bonjour.zig`'s FFI block may link
+   unmodified. Prove it with `tests/probe_avahi_dnssd.c` (needs §3.1): it
+   registers our real `SERVICE_TYPE` with a real TXT record, browses, resolves,
+   and checks the TXT comes back **byte-identical**. Linking only proves the
+   ABI exists; the two things that would silently sink the shortcut are
+   `DNSServiceRefSockFD` (our whole event loop is a pollable fd — a stub
+   returning −1 links fine and never delivers a callback) and the TXT
+   round-trip (the self-token that makes proxy loops impossible rides in it).
+2. **Windows needs the hand-rolled module** — port `../zig-ai`'s
+   `src/server/mdns.zig` (970 lines, 8 tests) + `rawsock.zig` (641, 6). Read
+   `../zig-ai/bonjour.md` first: it is a port plan of OUR `lan.zig` written
+   against our line numbers. zig-ai copied our pure layer verbatim, so
+   `lan_policy.zig` is the shared spec and **must not drift** — any change to
+   the id form, TXT format or `X-MLX-*` headers breaks interop with zig-ai and
+   with macOS. Change it in both or neither.
 
-The shim (`lib/llama_shim/llama_shim.h`, 25 functions) exposes text generation
-only. llama.cpp offers more, and `mtmd.dll` already ships beside `llama.dll` in
-the staged set:
+Already-paid-for knowledge to carry across:
 
-- **Embeddings** — keeps `/v1/embeddings` alive on GGUF embedding models.
-  Smallest of the three. `gen_stub.computeEmbeddingsBatch` currently refuses by
-  name; that is the seam.
-- **Vision via mtmd** — `mtmd.h` and `mtmd-helper.h` are already staged in
-  `lib/llama/include`. Note mtmd does its OWN preprocessing, so it does not go
-  through `qwen_vision`/`muse_vision`/`lfm2_vision` and does not resurrect
-  `vision_stub.zig`.
-- **Draft-model speculative decode** — llama.cpp has its own. Partly recovers
-  what was lost with MTP/DFlash. Needs shim work plus scheduler wiring; do it
-  last, and measure before claiming anything (`/bench` skill rules apply).
-
-### 3.5 LAN sharing / Bonjour discovery — port it, do not rewrite it
-
-`--lan-share` / `--lan-discover` are currently no-ops off Apple
-(`lan_transport_stub.zig`). **There is a working implementation to draw on:
-`../zig-ai`**, which is explicitly a proof of concept of mlx-serve on
-Windows/Linux and already did this job.
-
-Read `../zig-ai/bonjour.md` first — it is a port plan of OUR `lan.zig`, written
-against our line numbers, and it settles most of the design questions.
-
-What is there:
-
-| File | Lines | Tests | What it is |
-|---|---|---|---|
-| `src/server/mdns.zig` | 970 | 8 | Hand-rolled mDNS (RFC 6762) responder + browser, pure Zig, zero deps |
-| `src/server/rawsock.zig` | 641 | 6 | The socket layer under it |
-| `src/server/lan.zig` | 1446 | 18 | A direct port of our `lan.zig` |
-
-Its tests include a real two-responder local discovery test, and the module is
-wired into that server (`api.zig`, `auth.zig`) rather than sitting standalone.
-I have not seen it run across a real LAN, so treat "works" as "has tests and is
-integrated", not "field-proven".
-
-**The shape of our side is already right.** The `lan.zig` split done for this
-port left exactly a transport-shaped hole:
-
-```
-lan_policy.zig          portable, shared    <- ALREADY the interop spec
-lan_bonjour.zig         Apple dns_sd
-lan_transport_stub.zig  no-op               <- replace this
-```
-
-zig-ai copied our pure layer verbatim: same `SERVICE_TYPE = "_mlxserve._tcp"`,
-byte-identical `txtBuild`. So `lan_policy.zig` is already the shared spec and
-must not drift — **any change to the id form, TXT format or `X-MLX-*` headers
-breaks interop with zig-ai and with macOS mlx-serve.** Change it in both or
-neither.
-
-Two routes, and bonjour.md argues for doing them in this order:
-
-1. **Linux may be nearly free.** `avahi-compat-libdns_sd` exposes the *identical*
-   `DNSService*` C API, so `lan_bonjour.zig`'s FFI block may link unmodified
-   (`libdns_sd.so.1`, Debian `libavahi-compat-libdnssd1-dev`). bonjour.md flags
-   this as **UNVERIFIED** and says to prove it with a ~20-line program against
-   the seven entry points we use before planning around it. If it holds, Linux
-   costs an import gate; if not, Linux joins Windows on the hand-rolled module.
-2. **Windows needs the hand-rolled module.** Apple's `dnssd.dll` ships with
-   iTunes / Bonjour Print Services and cannot be assumed present.
-
-Long term one hand-rolled module on both platforms is likely better than two
-paths — and if it turns out clean, macOS could adopt it and drop its dns_sd FFI.
-
-Carry these across, they are already-paid-for knowledge:
-
-- **Windows joins the multicast group on only ONE interface for `INADDR_ANY`,
+- **Windows joins the multicast group on only ONE interface for `INADDR_ANY`**,
   and on a box with Hyper-V / WSL / VPN adapters that is frequently the wrong
-  one** (mdns.zig's header). Join every up interface explicitly.
-- DNS name compression must be **parsed** (peers emit it) but need not be
-  **emitted**.
+  one. Join every up interface explicitly.
+- DNS name compression must be **parsed** (peers emit it), not emitted.
 - Keep the two-tier failure counters (`PEER_DROP_FAILS` 3 / `KNOWN_MAX_FAILS`
-  24). Our comment records a real production bug: one transient resolve hiccup
-  evicting a live peer, producing alternating success/404 on a peer that never
-  went down. A single counter reintroduces it.
-- **The gate lands WITH sharing, never after.** This opens an inference surface
-  to the network; `routeClass` x `SharedSet` is the whole defence and it already
-  runs on every host.
+  24). One counter reintroduces a real production bug: a single transient
+  resolve hiccup evicting a live peer.
+- **The gate lands WITH sharing, never after.**
 
-Acceptance test is interop in both directions: this build discovering and using
-a macOS mlx-serve's model, and the Mac using ours.
+Acceptance test is interop both ways: this build using the Mac's model, and the
+Mac using ours. Note this link is cross-subnet (Windows 192.168.0.150, Mac
+192.168.2.61, router reflects mDNS) — so it cannot prove the same-subnet-only
+case. WSL2's NAT'd networking means the Avahi probe answers "does the API
+work", never "does mDNS reach the LAN from WSL"; that needs a real Linux box.
 
+### 3.4 Vision via mtmd
 
-### 3.6 Un-skip what deserves it
+Not started. `mtmd.h` / `mtmd-helper.h` are staged and `mtmd.dll` ships in the
+set. mtmd does its OWN preprocessing, so it does not go through
+`qwen_vision`/`muse_vision`/`lfm2_vision` and does not resurrect
+`vision_stub.zig`.
 
-18 tests skip. Most are pre-existing env-gated live tests. The ones this port
-added, each with its reason stated in code:
+### 3.5 Draft-model speculative decode
 
-| Skipped | Why | Worth revisiting? |
-|---|---|---|
-| 2 × HF-cache symlink tests | Windows needs Developer Mode to create symlinks | Only if CI enables it |
-| 7 × `prefillMemoryNeeded` / `resolvePrefillChunk` | MLX billing math; the terms come from `transformer.zig` + `ane.zig` | No — behaviour is absent, not untested |
-| 1 × `aneGateHeadroom` | ANE is Apple hardware | No |
-| 1 × `lanShareDenial` | needs a Lan that can share; stub never does | Only if Avahi lands |
+Not started. llama.cpp has its own; partly recovers what was lost with
+MTP/DFlash. Shim work plus scheduler wiring. Measure before claiming anything
+(`/bench` rules apply).
 
-Known cosmetic wart, **pre-existing and not a port regression**:
-`/v1/models` reports `"quantization":"0-bit"` for GGUF models. `quant_bits` is
-an affine-safetensors concept that is never set on the GGUF path (and
-`gguf_meta.zig` does not parse the ggml file type at all), so macOS reports the
-same. Fixing it means plumbing the GGML type through and changes macOS-visible
-API output — worth doing deliberately, not as a drive-by.
+### 3.6 CI
 
-The security-relevant half (`routeClass` × `SharedSet`) still runs everywhere —
-that was the point of splitting `lan.zig`.
+`.github/workflows/ci.yml` has a `build-test-windows` job (fetch-zig,
+fetch-llama, ReleaseFast build, `--version`/`--help` smoke, `zig build test`,
+`tests/test_portable_env.sh`). No brew, no mlx, no Xcode. **Never run on a
+runner** — the first PR is the test. The shell suite is not run there; it needs
+models.
 
-### 3.7 CI
+### 3.7 Known issues, deliberately not fixed
 
-`.github/workflows/ci.yml` is `runs-on: macos-26` only. A
-`windows-latest` job would need: `scripts/fetch-zig.sh` (already works there),
-`scripts/fetch-llama.sh` (already works there), `zig build -Dgguf-only`,
-`zig build test`. No brew, no mlx build, no Xcode steps.
+- **`"quantization":"0-bit"` for GGUF models** in `/v1/models`. `quant_bits` is
+  an affine-safetensors concept never set on the GGUF path, so macOS reports
+  the same. Fixing it means plumbing the GGML type through and changes
+  macOS-visible API output — do it deliberately, not as a drive-by.
+- **11 shell scripts exit 1 on a missing prerequisite** instead of skipping.
+  Pre-existing inconsistency, shared with macOS, not a port defect.
+- **15 skipped Zig tests**: 2 HF-cache symlink (Windows needs Developer Mode),
+  7 `prefillMemoryNeeded`/`resolvePrefillChunk` and 1 `aneGateHeadroom` (MLX/ANE
+  behaviour is absent, not untested), 1 `lanShareDenial` (needs a Lan that can
+  share — revisit when §3.3 lands).
+- **Both hosts stage into the same `.zig-toolchain`** and fight over it (§6.14).
+  Use separate clones; making the paths host-specific changes what CI, the docs
+  and CLAUDE.md all reference.
 
 ### 3.8 Things deliberately left broken
 
@@ -259,9 +221,6 @@ Each is named at its call site; do not "fix" one by making it silently succeed.
 - **WebP input** — `lib/webp_stub/` returns NULL from `WebPDecodeRGB`, which the
   single call site already treats as "cannot decode". PNG/JPEG still work via
   stb. Lift by vendoring real libwebp.
-- **LAN sharing** — `--lan-share` / `--lan-discover` are no-ops. This one has a
-  clear path and a reference implementation; see §3.5 rather than treating it as
-  permanent.
 - **Media generation, ds4, ANE, MTP/DFlash/PLD/drafter, MLX safetensors** — all
   refuse by name.
 
@@ -270,22 +229,47 @@ Each is named at its call site; do not "fix" one by making it silently succeed.
 ## 4. Environment
 
 ```bash
-./scripts/fetch-zig.sh      # -> .zig-toolchain/zig.exe  (0.17.0-dev nightly, pinned)
+./scripts/fetch-zig.sh      # -> .zig-toolchain/  (0.17.0-dev nightly, pinned)
 ./scripts/fetch-llama.sh    # -> lib/llama/{bin,include}  (b10472, CUDA 13.3)
-.zig-toolchain/zig.exe build
+.zig-toolchain/zig.exe build -Doptimize=ReleaseFast
 ```
 
 Both staged trees are gitignored. `fetch-llama.sh` takes `LLAMA_CUDA_VER`
 (default 13.3; upstream also ships 12.4 for x64).
 
-Dev box this was built on: Windows 11, RTX 5060 Ti 16 GB (sm_120), CUDA 13.3,
-WSL2 Ubuntu available but unused so far.
+**Run shell tests through the wrapper**, which installs the host shims (§6.10):
+
+```bash
+./tests/run.sh test_multi_model_dir.sh
+```
+
+Model-gated Zig tests read these at RUN time (see the caching trap in §6.11):
+
+```
+LLAMA_TEST_MODEL         a chat .gguf        — prefix reuse, decode, tokenize
+LLAMA_TEST_EMBED_MODEL   an embedding .gguf  — /v1/embeddings engine contract
+MLX_LLAMA_BACKEND_DIR    lib/llama/bin       — build.zig sets it for `zig build test`
+```
+
+Dev box: Windows 11, RTX 5060 Ti 16 GB (sm_120), CUDA 13.3; WSL2 Ubuntu 26.04
+with systemd, GPU visible, toolchain incomplete (§3.1).
+
+**Which host to work from.** Not interchangeable, and the split is measured:
+
+| Task | Host | Why |
+|---|---|---|
+| §3.2 Linux build, `status_linux.zig` | **WSL** | native POSIX shell; the whole §6.10 environment tax disappears and `tests/` runs unmodified |
+| §3.3 LAN transport + acceptance | **Windows** | WSL2's default NAT puts it on `172.27.x` behind the host while the LAN is `192.168.x`. The mDNS prober that finds the Mac from Windows returns NOTHING from WSL. `networkingMode=mirrored` in `.wslconfig` would lift this; untested here |
+| §3.3 Avahi API probe | either | it asks a question about the local daemon, not about the LAN |
+| Anything Windows-shaped | **Windows** | §6.2, §6.10 and §6.11 only exist on Windows, and Windows is a target rather than merely the host |
+
+If you run an agent inside WSL: it needs `node` + the CLI installed (neither is
+present), and it must NOT be pointed at the `/mnt/c` checkout — see §6.14.
+`~/mlx-serve-linux` already has the branch applied with Zig staged.
 
 **Always `-Doptimize=ReleaseFast` for anything perf-shaped** (project rule:
 Debug is 2–4× slower and produces fake regressions). Plain `zig build` is fine
 for compile-error iteration.
-
----
 
 ## 5. Map of what was added
 
@@ -308,9 +292,19 @@ rather than duplicating):
 
 **Host layer**
 - `src/platform.zig` — sleep, shutdown handling, `pollSocket`/`peerClosed`,
-  `homeDir`, `setEnv`, `connectedPair`, `tmpDirPath`. Everything here is reached
-  from threads carrying no `std.Io` handle; that is *why* it cannot use `std.Io`.
+  `homeDir`, `setEnv`, `connectedPair`, `tmpDirPath`, `looksAbsolutePath`,
+  `trimTrailingSeps`. Everything here is reached from threads carrying no
+  `std.Io` handle; that is *why* it cannot use `std.Io`.
 - `src/status_windows.zig` — a real implementation, not a stub. See §6.3.
+
+**Added while widening the surface**
+- `tests/lib/portable_env.sh` + `tests/run.sh` — the host shim layer, guarded
+  by `tests/test_portable_env.sh`. See §6.10.
+- `scripts/build-llama-cuda.sh` — Linux CUDA build (§3.2, never run).
+- Shim: `mlx_llama_embed_session_create` / `_session_embed` / `_n_embd` /
+  `_is_encoder_only` / `_n_ctx_train`, plus explicit `ggml_backend_load_all`.
+- `tests/probe_avahi_dnssd.c`, `tests/probe_mdns_browse.py` — §3.3 probes.
+- `.github/workflows/ci.yml` — the `build-test-windows` job.
 
 ---
 
@@ -326,10 +320,10 @@ ABI difference is not observable. Headers come from the source tarball at the
 same tag.
 
 `ggml` is a **separate DLL** on Windows (the macOS XCFramework merges
-llama+ggml+ggml-metal into one dylib), hence `linkSystemLibrary("ggml-base")`.
-The whole DLL set must ship beside the exe even though only two are linked —
-ggml dlopens its backends **by filename** at init, so a missing `ggml-cuda.dll`
-silently downgrades the backend instead of failing the link.
+llama+ggml+ggml-metal into one dylib). The whole DLL set must ship beside the
+exe even though only a few are linked — ggml dlopens its backends **by
+filename** at init, so a missing `ggml-cuda.dll` silently downgrades the backend
+instead of failing the link.
 
 ### 6.2 Winsock: the accept loop does not work the way POSIX's does
 
@@ -407,6 +401,19 @@ If you see undefined `mlx_*` symbols in a build that compiled fine, this is why.
 `zig build test 2>&1 | grep "test_zcu.obj:"` names the emitting function, which
 is how to find the culprit.
 
+### 6.7 This Zig nightly
+
+No `std.fs`, no `std.posix.open`, no `std.Thread.Mutex`, no
+`std.crypto.random`, no `std.time.nanoTimestamp`, no `std.time.Timer`.
+Everything file-shaped is `std.Io.*` and needs an `Io` handle;
+`std.Io.Mutex` is the codebase idiom (17 uses). `std.c.open` cannot even be
+*declared* under the Windows calling convention.
+
+`mlx_stub.zig` **aliases the real types** (`const real = @import("mlx.zig")`)
+and stubs only functions. A type is not a symbol — an extern is emitted only if
+called — so this costs no link dependency, while parallel type declarations made
+MLX-side modules see two incompatible `mlx_array` types.
+
 ### 6.8 Compiles + loads is not runs
 
 Both bugs that blocked the first token had this shape, and neither was visible
@@ -424,39 +431,129 @@ by reading the diff:
 The general lesson: a stub that refuses is right for a feature that is absent,
 and wrong for a shared code path that merely *degenerates* on this backend.
 
-### 6.7 This Zig nightly
+### 6.9 A return value nobody reads is a contract nobody keeps
 
-No `std.fs`, no `std.posix.open`, no `std.Thread.Mutex`, no
-`std.crypto.random`, no `std.time.nanoTimestamp`, no `std.time.Timer`.
-Everything file-shaped is `std.Io.*` and needs an `Io` handle;
-`std.Io.Mutex` is the codebase idiom (17 uses). `std.c.open` cannot even be
-*declared* under the Windows calling convention.
+The three worst bugs found by actually serving traffic were all a discarded or
+never-asked-for answer, and every one produced PLAUSIBLE OUTPUT rather than an
+error:
 
-`mlx_stub.zig` **aliases the real types** (`const real = @import("mlx.zig")`)
-and stubs only functions. A type is not a symbol — an extern is emitted only if
-called — so this costs no link dependency, while parallel type declarations made
-MLX-side modules see two incompatible `mlx_array` types.
+- `llama_memory_seq_rm` returns false when it cannot partially trim. The shim
+  ignored it, with a comment asserting the case could not happen. It happens on
+  every recurrent/hybrid checkpoint — which is what Qwen3.5/3.8 are — and the
+  result was a repeat request answering from the wrong position. The existing
+  "prefix reuse is byte-identical" test missed it because it only ever EXTENDS a
+  prompt, so the back-off-and-trim branch never runs; the new test re-serves an
+  IDENTICAL prompt over a generated tail.
+- `llama_model_n_ctx_train` was never asked, so the stub config's 8192 guess
+  stood. A 2048-window embedder accepted inputs four times too long.
+- The model's pooling type was never asked, so an embedding model advertised
+  `chat` and answered chat requests with garbage.
+
+When wrapping a C API, the question is not "did this call succeed" but "what is
+this function telling me that I am throwing away". `grep` the shim for calls
+whose result is unused; each one is a claim you have not checked.
+
+### 6.10 The suite's environment is a bigger port surface than the suite
+
+Not one of the 166 shell scripts needed rewriting for Windows. What needed
+fixing was the environment they assume, and each gap fails SILENTLY:
+
+- `python3` exists, is executable, and does not run (Microsoft Store alias,
+  exit 49). `command -v` finds it, so all 645 call sites returned an EMPTY
+  string, which reads as the server having returned nothing.
+  `test_multi_model_dir` reported "single-dir case returned []" with a perfectly
+  good server behind it. The resolver's contract is "does it RUN".
+- POSIX paths reach a native binary through argv but not through a request body.
+- `script(1)` does not exist, so a pty transcript is empty and the assertion
+  "no bad lines in the transcript" passes vacuously.
+- `HOME` is not what the server reads, so an isolated fixture is not isolated.
+- A model can be a FILE (`.gguf`), not only a directory.
+- `-d "$body"` overflows `ARG_MAX` far sooner than on macOS.
+
+Two rules fall out. Run scripts through `tests/run.sh`, and when a check can
+pass because its fixture did NOTHING, assert the fixture did something first.
+
+### 6.11 `zig build test` used to require killing your server
+
+The test step depended on `b.getInstallStep()` purely so the DLLs would be
+staged, which reinstalls `mlx-serve.exe` — and Windows holds an open image
+locked, so the whole suite failed `AccessDenied` whenever a server was running
+out of `zig-out/bin`. That is exactly when you want to run it. It now points
+PATH at the staged `lib/llama/bin` and depends on nothing.
+
+The related trap that is NOT fixed: `MLX_LLAMA_BACKEND_DIR` and
+`LLAMA_TEST_MODEL` are read at RUN time, but `zig build test` caches the run
+step and will report `cached` without re-running when only the environment
+changed. Invoke the test binary directly (`ls -t .zig-cache/o/*/test.exe |
+head -1`) when varying model env vars.
+
+### 6.12 Loading a DLL and registering a backend are two different things
+
+`llama_backend_init()` does not register ggml's compute backends; ggml dlopens
+them BY FILENAME and its own auto-load searches the RUNNING EXECUTABLE's
+directory. That is right for the installed server (the whole set ships beside
+`mlx-serve.exe`) and empty for a `zig build test` binary under `.zig-cache`, so
+every model-gated llama test died `no backends are loaded` no matter what was
+on PATH. The shim now calls `ggml_backend_load_all()` explicitly, with
+`MLX_LLAMA_BACKEND_DIR` overriding the directory (build.zig sets it for the
+test run). Those symbols live in `ggml.dll`, not `ggml-base.dll` — hence the
+extra `linkSystemLibrary("ggml")`.
+
+### 6.13 The host you are working on is the one that cannot warn you
+
+`fetch-zig.sh` downloaded to `"$TMP/zig.$KIND"` and extracted
+`"$TMP/zig.tar.xz"`. On macOS and Linux `KIND` is `tar`, so the two never named
+the same file and **neither host could stage a toolchain from a clean tree**.
+Windows was fine because its `KIND` spells `zip` and matched by accident — so
+the only host anyone was testing on was the only one that could not see the
+break, and it survived a whole port.
+
+`tests/test_toolchain_fetch.sh` did not catch it either: it tested the pure
+resolver (does it pick the right asset name), while the defect was a *coupling*
+between two lines further down. It now checks that the download target and every
+extractor input are the same expression, in both directions. When you refactor a
+name, the guard belongs on the thing that has to agree, not on the thing you
+renamed.
+
+### 6.14 Do not share one checkout between Windows and WSL
+
+Both hosts stage into the same `.zig-toolchain`, and `fetch-zig.sh` does
+`rm -rf "$DEST"` before extracting. Its idempotency check keys on `zig.exe` vs
+`zig`, so each host sees the other's toolchain as wrong, wipes it and
+re-downloads. `lib/llama` is less violent (its staged-check is layout-aware, so
+it merely refetches) but still ping-pongs. Use a separate Linux clone — the
+staging trees are gitignored anyway, and WSL over `/mnt/c` is slow regardless.
 
 ---
 
 ## 7. Before this merges to main
 
-**The macOS build has never been compiled since these changes.** `build.zig`,
-`server.zig`, `main.zig`, `scheduler.zig`, `model.zig`, `generate.zig`,
-`lan.zig`, `kv_quant.zig`, `dflash.zig`, `mtp.zig` and the three vision modules
-were all edited. Everything is gated and macOS *should* be unchanged, but that
-needs a real `zig build && zig build test` on a Mac.
+**The macOS build has never been compiled since these changes.** Everything is
+gated and macOS *should* be unchanged, but that needs a real
+`zig build && zig build test` on a Mac. Note §6.13: until that fix, a clean Mac
+tree could not even stage its toolchain, so "should be fine" was never testable.
 
-Highest-risk spots for a macOS regression, in order:
+Highest-risk spots, in order:
 
-1. The six file splits — every one moved declarations between files and added
-   re-exports. `model.zig` and `kv_quant.zig` re-export into hot paths.
-2. `build.zig`'s `makeSharedModule` — the exe and test modules had *drifted*
-   (the test module carried a `linkSystemLibrary("c++")` the exe did not);
-   unifying them is correct but changes the macOS link line.
-3. The tests moved out of `format_corpus_test.zig`, `lfm2_vision.zig`,
-   `muse_vision.zig` and `qwen_vision.zig` — they must still run on macOS via
-   `tests_all.zig`, not silently vanish. Check the macOS test COUNT, not just
-   that it is green.
+1. The six file splits (pre-existing) — `model.zig` and `kv_quant.zig`
+   re-export into hot paths.
+2. `build.zig`'s `makeSharedModule` (pre-existing) — the exe and test modules
+   had drifted; unifying them changes the macOS link line.
+3. Tests moved out of `format_corpus_test.zig` and the three vision modules —
+   check the macOS test COUNT, not just that it is green.
+4. The llama shim now calls `ggml_backend_load_all*`, fenced `#ifndef
+   __APPLE__` — on Apple the XCFramework merges llama + ggml + ggml-metal into
+   one dylib with its backends compiled IN, so there is nothing to dlopen and,
+   crucially, nothing new to link. Only Windows and Linux gained `ggml`. If the
+   macOS link breaks, look here first.
+5. `platform.homeDir` now prefers an explicit `HOME` on every host. A no-op on
+   macOS (the POSIX branch always read HOME) but the code moved, so the
+   `homeDir` tests are the check.
+6. `runEmbedRequest` gained a llama arm ahead of the MLX one, keyed on
+   `llama_engine != null`. An MLX model never enters it.
+7. `tests/run.sh` and `tests/lib/portable_env.sh` are additive; on macOS
+   `run.sh` is a passthrough. Three scripts gained skip guards keyed on
+   `uname -s` / the build — verify they still RUN on a Mac rather than skipping
+   (a skip reads as a pass).
 
 The Swift app (`app/`) was not touched and is untested against any of this.
