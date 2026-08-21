@@ -7,9 +7,15 @@
 //!                              `SharedSet`, name sanitizing, TXT records,
 //!                              peer-model rewriting. Pure; builds everywhere;
 //!                              carries 11 of the 13 original tests.
-//!   `lan_bonjour.zig`        — the dns_sd advertiser/browser and the socket
-//!                              tunnel. macOS only (49 dns_sd call sites).
-//!   `lan_transport_stub.zig` — its inert twin for other hosts.
+//!   `lan_peers.zig`          — the discovered-peer table, the peer-model
+//!                              fetch and the streaming proxy tunnel. Portable;
+//!                              only DISCOVERY is per-host.
+//!   `lan_bonjour.zig`        — dns_sd discovery. Apple only.
+//!   `lan_transport_mdns.zig` — discovery over the hand-rolled responder in
+//!                              `lan_mdns.zig` (+ `lan_net.zig`), everywhere
+//!                              else. avahi-compat was measured and rejected:
+//!                              it lacks DNSServiceGetAddrInfo and needs a
+//!                              running daemon (windows-plan.md §3.5).
 //!
 //! Splitting rather than `if (macos)`-ing inside one file keeps the policy
 //! tests running on every host: they are where the security-relevant behaviour
@@ -28,7 +34,7 @@ pub const policy = @import("lan_policy.zig");
 const transport = if (builtin.os.tag == .macos or builtin.os.tag == .ios)
     @import("lan_bonjour.zig")
 else
-    @import("lan_transport_stub.zig");
+    @import("lan_transport_mdns.zig");
 
 // ── Policy (portable) ──
 pub const SERVICE_TYPE = policy.SERVICE_TYPE;
@@ -55,4 +61,5 @@ pub const tunnel = transport.tunnel;
 test {
     _ = policy;
     _ = transport;
+    _ = @import("lan_peers.zig");
 }

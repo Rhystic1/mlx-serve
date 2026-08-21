@@ -3793,7 +3793,7 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     // The dir is validated exactly like discovery (config.json, supported
     // model_type + quant mode) before anything is registered; the load then
     // proceeds under the directory-basename id.
-    if (std.mem.startsWith(u8, requested_id, "/")) {
+    if (platform.looksAbsolutePath(requested_id)) {
         const registry = global_registry orelse {
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
             return;
@@ -4013,9 +4013,8 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_
     } else |_| {
         requested_id = parseModelFromBody(request_body) orelse "";
     }
-    if (std.mem.startsWith(u8, requested_id, "/")) {
-        var trimmed = requested_id;
-        while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
+    if (platform.looksAbsolutePath(requested_id)) {
+        const trimmed = platform.trimTrailingSeps(requested_id);
         requested_id = std.fs.path.basename(trimmed);
     }
 
@@ -4407,6 +4406,26 @@ fn handleEmbeddings(
         seqs.deinit(allocator);
     }
     for (texts.items) |text| {
+        // GGUF: the engine owns the real vocabulary. `lm.tokenizer` on this
+        // path is the decode-only STUB the cold load attaches (empty vocab, no
+        // merges), so encoding through it would hand the embedder ids that
+        // mean nothing -- and produce a confident, wrong vector rather than an
+        // error. `add_special` is true so the checkpoint's own [CLS]/[SEP] (or
+        // BOS/EOS) land exactly where it was trained to see them, which is the
+        // position a CLS-pooled model reads.
+        if (lm.llama_engine) |engine| {
+            const i32_ids = engine.tokenizeText(allocator, text, true) catch |err| {
+                log.err("  embedding tokenize failed: {s}\n", .{@errorName(err)});
+                try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to tokenize embedding input", null);
+                return;
+            };
+            defer allocator.free(i32_ids);
+            const ids = try allocator.alloc(u32, i32_ids.len);
+            for (i32_ids, 0..) |t, i| ids[i] = @intCast(t);
+            total_tokens += ids.len;
+            try seqs.append(allocator, ids);
+            continue;
+        }
         const raw_ids = try tok.encode(allocator, text);
         // Bidirectional embedding models (EmbeddingGemma) declare
         // add_bos_token + add_eos_token; the SentencePiece encode path adds
@@ -8361,12 +8380,11 @@ test "apiKeyAuthorized accepts Bearer, x-api-key, Basic, and query param" {
 }
 
 test "lanShareDenial: shared inference surface only, resolved like dispatch" {
-    // Needs a Lan that can actually SHARE. The stub transport never does (no
-    // Bonjour off Apple), so the denial it returns is the correct one for this
-    // build but not the one this test is about. The policy half -- routeClass x
-    // SharedSet, where the keyless gate actually lives -- is covered by
-    // lan_policy.zig's tests, which run on every host.
-    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    // Ran on macOS only while the other hosts had a stub transport that could
+    // never share. Both transports share now (dns_sd on Apple, the hand-rolled
+    // responder elsewhere) and both carry the same peer table, so the gate this
+    // test covers -- the keyless one, routeClass x SharedSet resolved exactly
+    // as dispatch resolves it -- is exercised everywhere it ships.
     const a = std.testing.allocator;
     const reg = try ModelRegistry.init(a, std.Io.Threaded.global_single_threaded.io(), null, 8, 0, null);
     defer reg.deinit();
@@ -8374,17 +8392,18 @@ test "lanShareDenial: shared inference surface only, resolved like dispatch" {
     _ = try reg.registerStub("qwen3.6-27b", "/m/q", 1);
     reg.default_id = shared_entry.id;
 
+    // The fields both transports have in common; everything else defaults.
     var l = lan_mod.Lan{
         .alloc = a,
         .port = 0,
         .discover = false,
-        .peers = .init(a),
+        .table = .init(a),
         .known = .init(a),
         .share = try lan_mod.SharedSet.parse(a, "gemma-4-e4b-it-4bit"),
     };
     defer {
         l.share.?.deinit(a);
-        l.peers.deinit();
+        l.table.deinit();
         l.known.deinit();
     }
 

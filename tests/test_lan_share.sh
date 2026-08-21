@@ -28,10 +28,14 @@ PORT_B=$((PORT_A + 1))
 PEER_NAME="lantest-a-$$"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
 
-if [ ! -d "$MODEL" ] && [ -d "$HOME/.mlx-serve/models/gemma-4-e4b-it-4bit" ]; then
+# A model is a DIRECTORY for MLX and a FILE for GGUF; testing only for a
+# directory made this skip on every host whose only checkpoints are .gguf --
+# i.e. on exactly the hosts the hand-rolled mDNS transport was written for.
+model_exists() { [ -d "$1" ] || [ -f "$1" ]; }
+if ! model_exists "$MODEL" && [ -d "$HOME/.mlx-serve/models/gemma-4-e4b-it-4bit" ]; then
     MODEL="$HOME/.mlx-serve/models/gemma-4-e4b-it-4bit"
 fi
-if [ ! -d "$MODEL" ]; then
+if ! model_exists "$MODEL"; then
     echo -e "${YELLOW}SKIP${NC} test_lan_share: $MODEL not found."
     exit 0
 fi
@@ -40,9 +44,10 @@ if [ ! -x "$BINARY" ]; then
     echo -e "${RED}FAIL${NC} $BINARY not found. Build first."
     exit 1
 fi
-LAN_IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)
+. "$(dirname "$0")/lib/portable_env.sh"
+LAN_IP=$(mlxserve_lan_ip || true)
 if [ -z "$LAN_IP" ]; then
-    echo -e "${YELLOW}SKIP${NC} test_lan_share: no non-loopback IP (offline Mac)."
+    echo -e "${YELLOW}SKIP${NC} test_lan_share: no non-loopback IP (offline machine)."
     exit 0
 fi
 
