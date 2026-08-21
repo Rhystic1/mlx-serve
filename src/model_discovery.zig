@@ -13,10 +13,16 @@
 //! plan 01 Phase 0 (detangling Transformer state).
 
 const std = @import("std");
+const builtin = @import("builtin");
+const platform = @import("platform.zig");
 const log = @import("log.zig");
 // Only the pure JSON contract predicate is referenced — lazy analysis keeps
 // dflash.zig's mlx FFI out of this filesystem-only module.
-const dflash = @import("dflash.zig");
+// Only the CONFIG-CONTRACT predicate is needed here (a drafter is classified
+// by `block_size` + `mask_token_id` + `target_layer_ids`, never by
+// `model_type`), and discovery must work in every build. The full dflash.zig
+// would pull transformer.zig and deepseek_v4.zig in behind it.
+const dflash = @import("dflash_contract.zig");
 
 /// Architecture allow-list for discovery. Must stay in sync with the
 /// `model_type` branches in `model.zig:parseConfigFromJson`. Discovery
@@ -1219,12 +1225,9 @@ test "discoverModelsMany merges roots in order and de-dups by id" {
 
     // `discoverModels` opens by ABSOLUTE path (the openDirAbsolute UB class),
     // and a testing tmpDir is `<cwd>/.zig-cache/tmp/<sub_path>`.
-    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
-    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
-    const a_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, a_dir.sub_path });
+    const a_path = try platform.tmpDirPathAlloc(allocator, &a_dir.sub_path);
     defer allocator.free(a_path);
-    const b_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, b_dir.sub_path });
+    const b_path = try platform.tmpDirPathAlloc(allocator, &b_dir.sub_path);
     defer allocator.free(b_path);
 
     var result = try discoverModelsMany(io, allocator, &.{ a_path, b_path });
@@ -1243,7 +1246,7 @@ test "discoverModelsMany merges roots in order and de-dups by id" {
         if (std.mem.eql(u8, m.id, "org/only-in-b")) saw_b = true;
         // Every path must be absolute and under the root it came from, or the
         // registry stores a path nothing can open.
-        try std.testing.expect(m.path.len > 0 and m.path[0] == '/');
+        try std.testing.expect(std.fs.path.isAbsolute(m.path));
     }
     try std.testing.expectEqualStrings("qwen3", shared_type);
     try std.testing.expect(saw_a and saw_b);
@@ -1268,6 +1271,13 @@ test "discoverModelsMany merges roots in order and de-dups by id" {
 }
 
 test "discovery measures a SYMLINKED (HF hub cache) model dir's real bytes" {
+    // Creating a symlink on Windows needs Developer Mode or SeCreateSymbolicLink
+    // privilege, which a plain `zig build test` will not have. Skip rather than
+    // fail: the behaviour under test (size sums follow links) is a real
+    // invariant on the hosts where HF hub caches actually use symlinks, and a
+    // false red here would train people to ignore the suite. The skip is
+    // VISIBLE in the runner output, not a silent pass.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });

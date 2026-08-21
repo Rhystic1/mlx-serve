@@ -1575,10 +1575,10 @@ pub fn loadMtp(
         const eval_vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(eval_vec);
         const base = [_]mlx.mlx_array{
-            m.fc.w,       m.fc.s,            m.fc.b,               m.pre_fc_norm_emb,
-            m.pre_fc_norm_hidden,            m.final_norm,         m.input_norm,
-            m.post_attn_norm,                m.q_norm,             m.k_norm,
-            m.q.w,        m.k.w,             m.v.w,                m.o.w,
+            m.fc.w,               m.fc.s,       m.fc.b,       m.pre_fc_norm_emb,
+            m.pre_fc_norm_hidden, m.final_norm, m.input_norm, m.post_attn_norm,
+            m.q_norm,             m.k_norm,     m.q.w,        m.k.w,
+            m.v.w,                m.o.w,
         };
         for (base) |a| if (a.ctx != null) {
             _ = mlx.mlx_vector_array_append_value(eval_vec, a);
@@ -4220,4 +4220,48 @@ test "adaptiveDepthCapForMachine: measured rows only, unmeasured chips keep the 
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M1 Max", 6).cap);
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M4 Max", 6).cap);
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("", 6).cap);
+}
+
+// Moved here from src/format_corpus_test.zig for the Windows/Linux port. The
+// function under test is pure, but it lives in this file, and importing mtp.zig
+// from the portable corpus dragged transformer.zig -> deepseek_v4.zig ->
+// kv_quant.zig -> the vision towers into a -Dgguf-only test binary. Tests at
+// the bottom of the file they test is the project convention anyway.
+test "MTP cost profiles classify full target tensor surfaces" {
+    const Case = struct {
+        bits: u32,
+        group_size: u32,
+        target: MtpNaxTargetSurface,
+        want: MtpCostProfile,
+    };
+    const cases = [_]Case{
+        .{ .bits = 8, .group_size = 32, .target = .uniform_quantized_embedding, .want = .g17_nax_q8_gs32 },
+        .{ .bits = 4, .group_size = 32, .target = .uniform_quantized_embedding, .want = .g17_nax_q4_gs32 },
+        .{ .bits = 4, .group_size = 64, .target = .uniform_quantized_embedding, .want = .generic },
+        .{ .bits = 4, .group_size = 64, .target = .uniform_bf16_embedding, .want = .g17_nax_q4_gs64 },
+        .{ .bits = 6, .group_size = 64, .target = .uniform_q6_quantized_embedding, .want = .g17_nax_q6_gs64 },
+        .{ .bits = 8, .group_size = 64, .target = .uniform_q8_bf16_embedding, .want = .g17_nax_q8_gs64 },
+        .{ .bits = 8, .group_size = 64, .target = .uniform_q6_quantized_embedding, .want = .generic },
+        .{ .bits = 6, .group_size = 64, .target = .uniform_q8_bf16_embedding, .want = .generic },
+        .{ .bits = 4, .group_size = 64, .target = .oqe_quantized_embedding, .want = .g17_nax_oq4e_q4_gs64 },
+        .{ .bits = 4, .group_size = 64, .target = .none, .want = .generic },
+        .{ .bits = 4, .group_size = 32, .target = .uniform_bf16_embedding, .want = .generic },
+        .{ .bits = 8, .group_size = 32, .target = .oqe_quantized_embedding, .want = .generic },
+    };
+
+    for (cases) |case| {
+        try testing.expectEqual(
+            case.want,
+            m5NaxCostProfileForFingerprint(case.bits, case.group_size, case.target),
+        );
+    }
+
+    // A sidecar's quantization label never selects a calibrated target
+    // surface by itself. Unsupported sidecars remain generic for every target.
+    inline for (std.meta.tags(MtpNaxTargetSurface)) |target| {
+        try testing.expectEqual(
+            MtpCostProfile.generic,
+            m5NaxCostProfileForFingerprint(3, 32, target),
+        );
+    }
 }

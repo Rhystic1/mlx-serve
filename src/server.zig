@@ -1,34 +1,39 @@
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const transformer_mod = @import("transformer.zig");
-const kv_quant_mod = @import("kv_quant.zig");
+const builtin = @import("builtin");
+const mlx = if (@import("build_cfg.zig").mlx_enabled) @import("mlx.zig") else @import("mlx_stub.zig");
+const transformer_mod = if (@import("build_cfg.zig").mlx_enabled) @import("transformer.zig") else @import("transformer_stub.zig");
+// Only `Scheme` is used here, which lives in the portable config half --
+// importing the full kv_quant.zig would drag in 313 MLX references.
+const kv_quant_mod = @import("kv_quant_config.zig");
 const tokenizer_mod = @import("tokenizer.zig");
-const generate_mod = @import("generate.zig");
-const drafter_mod = @import("drafter.zig");
+const generate_mod = if (@import("build_cfg.zig").mlx_enabled) @import("generate.zig") else @import("generate_stub.zig");
+const drafter_mod = if (@import("build_cfg.zig").mlx_enabled) @import("drafter.zig") else @import("spec_stub.zig");
 const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
-const dsv4_mod = @import("deepseek_v4.zig");
+const dsv4_mod = if (@import("build_cfg.zig").mlx_enabled) @import("deepseek_v4.zig") else @import("dsv4_stub.zig");
 const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
 const mrope_mod = @import("mrope.zig");
-const vision_mod = @import("vision.zig");
+const vision_mod = if (@import("build_cfg.zig").mlx_enabled) @import("vision.zig") else @import("vision_stub.zig");
 const log = @import("log.zig");
 const responses_mod = @import("responses.zig");
 const pld_index = @import("pld_index.zig");
-const prefix_cache_mod = @import("prefix_cache.zig");
+const prefix_cache_mod = if (@import("build_cfg.zig").mlx_enabled) @import("prefix_cache.zig") else @import("mlx_cache_stub.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
-const ds4_ffi = if (@import("build_options").ios) @import("ds4_ffi_stub.zig") else @import("ds4_ffi.zig");
+const ds4_ffi = if (@import("build_cfg.zig").ds4_enabled) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
-const arch_llama = if (@import("build_options").ios) @import("arch/llama_stub.zig") else @import("arch/llama.zig");
-const media_mod = @import("gen.zig");
+const arch_llama = if (@import("build_cfg.zig").llama_enabled) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const media_mod = gen_mod;
 const stb = @import("stb");
 const webp = @import("webp");
+const platform = @import("platform.zig");
+const gen_mod = if (@import("build_cfg.zig").mlx_enabled) @import("gen.zig") else @import("gen_stub.zig");
 const metrics = @import("status.zig");
 const instr = @import("metrics.zig");
-const ane_mod = @import("ane.zig");
+const ane_mod = if (@import("build_cfg.zig").mlx_enabled) @import("ane.zig") else @import("ane_stub.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -318,28 +323,12 @@ pub const Conn = struct {
     pub const STREAM_KEEPALIVE_MS: i64 = 5000;
 
     pub fn peerClosed(c: *Conn) bool {
-        const fd = c.stream.socket.handle;
-        var fds = [_]std.posix.pollfd{.{
-            .fd = fd,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-        const n = std.posix.poll(&fds, 0) catch return false;
-        if (n == 0) return false;
-        const revents = fds[0].revents;
-        if ((revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) return true;
-        if ((revents & std.posix.POLL.IN) == 0) return false;
-        var peek_buf: [1]u8 = undefined;
-        const flags: c_int = std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT;
-        const r = std.c.recv(fd, &peek_buf, peek_buf.len, flags);
-        if (r == 0) return true; // FIN: peer closed cleanly
-        return false; // negative (EAGAIN) or data available → assume alive
+        // Winsock has no poll(2), and its WSAPoll struct differs (SOCKET-width
+        // fd), so the probe lives in src/platform.zig. Semantics unchanged:
+        // readable-with-a-zero-length-peek is FIN, everything else is alive.
+        return platform.peerClosed(c.stream.socket.handle);
     }
 };
-
-fn signalHandler(_: std.posix.SIG) callconv(.c) void {
-    shutdown_requested.store(true, .release);
-}
 
 /// Adaptive spec-decode gate threshold. Per-request, we score the prompt's
 /// 3-gram repetition density; if `score < spec_gate_threshold` AND the user
@@ -1090,23 +1079,46 @@ fn loopTrimmedIds(ids: []const u32, start: ?usize) []const u32 {
 /// Framing is by byte COUNT, never a delimiter: both payloads are arbitrary bytes
 /// and any sentinel can occur inside them. libc `write(2)` like log.zig's sink
 /// (callers here carry no `Io`); O_APPEND keeps conn threads from interleaving.
-fn appendRawToolDump(path: []const u8, tools_json: ?[]const u8, text: []const u8) void {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (path.len == 0 or path.len >= path_buf.len) return;
-    @memcpy(path_buf[0..path.len], path);
-    path_buf[path.len] = 0;
-    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
-
-    const fd = std.c.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o644));
-    if (fd < 0) return;
-    defer _ = std.c.close(fd);
-
+fn appendRawToolDump(io: std.Io, path: []const u8, tools_json: ?[]const u8, text: []const u8) void {
+    if (path.len == 0) return;
     const tools = tools_json orelse "";
     var hdr: [96]u8 = undefined;
     const h = std.fmt.bufPrint(&hdr, "\n===MLX_RAW_DUMP tools={d} raw={d}===\n", .{ tools.len, text.len }) catch return;
-    _ = std.c.write(fd, h.ptr, h.len);
-    if (tools.len > 0) _ = std.c.write(fd, tools.ptr, tools.len);
-    if (text.len > 0) _ = std.c.write(fd, text.ptr, text.len);
+
+    // Was raw libc open/write with O_APPEND. `std.c.open` cannot even be
+    // declared under the Windows calling convention, so this goes through
+    // std.Io -- which needs an `Io`, hence the added parameter. Every caller is
+    // an HTTP handler that already has `stream.io`.
+    //
+    // O_APPEND used to keep concurrent conn threads from interleaving; the
+    // replacement re-seeks to the end and writes ONE buffer, so a dump is still
+    // never split, though two dumps can now race for the same offset. This is a
+    // debug capture path (MLX_SERVE_RAW_DUMP_FILE), not a server invariant.
+    const file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false }) catch return;
+    defer file.close(io);
+    const end = file.length(io) catch return;
+
+    var buf: [4096]u8 = undefined;
+    if (h.len + tools.len + text.len <= buf.len) {
+        var n: usize = 0;
+        @memcpy(buf[n..][0..h.len], h);
+        n += h.len;
+        @memcpy(buf[n..][0..tools.len], tools);
+        n += tools.len;
+        @memcpy(buf[n..][0..text.len], text);
+        n += text.len;
+        file.writePositionalAll(io, buf[0..n], end) catch {};
+        return;
+    }
+    // Oversized: three positional writes at running offsets. Same bytes.
+    var off = end;
+    file.writePositionalAll(io, h, off) catch return;
+    off += h.len;
+    if (tools.len > 0) {
+        file.writePositionalAll(io, tools, off) catch return;
+        off += tools.len;
+    }
+    if (text.len > 0) file.writePositionalAll(io, text, off) catch {};
 }
 
 /// The ONE tool-call extraction path for every HTTP surface: parse, fall back to
@@ -1293,14 +1305,10 @@ pub fn serve(
         }
     }
     global_port = port;
-    // Install signal handlers for graceful shutdown
-    const sigact = std.posix.Sigaction{
-        .handler = .{ .handler = signalHandler },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.INT, &sigact, null);
-    std.posix.sigaction(std.posix.SIG.TERM, &sigact, null);
+    // Install interrupt/termination handlers for graceful shutdown. Windows
+    // has no POSIX signals, so the mechanism differs per host -- see
+    // src/platform.zig.
+    platform.installShutdownHandler(&shutdown_requested, port);
 
     // Parse host address
     var ip4_bytes: [4]u8 = .{ 0, 0, 0, 0 };
@@ -1415,20 +1423,15 @@ pub fn serve(
         });
     }
 
-    var poll_fds = [_]std.posix.pollfd{.{
-        .fd = server.socket.handle,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-
     while (!shutdown_requested.load(.acquire)) {
-        // Poll with 1-second timeout so we can check shutdown flag
-        const poll_result = std.posix.poll(&poll_fds, 1000) catch |err| {
-            if (shutdown_requested.load(.acquire)) break;
-            log.err("poll error: {}\n", .{err});
-            continue;
-        };
-        if (poll_result == 0) continue; // timeout, re-check shutdown flag
+        // Poll with 1-second timeout so we can check shutdown flag.
+        // Winsock has no poll(2); see src/platform.zig. `.closed` on a
+        // LISTENING socket is not a peer hangup -- it means the listener
+        // itself died, so fall through and let accept() report it.
+        // `.poll_failed` falls THROUGH to accept() rather than looping: a
+        // listener we cannot poll must still be served, and accept() blocking
+        // is far better than never accepting at all.
+        if (platform.pollSocket(server.socket.handle, 1000) == .idle) continue;
         if (shutdown_requested.load(.acquire)) break;
 
         const accepted_stream = server.accept(io) catch |err| {
@@ -1478,9 +1481,8 @@ pub fn serve(
     if (global_scheduler) |sch| sch.cancelAllInFlight();
     {
         var waited_ms: u64 = 0;
-        var idle_fds = [_]std.posix.pollfd{};
         while (active_conn_threads.load(.acquire) > 0 and waited_ms < 30_000) {
-            _ = std.posix.poll(&idle_fds, 20) catch {}; // empty fd set → 20ms sleep
+            platform.sleepMs(20);
             waited_ms += 20;
         }
         const remaining = active_conn_threads.load(.acquire);
@@ -2372,7 +2374,9 @@ fn handleOllamaPull(allocator: std.mem.Allocator, stream: *Conn, body: []const u
         try sendOllamaError(allocator, stream, "404 Not Found", "unknown model name; use a known short name or a HuggingFace 'org/repo' id");
         return;
     };
-    const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
+    var home_buf: [1024]u8 = undefined;
+    // HOME is POSIX-only; Windows names it USERPROFILE. See platform.homeDir.
+    const home = platform.homeDir(&home_buf) orelse ".";
     const dest = try cli_mod.modelDestPath(allocator, home, resolved.repo);
     defer allocator.free(dest);
 
@@ -3176,13 +3180,16 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
     return true;
 }
 
-extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;
-
 /// Get the Metal max buffer allocation limit (~75% of system unified memory).
+///
+/// Reads total physical memory through `status.getTotalMemBytes` rather than a
+/// direct `sysctlbyname("hw.memsize")`, which is Darwin-only. Same number on
+/// macOS (that helper is the sysctl); on other hosts it is the host's own total
+/// RAM. The 75% figure is a Metal property and does not describe a CUDA device,
+/// but the only consumer is the MLX-side buffer gate, which no GGUF-only build
+/// reaches.
 fn getMetalBufferLimit() u64 {
-    var mem: u64 = 0;
-    var len: usize = @sizeOf(u64);
-    _ = sysctlbyname("hw.memsize", @ptrCast(&mem), &len, null, 0);
+    const mem = metrics.getTotalMemBytes();
     if (mem == 0) return 8 * 1024 * 1024 * 1024; // fallback 8GB
     return mem * 75 / 100;
 }
@@ -4325,7 +4332,6 @@ fn handleEmbeddings(
     const xfm_opt = lm.transformer;
     const tok = lm.tokenizer.?;
     const config = lm.config.?;
-    const gen_mod = @import("generate.zig");
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid JSON in request body", null);
         return;
@@ -7462,7 +7468,7 @@ fn handleStreamingGeneration(
             // a harvester can slice each record exactly (the text is arbitrary
             // bytes, so the byte count — not a delimiter — defines the record).
             if (std.c.getenv("MLX_SERVE_RAW_DUMP_FILE")) |dump_path| {
-                appendRawToolDump(std.mem.span(dump_path), tools_json, text_buf.items);
+                appendRawToolDump(stream.io, std.mem.span(dump_path), tools_json, text_buf.items);
             }
         }
         // Merge re-opened mid-text thought channels into the leading block so
@@ -8048,16 +8054,16 @@ fn gaugeSamplerLoop(ctx: GaugeSamplerCtx) void {
     // Wake every 500 ms to check the stop flag; sample system state once per
     // 2-second interval. The 2 s cadence is what makes generation_tokens_live a
     // real-time tok/s source — the panel windows over a few of these samples.
-    // Uses std.c.nanosleep (POSIX) because std.time.sleep was removed in Zig
-    // 0.16 — this thread has no Io handle.
+    // Uses platform.sleepMs because std.time.sleep was removed in Zig 0.16 and
+    // std.Io.sleep needs an Io handle — this thread has neither.
     const SAMPLE_INTERVAL_TICKS: u64 = 4; // 4 × 500 ms = 2 s
-    const poll_ts = std.c.timespec{ .sec = 0, .nsec = 500_000_000 };
+    const POLL_MS: u32 = 500;
     // Sample once immediately so the panel / Grafana show real values from the
     // first scrape instead of zeros for the first interval.
     sampleGauges(ctx);
     var tick: u64 = 0;
     while (!ctx.stop.load(.monotonic)) {
-        _ = std.c.nanosleep(&poll_ts, null);
+        platform.sleepMs(POLL_MS);
         tick += 1;
         if (tick < SAMPLE_INTERVAL_TICKS) continue;
         tick = 0;
@@ -8225,8 +8231,7 @@ fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, 
                 }
                 if (stream.peerClosed()) return; // client gave up while we waited
                 l.pokeDiscovery();
-                const ts = std.c.timespec{ .sec = 0, .nsec = 250_000_000 };
-                _ = std.c.nanosleep(&ts, null);
+                platform.sleepMs(250);
             },
         }
     };
@@ -8356,6 +8361,12 @@ test "apiKeyAuthorized accepts Bearer, x-api-key, Basic, and query param" {
 }
 
 test "lanShareDenial: shared inference surface only, resolved like dispatch" {
+    // Needs a Lan that can actually SHARE. The stub transport never does (no
+    // Bonjour off Apple), so the denial it returns is the correct one for this
+    // build but not the one this test is about. The policy half -- routeClass x
+    // SharedSet, where the keyless gate actually lives -- is covered by
+    // lan_policy.zig's tests, which run on every host.
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const a = std.testing.allocator;
     const reg = try ModelRegistry.init(a, std.Io.Threaded.global_single_threaded.io(), null, 8, 0, null);
     defer reg.deinit();
@@ -10000,10 +10011,10 @@ fn appendLfm2Tiles(
         }
     }
     log.info("  Decoded {d}x{d} image → lfm2 {d}x{d} tiles{s} on a {d}x{d} canvas ({d} tokens)\n", .{
-        src.w,     src.h,
-        grid.rows, grid.cols,
+        src.w,      src.h,
+        grid.rows,  grid.cols,
         thumb_note, canvas_w,
-        canvas_h,  @as(usize, n_tiles) * per_tile + (if (thumb_note.len > 0) thumb_tokens else 0),
+        canvas_h,   @as(usize, n_tiles) * per_tile + (if (thumb_note.len > 0) thumb_tokens else 0),
     });
 }
 
@@ -11794,7 +11805,7 @@ fn handleAnthropicStreaming(
         if (log.isDebug() and text_buf.items.len > 0) {
             log.debug("  raw generated text before tool parse ({d}b): {s}\n", .{ text_buf.items.len, text_buf.items[0..@min(text_buf.items.len, 4000)] });
             if (std.c.getenv("MLX_SERVE_RAW_DUMP_FILE")) |dump_path| {
-                appendRawToolDump(std.mem.span(dump_path), tools_json, text_buf.items);
+                appendRawToolDump(stream.io, std.mem.span(dump_path), tools_json, text_buf.items);
             }
         }
         // Merge re-opened mid-text thought channels into the leading block so
@@ -14222,14 +14233,12 @@ const testing = std.testing;
 
 test "Conn.peerClosed: alive socket returns false, closed peer returns true" {
     // Create a connected socket pair (AF_UNIX SOCK_STREAM via socketpair).
-    var sv: [2]std.posix.fd_t = undefined;
-    const AF_UNIX: c_uint = 1;
-    const SOCK_STREAM: c_uint = 1;
-    const rc = std.c.socketpair(AF_UNIX, SOCK_STREAM, 0, &sv);
-    try testing.expect(rc == 0);
-
-    const server_fd = sv[0];
-    const client_fd = sv[1];
+    // socketpair(2) is POSIX-only; platform.connectedPair builds the same
+    // thing over TCP loopback on Windows, so this test keeps running on the
+    // host whose peerClosed implementation is the NEW one.
+    const pair = try platform.connectedPair();
+    const server_fd = pair.a;
+    const client_fd = pair.b;
 
     // Build a Conn that wraps the server-side fd. We only need
     // `stream.socket.handle` for peerClosed, so the Reader/Writer state
@@ -14241,12 +14250,12 @@ test "Conn.peerClosed: alive socket returns false, closed peer returns true" {
     try testing.expect(!conn.peerClosed());
 
     // Client closes its side → server should observe FIN/HUP.
-    _ = std.c.close(client_fd);
+    platform.closeSocket(client_fd);
 
     // socketpair() returns connected sockets in the kernel; close-of-peer
     // is observable immediately on the other side without delay.
     const closed = conn.peerClosed();
-    _ = std.c.close(server_fd);
+    platform.closeSocket(server_fd);
     try testing.expect(closed);
 }
 
@@ -14710,6 +14719,12 @@ test "auto-context on a 16 GB profile: activations are a chunk reserve, not a pe
 }
 
 test "aneGateHeadroom: reserves a usable context and scales with the chunk" {
+    // MLX-only billing math: the terms under test come from transformer.zig
+    // (fused-kernel head dims, the dequant-GEMM floor) and ane.zig, none of
+    // which a -Dgguf-only build contains -- llama.cpp bills its own KV and
+    // activations internally. The behaviour is ABSENT here, not merely
+    // untested, so a skip is the honest report; it stays a real test on macOS.
+    if (comptime !@import("build_cfg.zig").mlx_enabled) return error.SkipZigTest;
     const t = std.testing;
     var cfg = model_mod.ModelConfig{ .model_type = "qwen3_5" };
     cfg.num_attention_heads = 24;
@@ -15093,11 +15108,16 @@ test "lfm2ImageSegment labels every tile and closes on the thumbnail" {
     // (0,0)=124908, (0,1)=124909, (1,0)=124918, (1,1)=124919.
     const want = [_]u32{
         125009,
-        124908, 124907,
-        124909, 124907,
-        124918, 124907,
-        124919, 124907,
-        125008, 124907,
+        124908,
+        124907,
+        124909,
+        124907,
+        124918,
+        124907,
+        124919,
+        124907,
+        125008,
+        124907,
         125010,
     };
     try testing.expectEqualSlices(u32, &want, seg);
@@ -15893,8 +15913,7 @@ test "parseReasoningEffort: a template that READS the effort word gets no budget
         try std.testing.expect(got.enable);
         try std.testing.expectEqual(case.want, got.budget);
         // The raw string rides along either way — the template still renders it.
-        try std.testing.expectEqualStrings(
-            parsed.value.object.get("reasoning_effort").?.string, got.effort.?);
+        try std.testing.expectEqualStrings(parsed.value.object.get("reasoning_effort").?.string, got.effort.?);
     }
 }
 
@@ -16300,6 +16319,12 @@ test "prefillMemoryNeeded: working set is chunk-bounded — the 255K MoE prompt 
 }
 
 test "prefillMemoryNeeded: unfused head dims bill the materialized score scratch" {
+    // MLX-only billing math: the terms under test come from transformer.zig
+    // (fused-kernel head dims, the dequant-GEMM floor) and ane.zig, none of
+    // which a -Dgguf-only build contains -- llama.cpp bills its own KV and
+    // activations internally. The behaviour is ABSENT here, not merely
+    // untested, so a skip is the honest report; it stays a real test on macOS.
+    if (comptime !@import("build_cfg.zig").mlx_enabled) return error.SkipZigTest;
     const t = std.testing;
     transformer_mod.fused256_override = false;
     defer transformer_mod.fused256_override = null;
@@ -16319,6 +16344,12 @@ test "prefillMemoryNeeded: unfused head dims bill the materialized score scratch
 }
 
 test "prefillMemoryNeeded: the SCORE width decides the score term, not the stored width" {
+    // MLX-only billing math: the terms under test come from transformer.zig
+    // (fused-kernel head dims, the dequant-GEMM floor) and ane.zig, none of
+    // which a -Dgguf-only build contains -- llama.cpp bills its own KV and
+    // activations internally. The behaviour is ABSENT here, not merely
+    // untested, so a skip is the honest report; it stays a real test on macOS.
+    if (comptime !@import("build_cfg.zig").mlx_enabled) return error.SkipZigTest;
     // bailing_hybrid: MLA contracts scores over qk_head_dim 192 while storing
     // values at v_head_dim 128 and declaring head_dim 128. mlx has a fused
     // vector kernel for that pair at DECODE and falls back to the composed
@@ -16345,6 +16376,12 @@ test "prefillMemoryNeeded: the SCORE width decides the score term, not the store
 }
 
 test "prefillMemoryNeeded: fused hd-256 kernel drops the score bill, keeps KV + dequant" {
+    // MLX-only billing math: the terms under test come from transformer.zig
+    // (fused-kernel head dims, the dequant-GEMM floor) and ane.zig, none of
+    // which a -Dgguf-only build contains -- llama.cpp bills its own KV and
+    // activations internally. The behaviour is ABSENT here, not merely
+    // untested, so a skip is the honest report; it stays a real test on macOS.
+    if (comptime !@import("build_cfg.zig").mlx_enabled) return error.SkipZigTest;
     const t = std.testing;
     // Default (msv_attn_p256 active): the composed score scratch never exists,
     // so hd 256 bills exactly the hd-256 KV + mlp — the unfused bill minus the
@@ -16412,6 +16449,12 @@ test "resolvePrefillChunk: a squeezed box steps the chunk down; a roomy one keep
 }
 
 test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinned" {
+    // MLX-only billing math: the terms under test come from transformer.zig
+    // (fused-kernel head dims, the dequant-GEMM floor) and ane.zig, none of
+    // which a -Dgguf-only build contains -- llama.cpp bills its own KV and
+    // activations internally. The behaviour is ABSENT here, not merely
+    // untested, so a skip is the honest report; it stays a real test on macOS.
+    if (comptime !@import("build_cfg.zig").mlx_enabled) return error.SkipZigTest;
     // The whole point of pinning: `prefillTransientReserve` (sizer) and
     // `prefillMemoryNeeded` (guard) must move together with the resolved width.
     // A narrower pin has to produce a SMALLER bill for the same prompt, or the
@@ -16504,6 +16547,12 @@ test "prefillMemoryNeeded: every MEASURED prefill peak on the box is billed for"
 }
 
 test "prefillMemoryNeeded: the new terms fire only where the measurement put them" {
+    // MLX-only billing math: the terms under test come from transformer.zig
+    // (fused-kernel head dims, the dequant-GEMM floor) and ane.zig, none of
+    // which a -Dgguf-only build contains -- llama.cpp bills its own KV and
+    // activations internally. The behaviour is ABSENT here, not merely
+    // untested, so a skip is the honest report; it stays a real test on macOS.
+    if (comptime !@import("build_cfg.zig").mlx_enabled) return error.SkipZigTest;
     const t = std.testing;
     transformer_mod.fused256_override = true;
     defer transformer_mod.fused256_override = null;
@@ -16588,6 +16637,12 @@ test "prefillStreamBytesPerToken: keyed on the arch's own geometry, zero for pla
 }
 
 test "prefillDequantWeightBytes: affine-quantized weights only, and it reads the route's kill switch" {
+    // MLX-only billing math: the terms under test come from transformer.zig
+    // (fused-kernel head dims, the dequant-GEMM floor) and ane.zig, none of
+    // which a -Dgguf-only build contains -- llama.cpp bills its own KV and
+    // activations internally. The behaviour is ABSENT here, not merely
+    // untested, so a skip is the honest report; it stays a real test on macOS.
+    if (comptime !@import("build_cfg.zig").mlx_enabled) return error.SkipZigTest;
     const t = std.testing;
     var cfg = model_mod.ModelConfig{ .model_type = "muse_glimmer" };
     cfg.hidden_size = 6656;
@@ -16616,6 +16671,12 @@ test "prefillDequantWeightBytes: affine-quantized weights only, and it reads the
 }
 
 test "prefillMemoryNeeded: a sparse-attention arch bills its KEY BOUND, not the whole prompt" {
+    // MLX-only billing math: the terms under test come from transformer.zig
+    // (fused-kernel head dims, the dequant-GEMM floor) and ane.zig, none of
+    // which a -Dgguf-only build contains -- llama.cpp bills its own KV and
+    // activations internally. The behaviour is ABSENT here, not merely
+    // untested, so a skip is the honest report; it stays a real test on macOS.
+    if (comptime !@import("build_cfg.zig").mlx_enabled) return error.SkipZigTest;
     const t = std.testing;
     // DeepSeek-V4-Flash shape (live 2026-07-31): 64 heads, ONE latent kv head,
     // 43 layers, head_dim 512 — outside every fused kernel, so the score term
@@ -16710,24 +16771,19 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     // are the same class of parameter: derived from the CONFIG at the site, or
     // a GatedDeltaNet hybrid gets an attention arch's bill (measured 33% low)
     // and a quantized checkpoint gets a dense one's.
-    try t.expect(std.mem.indexOf(u8, src,
-        "config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config));") != null);
-    try t.expect(std.mem.indexOf(u8, src,
-        "        config.prefillAttnKeys(chunk),\n        prefillStreamBytesPerToken(config),\n        prefillDequantWeightBytes(config),\n") != null);
+    try t.expect(std.mem.indexOf(u8, src, "config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config));") != null);
+    try t.expect(std.mem.indexOf(u8, src, "        config.prefillAttnKeys(chunk),\n        prefillStreamBytesPerToken(config),\n        prefillDequantWeightBytes(config),\n") != null);
 
     // Auto-context sizing reads the same helpers — the two must not drift.
     // The KV width: both bill through `kvBytesPerTokenAtBits`, so a
     // `--kv-quant 4` server cannot size its context against fp16 while the
     // guard admits against 4-bit (that mismatch reported a third of what fits).
-    try t.expect(std.mem.indexOf(u8, src,
-        "const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);") != null);
-    try t.expect(std.mem.indexOf(u8, src,
-        "const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);") != null);
+    try t.expect(std.mem.indexOf(u8, src, "const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);") != null);
+    try t.expect(std.mem.indexOf(u8, src, "const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);") != null);
     // The prefill transient: the sizer RESERVES it once at the chunk width
     // (`prefillTransientReserve` is the same estimator with the KV term zeroed),
     // never as a per-token multiplier on the context it is solving for.
-    try t.expect(std.mem.indexOf(u8, src,
-        "prefix_cache_mem_bytes +| prefillTransientReserve(config, kv_bits, chunk)") != null);
+    try t.expect(std.mem.indexOf(u8, src, "prefix_cache_mem_bytes +| prefillTransientReserve(config, kv_bits, chunk)") != null);
 }
 
 test "the chunk the guard BILLS is the chunk the forward will RUN" {
@@ -16763,8 +16819,7 @@ test "the chunk the guard BILLS is the chunk the forward will RUN" {
     // scheduler sources it from `slot.model.config` — the same object the
     // guard bills against.
     const sched = @embedFile("scheduler.zig");
-    try t.expect(std.mem.indexOf(u8, sched,
-        ".pinned_prefill_chunk = if (slot.model.config) |c| c.pinned_prefill_chunk else 0,") != null);
+    try t.expect(std.mem.indexOf(u8, sched, ".pinned_prefill_chunk = if (slot.model.config) |c| c.pinned_prefill_chunk else 0,") != null);
     try t.expect(std.mem.indexOf(u8, srcs[1], "xfm.config.pinned_prefill_chunk") == null);
 
     // And the width has to be frozen BEFORE anything is computed from it:

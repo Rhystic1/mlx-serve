@@ -32,27 +32,29 @@
 //! plus a cv broadcast.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const transformer_mod = @import("transformer.zig");
+const builtin = @import("builtin");
+const platform = @import("platform.zig");
+const mlx = if (@import("build_cfg.zig").mlx_enabled) @import("mlx.zig") else @import("mlx_stub.zig");
+const transformer_mod = if (@import("build_cfg.zig").mlx_enabled) @import("transformer.zig") else @import("transformer_stub.zig");
 const tokenizer_mod = @import("tokenizer.zig");
-const generate_mod = @import("generate.zig");
-const gen_mod = @import("gen.zig");
-const drafter_mod = @import("drafter.zig");
-const mtp_mod = @import("mtp.zig");
-const ane_mod = @import("ane.zig");
-const diffusion_mod = @import("diffusion.zig");
+const generate_mod = if (@import("build_cfg.zig").mlx_enabled) @import("generate.zig") else @import("generate_stub.zig");
+const gen_mod = if (@import("build_cfg.zig").mlx_enabled) @import("gen.zig") else @import("gen_stub.zig");
+const drafter_mod = if (@import("build_cfg.zig").mlx_enabled) @import("drafter.zig") else @import("spec_stub.zig");
+const mtp_mod = if (@import("build_cfg.zig").mlx_enabled) @import("mtp.zig") else @import("spec_stub.zig");
+const ane_mod = if (@import("build_cfg.zig").mlx_enabled) @import("ane.zig") else @import("ane_stub.zig");
+const diffusion_mod = if (@import("build_cfg.zig").mlx_enabled) @import("diffusion.zig") else @import("diffusion_stub.zig");
 const model_mod = @import("model.zig");
-const vision_mod = @import("vision.zig");
+const vision_mod = if (@import("build_cfg.zig").mlx_enabled) @import("vision.zig") else @import("vision_stub.zig");
 const chat_mod = @import("chat.zig");
-const prefix_cache_mod = @import("prefix_cache.zig");
+const prefix_cache_mod = if (@import("build_cfg.zig").mlx_enabled) @import("prefix_cache.zig") else @import("mlx_cache_stub.zig");
 const metrics_mod = @import("metrics.zig");
-const kv_disk_cache = @import("kv_disk_cache.zig");
+const kv_disk_cache = if (@import("build_cfg.zig").mlx_enabled) @import("kv_disk_cache.zig") else @import("mlx_cache_stub.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
-const arch_ds4 = if (@import("build_options").ios) @import("arch/ds4_stub.zig") else @import("arch/ds4.zig");
-const arch_llama = if (@import("build_options").ios) @import("arch/llama_stub.zig") else @import("arch/llama.zig");
+const arch_ds4 = if (@import("build_cfg.zig").ds4_enabled) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const arch_llama = if (@import("build_cfg.zig").llama_enabled) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const status = @import("status.zig");
@@ -66,7 +68,7 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const Generator = generate_mod.Generator;
 const SamplingParams = generate_mod.SamplingParams;
 const DrafterModel = drafter_mod.DrafterModel;
-const dflash_mod = @import("dflash.zig");
+const dflash_mod = if (@import("build_cfg.zig").mlx_enabled) @import("dflash.zig") else @import("spec_stub.zig");
 const DflashModel = dflash_mod.DflashModel;
 const VisionEncoder = vision_mod.VisionEncoder;
 const Weights = model_mod.Weights;
@@ -1950,8 +1952,7 @@ pub const Scheduler = struct {
     /// (measured 2.4x on concurrent GDN decode). Same class as "a guard that shapes
     /// INIT options does not bind DISPATCH".
     fn slotTicksRegular(slot: *const Slot) bool {
-        const gen = if (slot.legacy_gen) |*g| g else
-            return !(slot.enable_pld or slot.enable_drafter or slot.enable_mtp);
+        const gen = if (slot.legacy_gen) |*g| g else return !(slot.enable_pld or slot.enable_drafter or slot.enable_mtp);
         // A runtime-disabled generator is already ticking regular, so batching it
         // dispatches what it was going to dispatch anyway.
         //
@@ -2678,6 +2679,13 @@ fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
 }
 
 test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
+    // Creating a symlink on Windows needs Developer Mode or SeCreateSymbolicLink
+    // privilege, which a plain `zig build test` will not have. Skip rather than
+    // fail: the behaviour under test (size sums follow links) is a real
+    // invariant on the hosts where HF hub caches actually use symlinks, and a
+    // false red here would train people to ignore the suite. The skip is
+    // VISIBLE in the runner output, not a silent pass.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     // A model served straight out of the HuggingFace hub cache is a snapshot
     // dir of SYMLINKS into ../../blobs. Skipping .sym_link entries measured a
     // 121 GB checkpoint at 0 bytes, and memInsufficientForLoad treats 0 as
@@ -2695,10 +2703,10 @@ test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
     // …and a symlink to a DIRECTORY must not be summed (statFile follows it).
     try tmp.dir.symLink(io, "../../blobs", "snapshots/rev/dir.safetensors", .{});
 
-    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
-    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
-    const snap = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/snapshots/rev", .{ cwd, tmp.sub_path });
+    var snap_base: [4096]u8 = undefined;
+    const snap_root = try platform.tmpDirPath(&snap_base, &tmp.sub_path);
+    const sep = std.fs.path.sep_str;
+    const snap = try std.fmt.allocPrint(std.testing.allocator, "{s}" ++ sep ++ "snapshots" ++ sep ++ "rev", .{snap_root});
     defer std.testing.allocator.free(snap);
 
     try std.testing.expectEqual(@as(u64, 16), modelDiskBytes(io, snap));
@@ -2783,8 +2791,7 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
         "llama_kv_type_k",         "llama_kv_type_v",           "ds4_mtp",
         "ds4_dspark",              "ds4_ssd_streaming",         "no_drafter",
         "draft_block_size",        "draft_block_size_explicit", "ane_prefill",
-        "ane_chunk_resolver",
-        "ane_headroom_resolver",
+        "ane_chunk_resolver",      "ane_headroom_resolver",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);

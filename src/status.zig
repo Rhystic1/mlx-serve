@@ -2,6 +2,20 @@ const std = @import("std");
 const builtin = @import("builtin");
 const is_macos = builtin.os.tag == .macos;
 
+/// Per-host implementation of the probes below. The macOS bodies live inline in
+/// this file (they are also the iOS path, minus IOKit); everything else
+/// delegates.
+///
+/// These numbers are load-bearing, not cosmetic: `getTotalMemBytes` and
+/// `getAvailableMemBytes` feed the model-load admission gate and the
+/// auto-context sizer. A host without a real implementation must not silently
+/// report zero — it would make every load decision on wrong numbers.
+const impl = switch (builtin.os.tag) {
+    .windows => @import("status_windows.zig"),
+    else => @This(),
+};
+const delegate = builtin.os.tag == .windows;
+
 // ── macOS Mach externs ──
 
 extern "c" var mach_task_self_: u32;
@@ -102,6 +116,7 @@ var prev_ticks: [4]u64 = @splat(0);
 // ── Public metric helpers ──
 
 pub fn getAppRssMb() u32 {
+    if (comptime delegate) return impl.getAppRssMb();
     var info = std.mem.zeroes(TaskBasicInfo);
     var count: u32 = @sizeOf(TaskBasicInfo) / @sizeOf(i32);
     if (task_info(mach_task_self_, 20, @ptrCast(&info), &count) != 0) return 0;
@@ -112,6 +127,7 @@ pub fn getAppRssMb() u32 {
 /// resident_size, this includes MLX's Metal/IOKit + compressed memory — the
 /// only figure that reflects a loaded model's true footprint on Apple Silicon.
 pub fn getAppMemFootprintMb() u32 {
+    if (comptime delegate) return impl.getAppMemFootprintMb();
     var info = std.mem.zeroes(TaskVmInfo);
     var count: u32 = @sizeOf(TaskVmInfo) / @sizeOf(i32); // 38 = TASK_VM_INFO_REV1_COUNT
     if (task_info(mach_task_self_, 22, @ptrCast(&info), &count) != 0) return 0;
@@ -154,12 +170,14 @@ extern "c" fn os_proc_available_memory() usize;
 /// Returns 0 on macOS, where the concept doesn't apply; the symbol is only
 /// referenced on iOS builds so macOS links are unaffected.
 pub fn getProcAvailableMemBytes() u64 {
+    if (comptime delegate) return impl.getProcAvailableMemBytes();
     if (comptime builtin.os.tag != .ios) return 0;
     return @intCast(os_proc_available_memory());
 }
 
 /// Total physical RAM (hw.memsize; works on macOS and iOS). 0 on failure.
 pub fn getTotalMemBytes() u64 {
+    if (comptime delegate) return impl.getTotalMemBytes();
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
     if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
@@ -167,6 +185,7 @@ pub fn getTotalMemBytes() u64 {
 }
 
 pub fn getAvailableMemBytes() u64 {
+    if (comptime delegate) return impl.getAvailableMemBytes();
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
     if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
@@ -213,6 +232,7 @@ test "computeAvailableBytes counts the resident anon set, not file cache or purg
 }
 
 pub fn getSysMemPct() u32 {
+    if (comptime delegate) return impl.getSysMemPct();
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
     if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
@@ -230,6 +250,7 @@ pub fn getSysMemPct() u32 {
 }
 
 pub fn getCpuPct() u32 {
+    if (comptime delegate) return impl.getCpuPct();
     var info = std.mem.zeroes(CpuLoadInfo);
     var count: u32 = 4;
     if (host_statistics(mach_host_self(), 3, @ptrCast(&info), &count) != 0) return 0;
@@ -248,6 +269,7 @@ pub fn getCpuPct() u32 {
 }
 
 pub fn getGpuPct() u32 {
+    if (comptime delegate) return impl.getGpuPct();
     // IOKit's IOServiceMatching/AGXAccelerator path is macOS-only; the symbols
     // aren't in the public iOS SDK (and apps are sandboxed from the GPU service
     // registry anyway). On iOS we report 0 — the value is only a log-line stat.

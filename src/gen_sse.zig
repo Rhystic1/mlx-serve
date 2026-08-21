@@ -5,6 +5,7 @@
 //! their single-response shape.
 
 const std = @import("std");
+const platform = @import("platform.zig");
 const server_mod = @import("server.zig");
 const Conn = server_mod.Conn;
 
@@ -204,10 +205,11 @@ test "a NON-streaming job still gets a cancellation probe, and writes no SSE" {
     // every queued request waits behind it. Streaming requests latch on a
     // failed progress write; a non-streaming one has no write to fail, so it
     // used to have no cancellation at all.
-    var sv: [2]std.posix.fd_t = undefined;
-    try std.testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0); // AF_UNIX, SOCK_STREAM
+    // socketpair(2) is POSIX-only; platform.connectedPair builds the same
+    // thing over TCP loopback on Windows.
+    const pair = try platform.connectedPair();
     var conn: Conn = undefined;
-    conn.stream = .{ .socket = .{ .handle = sv[0], .address = undefined } };
+    conn.stream = .{ .socket = .{ .handle = pair.a, .address = undefined } };
     conn.ollama_sink = null;
 
     var sctx = StreamCtx{ .conn = &conn, .stream = false };
@@ -217,12 +219,12 @@ test "a NON-streaming job still gets a cancellation probe, and writes no SSE" {
     // Emitting must put NOTHING on the wire: this response is a single JSON
     // body, and an SSE event spliced into it is unparseable.
     p.emit("Generating", 1, 15);
-    var peek: [1]u8 = undefined;
-    const n = std.c.recv(sv[1], &peek, peek.len, std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT);
-    try std.testing.expect(n <= 0);
+    // Nothing must be on the wire: MSG_DONTWAIT does not exist on Windows, and
+    // "not readable" is the property being asserted anyway.
+    try std.testing.expect(platform.pollSocket(pair.b, 0) == .idle);
 
-    _ = std.c.close(sv[1]); // client hangs up mid-generation
+    platform.closeSocket(pair.b); // client hangs up mid-generation
     const cancelled = p.cancelled();
-    _ = std.c.close(sv[0]);
+    platform.closeSocket(pair.a);
     try std.testing.expect(cancelled);
 }

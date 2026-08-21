@@ -36,7 +36,7 @@ pub fn setLevel(level: Level) void {
 }
 
 pub fn isDebug() bool {
-    return @intFromEnum(current_level) >= @intFromEnum(Level.debug);
+    return @backingInt(current_level) >= @backingInt(Level.debug);
 }
 
 // ── File sink ──
@@ -53,18 +53,26 @@ pub const default_max_bytes: u64 = 32 * 1024 * 1024;
 const line_buf_len = 16 * 1024;
 const truncation_marker = "…[mlx-serve: log line truncated]\n";
 
-/// A pthread mutex, not `std.Io.Mutex`: locking the latter needs an `Io`
-/// handle, and log calls arrive from threads that don't carry one.
-var sink_mutex: std.c.pthread_mutex_t = .{};
+/// The sink's `Io`, captured at `openFile`. Log calls arrive from the accept
+/// loop, every connection thread and the inference thread, none of which carry
+/// an `Io` of their own — so the sink stores the one its opener had. Reading it
+/// from other threads is safe because the handle is a plain interface value
+/// (vtable + context) and the implementation behind it is thread-safe.
+///
+/// This replaced a raw-libc (`open`/`write`/`pthread_mutex_t`) sink. That layer
+/// does not exist off POSIX: this Zig has no `std.fs`, no `std.posix.open`, and
+/// `std.c.open` is not even declarable under the Windows calling convention
+/// ("parameter of type 'void' not allowed"). `std.Io` is the one file API that
+/// spans all three hosts.
+var sink_io: ?std.Io = null;
 
-fn lockSink() void {
-    _ = std.c.pthread_mutex_lock(&sink_mutex);
-}
-fn unlockSink() void {
-    _ = std.c.pthread_mutex_unlock(&sink_mutex);
-}
+/// Serializes writes + rotation. `std.Io.Mutex` is the codebase-wide idiom.
+var sink_mutex: std.Io.Mutex = .init;
 
-var sink_fd: c_int = -1;
+var sink_file: ?std.Io.File = null;
+/// Doubles as the rotation counter AND the write offset: the sink writes
+/// positionally rather than opening in append mode, because a tracked offset is
+/// portable while O_APPEND is not, and every write already holds the mutex.
 var sink_bytes: u64 = 0;
 var sink_max_bytes: u64 = default_max_bytes;
 var sink_path_buf: [1024]u8 = undefined;
@@ -90,64 +98,63 @@ pub fn shouldRotate(current_bytes: u64, incoming: usize, max_bytes: u64) bool {
     return current_bytes + incoming > max_bytes;
 }
 
-fn openAppend(path_z: [*:0]const u8, truncate: bool) c_int {
-    return std.c.open(path_z, .{
-        .ACCMODE = .WRONLY,
-        .CREAT = true,
-        .APPEND = !truncate,
-        .TRUNC = truncate,
-    }, @as(std.c.mode_t, 0o644));
+/// Directory portion of `path`, or null when it has none.
+///
+/// Splits on BOTH separators, not just '/': `defaultLogPath` builds forward
+/// slashes but `--log-file` on Windows is typed with backslashes, and a
+/// '/'-only scan would treat `C:\...\logs\x.log` as having no parent and then
+/// fail to create it.
+pub fn parentDir(path: []const u8) ?[]const u8 {
+    const fwd = std.mem.lastIndexOfScalar(u8, path, '/');
+    const back = std.mem.lastIndexOfScalar(u8, path, '\\');
+    const cut = if (fwd != null and back != null)
+        @max(fwd.?, back.?)
+    else
+        fwd orelse back orelse return null;
+    if (cut == 0) return null; // a root-relative path has no parent to create
+    return path[0..cut];
 }
 
-/// `mkdir -p` for the directory holding `path`. Existing components (EEXIST)
-/// are fine; a genuinely unwritable path surfaces later as OpenLogFileFailed.
-fn makeParentDirs(path: []const u8) void {
-    const last_slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return;
-    var buf: [1024]u8 = undefined;
-    var i: usize = 1; // skip a leading '/'
-    while (i <= last_slash) : (i += 1) {
-        if (i == last_slash or path[i] == '/') {
-            @memcpy(buf[0..i], path[0..i]);
-            buf[i] = 0;
-            _ = std.c.mkdir(@ptrCast(&buf), @as(std.c.mode_t, 0o755));
-        }
-    }
+/// `mkdir -p` for the directory holding `path`. An already-existing tree is
+/// fine; a genuinely unwritable path surfaces later as OpenLogFileFailed.
+fn makeParentDirs(io: std.Io, path: []const u8) void {
+    const parent = parentDir(path) orelse return;
+    std.Io.Dir.cwd().createDirPath(io, parent) catch {};
 }
 
 /// Open (create/append) a log file, creating parent directories as needed.
 /// `max_bytes` of 0 disables rotation. Errors are returned so the caller can
 /// warn — a failure here is never fatal to the server.
-pub fn openFile(path: []const u8, max_bytes: u64) !void {
+pub fn openFile(io: std.Io, path: []const u8, max_bytes: u64) !void {
     if (path.len == 0 or path.len >= sink_path_buf.len) return error.InvalidLogPath;
 
-    makeParentDirs(path);
+    makeParentDirs(io, path);
 
-    var path_z: [1024]u8 = undefined;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
+    // truncate=false so reopening APPENDS: a restarted server keeps its history.
+    const file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false }) catch
+        return error.OpenLogFileFailed;
+    const end = file.length(io) catch 0;
 
-    const fd = openAppend(@ptrCast(&path_z), false);
-    if (fd < 0) return error.OpenLogFileFailed;
-
-    lockSink();
-    defer unlockSink();
-    if (sink_fd >= 0) _ = std.c.close(sink_fd);
-    sink_fd = fd;
+    sink_mutex.lock(io) catch return error.OpenLogFileFailed;
+    defer sink_mutex.unlock(io);
+    if (sink_file) |f| f.close(io);
+    sink_io = io;
+    sink_file = file;
     sink_max_bytes = max_bytes;
-    // Start the rotation counter at the file's current size.
-    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
-    sink_bytes = if (end > 0) @intCast(end) else 0;
+    // Start the rotation counter (and the write offset) at the file's size.
+    sink_bytes = end;
     @memcpy(sink_path_buf[0..path.len], path);
     sink_path_len = path.len;
     @atomicStore(bool, &sink_active, true, .release);
 }
 
 pub fn closeFile() void {
-    lockSink();
-    defer unlockSink();
+    const io = sink_io orelse return;
+    sink_mutex.lock(io) catch return;
+    defer sink_mutex.unlock(io);
     @atomicStore(bool, &sink_active, false, .release);
-    if (sink_fd >= 0) _ = std.c.close(sink_fd);
-    sink_fd = -1;
+    if (sink_file) |f| f.close(io);
+    sink_file = null;
     sink_bytes = 0;
     sink_path_len = 0;
 }
@@ -159,36 +166,37 @@ pub fn filePath() ?[]const u8 {
 }
 
 /// Caller holds `sink_mutex`.
-fn rotateLocked() void {
+fn rotateLocked(io: std.Io) void {
     if (sink_path_len == 0) return;
-    var live: [1024]u8 = undefined;
-    var prev: [1024]u8 = undefined;
-    @memcpy(live[0..sink_path_len], sink_path_buf[0..sink_path_len]);
-    live[sink_path_len] = 0;
-    @memcpy(prev[0..sink_path_len], sink_path_buf[0..sink_path_len]);
-    @memcpy(prev[sink_path_len..][0..2], ".1");
-    prev[sink_path_len + 2] = 0;
+    const live = sink_path_buf[0..sink_path_len];
+    var prev_buf: [1024 + 2]u8 = undefined;
+    @memcpy(prev_buf[0..sink_path_len], live);
+    @memcpy(prev_buf[sink_path_len..][0..2], ".1");
+    const prev = prev_buf[0 .. sink_path_len + 2];
 
-    if (sink_fd >= 0) _ = std.c.close(sink_fd);
-    _ = std.c.rename(@ptrCast(&live), @ptrCast(&prev));
-    sink_fd = openAppend(@ptrCast(&live), true);
+    if (sink_file) |f| f.close(io);
+    sink_file = null;
+    // `rename` rather than `renameAbsolute`: the latter asserts both paths are
+    // absolute (it is otherwise the identical cwd-relative call), and a log path
+    // may legitimately be relative -- `--log-file server.log`, and the tests.
+    const cwd = std.Io.Dir.cwd();
+    cwd.rename(live, cwd, prev, io) catch {};
+    sink_file = std.Io.Dir.cwd().createFile(io, live, .{ .truncate = true }) catch null;
     sink_bytes = 0;
-    if (sink_fd < 0) @atomicStore(bool, &sink_active, false, .release);
+    if (sink_file == null) @atomicStore(bool, &sink_active, false, .release);
 }
 
 fn writeToSink(bytes: []const u8) void {
-    lockSink();
-    defer unlockSink();
-    if (sink_fd < 0) return;
-    if (shouldRotate(sink_bytes, bytes.len, sink_max_bytes)) rotateLocked();
-    if (sink_fd < 0) return;
+    const io = sink_io orelse return;
+    sink_mutex.lock(io) catch return;
+    defer sink_mutex.unlock(io);
+    if (sink_file == null) return;
+    if (shouldRotate(sink_bytes, bytes.len, sink_max_bytes)) rotateLocked(io);
+    const file = sink_file orelse return;
 
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = std.c.write(sink_fd, bytes.ptr + off, bytes.len - off);
-        if (n <= 0) return; // ENOSPC / EIO: drop the line, never kill the server
-        off += @intCast(n);
-    }
+    // Positional, at the tracked offset — see `sink_bytes`. A failed write is
+    // swallowed (ENOSPC / EIO): logging must never take the server down.
+    file.writePositionalAll(io, bytes, sink_bytes) catch return;
     sink_bytes += bytes.len;
 }
 
@@ -234,25 +242,25 @@ fn emit(comptime fmt: []const u8, args: anytype) void {
 }
 
 pub fn info(comptime fmt: []const u8, args: anytype) void {
-    if (@intFromEnum(current_level) >= @intFromEnum(Level.info)) {
+    if (@backingInt(current_level) >= @backingInt(Level.info)) {
         emit(fmt, args);
     }
 }
 
 pub fn warn(comptime fmt: []const u8, args: anytype) void {
-    if (@intFromEnum(current_level) >= @intFromEnum(Level.warn)) {
+    if (@backingInt(current_level) >= @backingInt(Level.warn)) {
         emit(fmt, args);
     }
 }
 
 pub fn err(comptime fmt: []const u8, args: anytype) void {
-    if (@intFromEnum(current_level) >= @intFromEnum(Level.err)) {
+    if (@backingInt(current_level) >= @backingInt(Level.err)) {
         emit(fmt, args);
     }
 }
 
 pub fn debug(comptime fmt: []const u8, args: anytype) void {
-    if (@intFromEnum(current_level) >= @intFromEnum(Level.debug)) {
+    if (@backingInt(current_level) >= @backingInt(Level.debug)) {
         emit(fmt, args);
     }
 }
@@ -276,9 +284,9 @@ test "Level.fromString invalid returns null" {
 
 test "Level ordering" {
     // err < warn < info < debug
-    try testing.expect(@intFromEnum(Level.err) < @intFromEnum(Level.warn));
-    try testing.expect(@intFromEnum(Level.warn) < @intFromEnum(Level.info));
-    try testing.expect(@intFromEnum(Level.info) < @intFromEnum(Level.debug));
+    try testing.expect(@backingInt(Level.err) < @backingInt(Level.warn));
+    try testing.expect(@backingInt(Level.warn) < @backingInt(Level.info));
+    try testing.expect(@backingInt(Level.info) < @backingInt(Level.debug));
 }
 
 test "setLevel changes current level" {
@@ -315,17 +323,33 @@ test "shouldRotate: caps growth, never loops on an oversized first line" {
 // NOTE: the sink is a process-global singleton, so every assertion about it
 // lives in ONE test — the build runner executes tests in parallel and two
 // tests calling `openFile` would fight over `sink_fd`.
+test "parentDir splits on both separators" {
+    // `--log-file` on Windows is typed with backslashes; a '/'-only scan would
+    // report "no parent" and then silently fail to create the directory.
+    try testing.expectEqualStrings("/a/b", parentDir("/a/b/c.log").?);
+    try testing.expectEqualStrings("C:\\a\\b", parentDir("C:\\a\\b\\c.log").?);
+    try testing.expectEqualStrings("C:/a\\b", parentDir("C:/a\\b/c.log").?);
+    try testing.expect(parentDir("c.log") == null);
+    try testing.expect(parentDir("/c.log") == null); // nothing to create
+}
+
 test "file sink: writes lines, honors level, survives reopen, rotates at the cap" {
-    const dir = "/tmp/mlx-serve-logtest";
-    const path = dir ++ "/s.log";
-    _ = std.c.mkdir(dir, @as(std.c.mode_t, 0o755));
-    _ = std.c.unlink(path);
-    _ = std.c.unlink(path ++ ".1");
-    defer {
-        closeFile();
-        _ = std.c.unlink(path);
-        _ = std.c.unlink(path ++ ".1");
-    }
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The sink takes a PATH (it opens through cwd), so build one pointing into
+    // the tmp dir rather than handing it a Dir. `tmpDir` lives at a known
+    // cwd-relative location, which keeps this free of any absolute-path or
+    // /tmp assumption -- neither of which exists on Windows.
+    var base_buf: [256]u8 = undefined;
+    const sep = std.fs.path.sep_str;
+    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache" ++ sep ++ "tmp" ++ sep ++ "{s}", .{tmp.sub_path});
+
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/sink.log", .{base});
+    var prev_buf: [512]u8 = undefined;
+    const rotated = try std.fmt.bufPrint(&prev_buf, "{s}/sink.log.1", .{base});
 
     const original = current_level;
     defer setLevel(original);
@@ -333,11 +357,12 @@ test "file sink: writes lines, honors level, survives reopen, rotates at the cap
     const original_stderr = stderr_enabled;
     stderr_enabled = false; // this test drives info/debug for real
     defer stderr_enabled = original_stderr;
+    defer closeFile();
 
     // No sink yet -> nothing on disk, and filePath reports that.
     try testing.expect(filePath() == null);
 
-    try openFile(path, 0); // rotation disabled
+    try openFile(io, path, 0); // rotation disabled
     try testing.expectEqualStrings(path, filePath().?);
     info("hello {d}\n", .{42});
     info("second line\n", .{});
@@ -347,62 +372,52 @@ test "file sink: writes lines, honors level, survives reopen, rotates at the cap
     try testing.expect(filePath() == null);
 
     var buf: [4096]u8 = undefined;
-    const n = readFileForTest(path, &buf);
-    try testing.expect(std.mem.indexOf(u8, buf[0..n], "hello 42\n") != null);
-    try testing.expect(std.mem.indexOf(u8, buf[0..n], "second line\n") != null);
-    try testing.expect(std.mem.indexOf(u8, buf[0..n], "must not reach disk") == null);
+    const first = readFileForTest(io, path, &buf);
+    try testing.expect(std.mem.indexOf(u8, first, "hello 42\n") != null);
+    try testing.expect(std.mem.indexOf(u8, first, "second line\n") != null);
+    try testing.expect(std.mem.indexOf(u8, first, "must not reach disk") == null);
 
     // Reopening appends rather than truncating: history survives a restart.
-    try openFile(path, 0);
+    try openFile(io, path, 0);
     info("after restart\n", .{});
     closeFile();
-    const n2 = readFileForTest(path, &buf);
-    try testing.expect(std.mem.indexOf(u8, buf[0..n2], "hello 42\n") != null);
-    try testing.expect(std.mem.indexOf(u8, buf[0..n2], "after restart\n") != null);
+    const second = readFileForTest(io, path, &buf);
+    try testing.expect(std.mem.indexOf(u8, second, "hello 42\n") != null);
+    try testing.expect(std.mem.indexOf(u8, second, "after restart\n") != null);
 
     // A tiny cap forces a rotation; the old bytes land in `.log.1`.
-    try openFile(path, 64);
+    try openFile(io, path, 64);
     var i: usize = 0;
     while (i < 40) : (i += 1) info("filler line {d}\n", .{i});
     closeFile();
-    const live = readFileForTest(path, &buf);
-    try testing.expect(live > 0);
-    try testing.expect(live <= 64 + 32); // bounded: the last line may overshoot
+    const live = readFileForTest(io, path, &buf);
+    try testing.expect(live.len > 0);
+    try testing.expect(live.len <= 64 + 32); // bounded: the last line may overshoot
     var buf2: [4096]u8 = undefined;
-    try testing.expect(readFileForTest(path ++ ".1", &buf2) > 0); // rotated backup exists
+    try testing.expect(readFileForTest(io, rotated, &buf2).len > 0); // rotated backup exists
 
     // Nested parents are created: the real default path is
     // ~/.mlx-serve/logs/… and BOTH components can be missing on a fresh HOME.
-    const deep = "/tmp/mlx-serve-logtest/a/b/c/deep.log";
-    defer {
-        closeFile();
-        _ = std.c.unlink(deep);
-        _ = std.c.rmdir("/tmp/mlx-serve-logtest/a/b/c");
-        _ = std.c.rmdir("/tmp/mlx-serve-logtest/a/b");
-        _ = std.c.rmdir("/tmp/mlx-serve-logtest/a");
-    }
-    try openFile(deep, 0);
+    var deep_buf: [512]u8 = undefined;
+    const deep = try std.fmt.bufPrint(&deep_buf, "{s}/a/b/c/deep.log", .{base});
+    try openFile(io, deep, 0);
     info("deep\n", .{});
     closeFile();
-    try testing.expect(readFileForTest(deep, &buf2) > 0);
+    try testing.expect(readFileForTest(io, deep, &buf2).len > 0);
 
     // An overlong line is clipped and SAYS SO — a silently-clipped model dump
     // must never read as the model's actual output.
-    _ = std.c.unlink(deep);
-    try openFile(deep, 0);
+    std.Io.Dir.cwd().deleteFile(io, deep) catch {};
+    try openFile(io, deep, 0);
     const huge: [line_buf_len + 500]u8 = @splat('x');
     info("{s}\n", .{huge});
     closeFile();
     var big: [line_buf_len * 2]u8 = undefined;
-    const wrote = readFileForTest(deep, &big);
-    try testing.expectEqual(@as(usize, line_buf_len), wrote); // never exceeds the buffer
-    try testing.expect(std.mem.endsWith(u8, big[0..wrote], truncation_marker));
+    const wrote = readFileForTest(io, deep, &big);
+    try testing.expectEqual(@as(usize, line_buf_len), wrote.len); // never exceeds the buffer
+    try testing.expect(std.mem.endsWith(u8, wrote, truncation_marker));
 }
 
-fn readFileForTest(path: [*:0]const u8, buf: []u8) usize {
-    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    if (fd < 0) return 0;
-    defer _ = std.c.close(fd);
-    const n = std.c.read(fd, buf.ptr, buf.len);
-    return if (n > 0) @intCast(n) else 0;
+fn readFileForTest(io: std.Io, path: []const u8, buf: []u8) []u8 {
+    return std.Io.Dir.cwd().readFile(io, path, buf) catch buf[0..0];
 }

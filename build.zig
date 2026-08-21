@@ -22,12 +22,44 @@ pub fn build(b: *std.Build) void {
     // the binary with a clear dyld version error beats "loading" and dying on
     // the dylib. Matches app LSMinimumSystemVersion + Package.swift. Guard:
     // tests/test_mlx_staged_nax.sh (binary minos check).
-    const target = b.standardTargetOptions(.{
-        .default_target = .{
-            .os_version_min = .{ .semver = .{ .major = 26, .minor = 2, .patch = 0 } },
-        },
-    });
+    // On macOS the default target pins LC_BUILD_VERSION minos as described
+    // above. Elsewhere the default is the plain native target, except that
+    // Windows is pinned to the GNU ABI: lld links directly against a DLL under
+    // `-gnu` but REFUSES one under `-msvc` ("bad file type. Did you specify a
+    // DLL instead of an import library?"), and llama.cpp's Windows releases
+    // ship DLLs with no import libraries. The boundary we link across is
+    // llama.h, which is pure C, so the ABI difference is not observable.
+    const default_target: std.Target.Query = switch (@import("builtin").os.tag) {
+        .macos => .{ .os_version_min = .{ .semver = .{ .major = 26, .minor = 2, .patch = 0 } } },
+        .windows => .{ .abi = .gnu },
+        else => .{},
+    };
+    const target = b.standardTargetOptions(.{ .default_target = default_target });
     const optimize = b.standardOptimizeOption(.{});
+
+    const is_darwin = target.result.os.tag == .macos;
+
+    // GGUF-only build: no MLX, no ds4, no ANE, no media generation — the
+    // server is driven entirely by the embedded llama.cpp engine.
+    //
+    // This is what makes Windows and Linux possible at all. MLX has no Windows
+    // build and its CUDA backend is Linux-only, and ~600 call sites across
+    // transformer.zig/deepseek_v4.zig go through `mlx_fast_metal_kernel`, which
+    // is Metal-only by construction. llama.cpp, by contrast, has first-class
+    // CUDA support on both platforms. So off-Apple we keep the whole HTTP /
+    // tool-calling / discovery / templating stack and swap the inference floor.
+    //
+    // Defaults to ON everywhere except macOS. It is exposed as a flag rather
+    // than derived silently so a Mac can build (and test) the portable
+    // configuration without cross-compiling.
+    const gguf_only = b.option(
+        bool,
+        "gguf-only",
+        "Build without MLX/ds4/ANE/media-gen; serve GGUF via llama.cpp only (default: on for non-macOS)",
+    ) orelse !is_darwin;
+
+    if (gguf_only and is_darwin)
+        std.debug.print("[mlx-serve] -Dgguf-only on macOS: MLX, ds4, ANE and media generation are disabled\n", .{});
 
     // Setting any non-default target field disables Zig's native macOS SDK detection,
     // so we resolve the SDK path ourselves and surface its frameworks dir.
@@ -44,10 +76,13 @@ pub fn build(b: *std.Build) void {
         break :blk b.fmt("{s}/System/Library/Frameworks", .{sdk});
     };
 
-    if (target.result.os.tag == .macos) {
+    if (is_darwin) {
         verifyBrewDeps(b);
-        verifyMlxStage(b);
+        // Only the MLX build needs the staged mlx/mlx-c pair; a -Dgguf-only
+        // macOS build links neither.
+        if (!gguf_only) verifyMlxStage(b);
     }
+    verifyLlamaStage(b, target.result.os.tag);
 
     // App version. Release builds pass it explicitly (app/build.sh computes the
     // next CalVer from the GitHub releases and stamps it into app/Info.plist;
@@ -84,84 +119,35 @@ pub fn build(b: *std.Build) void {
     // builds its own options with ios=true so the engine swaps the macOS-only
     // ds4 + llama.cpp engines for no-op stubs (iOS serves MLX safetensors only).
     build_options.addOption(bool, "ios", false);
+    build_options.addOption(bool, "gguf_only", gguf_only);
 
     // ds4 Metal kernel sources embedded via @embedFile and exposed as a
     // named module so src/arch/ds4.zig can import them with `@import("ds4_metal_sources")`
     // without traversing the project root.
     const ds4_metal_sources = b.createModule(.{
-        .root_source_file = b.path("lib/ds4_metal_sources.zig"),
+        // The real module @embedFiles the kernel sources out of the lib/ds4
+        // submodule; without ds4 those files are absent (and Metal-only
+        // anyway), so an unconditional path here is a hard FileNotFound at
+        // compile time rather than a disabled feature.
+        .root_source_file = b.path(if (gguf_only)
+            "lib/ds4_metal_sources_stub.zig"
+        else
+            "lib/ds4_metal_sources.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    const mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+    const shared: SharedOpts = .{
         .target = target,
         .optimize = optimize,
-        .link_libcpp = true,
-        .imports = &.{
-            .{ .name = "build_options", .module = build_options.createModule() },
-            .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
-            .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
-            .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
-            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize, "") },
-        },
-    });
+        .build_options = build_options,
+        .ds4_metal_sources = ds4_metal_sources,
+        .is_darwin = is_darwin,
+        .gguf_only = gguf_only,
+        .macos_sdk_frameworks = macos_sdk_frameworks,
+    };
 
-    // Jinja2 template engine (from llama.cpp's common/jinja + nlohmann/json).
-    // Pre-compiled as a static library with system clang++ (C++17 requires system libc++).
-    // Rebuild with: cd lib/jinja_cpp && for f in jinja_wrapper caps lexer parser runtime jinja_string value; do clang++ -std=c++17 -O2 -DNDEBUG -I . -c $f.cpp -o obj/$f.o; done && ar rcs libjinja.a obj/*.o
-    mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
-    mod.addIncludePath(b.path("lib/jinja_cpp"));
-
-    // stb_image for JPEG/PNG decoding in the vision pipeline
-    mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
-    // stb_image_write for PNG encoding (native image-generation endpoint)
-    mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = &.{"-O2"} });
-    mod.addIncludePath(b.path("lib"));
-
-    // xatlas UV unwrapping (MIT, vendored amalgamation) + C shim for the
-    // Hunyuan3D texture paint stage. See lib/xatlas/xatlas_shim.h + src/uvwrap.zig.
-    mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
-    mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
-    mod.addIncludePath(b.path("lib/xatlas"));
-
-    // ds4 inference engine for DSV4-Flash (Metal backend, macOS only). See
-    // `lib/ds4/` submodule pinned at 613e9b2 and `src/arch/ds4.zig`. Kernel
-    // sources are embedded via `lib/ds4_metal_sources.zig` and extracted at
-    // runtime to ~/.mlx-serve/ds4-metal/<hash>/.
-    addDs4Sources(b, mod);
-    mod.addIncludePath(b.path("lib/ds4"));
-
-    // ANE prefill-MLP offload (perf-plan-aug-17 P5): objc bridge to the
-    // private AppleNeuralEngine framework (dlopen'd at runtime — the probe
-    // returns unavailable on machines/OSes without it) + the per-layer MLP
-    // MIL program builder. See lib/ane/ + src/ane.zig; provenance in NOTICE.
-    addAneSources(b, mod);
-
-    // llama.cpp libllama for generic GGUF models (Metal backend, macOS only).
-    // Staged by `scripts/fetch-llama.sh` into lib/llama/ (a single self-contained
-    // dylib + headers extracted from the pinned XCFramework). See src/arch/llama.zig.
-    addLlamaLib(b, mod);
-
-    // mlx + mlx-c: self-built from the pinned submodules (lib/mlx-src,
-    // lib/mlxc-src) into lib/mlx by scripts/build-mlx.sh, with NAX kernels
-    // enabled (the Homebrew bottle ships without them). MUST come before the
-    // /opt/homebrew lib path so a leftover brew mlx-c can never win the link.
-    addMlxLib(b, mod);
-    // webp include/lib paths (homebrew)
-    mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    mod.linkSystemLibrary("webp", .{});
-
-    if (macos_sdk_frameworks) |fw_path| {
-        mod.addFrameworkPath(.{ .cwd_relative = fw_path });
-    }
-    mod.linkFramework("IOKit", .{});
-    mod.linkFramework("CoreFoundation", .{});
-    mod.linkFramework("Foundation", .{});
-    mod.linkFramework("Metal", .{});
-    mod.linkFramework("IOSurface", .{});
+    const mod = makeSharedModule(b, b.path("src/main.zig"), shared);
 
     const exe = b.addExecutable(.{
         .name = "mlx-serve",
@@ -173,6 +159,14 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // Windows resolves a DLL from the EXECUTABLE's own directory (there is no
+    // rpath), so the whole llama.cpp DLL set has to land beside mlx-serve.exe.
+    // The set must stay COMPLETE even though only llama + ggml-base are linked:
+    // ggml dlopens its backends by filename at init (ggml-cuda.dll and the
+    // per-microarch ggml-cpu-*.dll variants), so a missing one silently
+    // downgrades the backend instead of failing the link.
+    if (target.result.os.tag == .windows) installLlamaDlls(b);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.addPassthruArgs();
@@ -180,47 +174,15 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run mlx-serve");
     run_step.dependOn(&run_cmd.step);
 
-    // Unit tests — reuses the same module config (mlx-c, jinja_cpp, etc.)
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libcpp = true,
-        .imports = &.{
-            .{ .name = "build_options", .module = build_options.createModule() },
-            .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
-            .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
-            .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
-            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize, "") },
-        },
-    });
-
-    test_mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
-    test_mod.addIncludePath(b.path("lib/jinja_cpp"));
-    test_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
-    test_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = &.{"-O2"} });
-    test_mod.addIncludePath(b.path("lib"));
-    test_mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
-    test_mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
-    test_mod.addIncludePath(b.path("lib/xatlas"));
-    addDs4Sources(b, test_mod);
-    test_mod.addIncludePath(b.path("lib/ds4"));
-    addAneSources(b, test_mod);
-    addLlamaLib(b, test_mod);
-    test_mod.linkSystemLibrary("c++", .{});
-    addMlxLib(b, test_mod);
-    test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    test_mod.linkSystemLibrary("webp", .{});
-
-    if (macos_sdk_frameworks) |fw_path| {
-        test_mod.addFrameworkPath(.{ .cwd_relative = fw_path });
-    }
-    test_mod.linkFramework("IOKit", .{});
-    test_mod.linkFramework("CoreFoundation", .{});
-    test_mod.linkFramework("Foundation", .{});
-    test_mod.linkFramework("Metal", .{});
-    test_mod.linkFramework("IOSurface", .{});
+    // Unit tests — identical module configuration to the exe, built from the
+    // same helper so the two can no longer drift (they were hand-duplicated).
+    // Two roots, selected by FILE: src/tests.zig is the portable suite;
+    // src/tests_all.zig adds the MLX/ds4/ANE suites. A comptime `if` inside one
+    // root does NOT work here -- a dead `if (cond) _ = @import(x)` branch still
+    // registers x's tests, so the MLX imports must be absent from the file the
+    // GGUF-only build compiles.
+    const test_root = if (gguf_only) "src/tests.zig" else "src/tests_all.zig";
+    const test_mod = makeSharedModule(b, b.path(test_root), shared);
 
     const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
     const qwen_preprocess_fixture = b.option(
@@ -234,6 +196,28 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
+
+    // The test binary runs out of .zig-cache/o/<hash>/, and Windows resolves an
+    // imported DLL from the EXECUTABLE's own directory -- where the llama.cpp
+    // set is not. Without this the process dies at load, before a single test
+    // runs, and the build reports only a bare exit code.
+    if (target.result.os.tag == .windows) {
+        // Point PATH at the install bin dir, where installLlamaDlls already
+        // put the whole set beside mlx-serve.exe, and make the test depend on
+        // that install so the DLLs exist before it runs.
+        run_unit_tests.step.dependOn(b.getInstallStep());
+        // `getEnvMap` returns the RunStep's inherited environment, so this
+        // PREPENDS rather than replacing PATH -- clobbering it would break any
+        // tool the tests shell out to.
+        const env = run_unit_tests.getEnvMap();
+        const prev = env.get("PATH") orelse "";
+        run_unit_tests.setEnvironmentVariable(
+            "PATH",
+            // Relative on purpose: a RunStep's cwd is the build root, and
+            // Windows resolves relative PATH entries against it.
+            b.fmt("zig-out\\bin;lib\\llama\\bin;{s}", .{prev}),
+        );
+    }
     if (qwen_preprocess_fixture) |fixture| {
         run_unit_tests.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
         run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
@@ -265,9 +249,14 @@ pub fn build(b: *std.Build) void {
     //    zig-out/ios/<sdk>/lib. `-Dios-include=<dir>` points at the iOS dist's
     //    include dir for third-party headers (webp); defaults to Homebrew's,
     //    whose versions are pinned identical by verifyBrewDeps.
-    const ios_include = b.option([]const u8, "ios-include", "Include dir for webp/stb headers when cross-compiling the iOS lib") orelse "/opt/homebrew/include";
-    addIosLib(b, version, ios_include, .{ .step = "ios-lib", .abi = .none, .sdk = "iphoneos" });
-    addIosLib(b, version, ios_include, .{ .step = "ios-lib-sim", .abi = .simulator, .sdk = "iphonesimulator" });
+    // Apple-only: these resolve their SDKs through xcrun, which does not exist
+    // off macOS. (addIosLib already returns quietly when xcrun fails, but
+    // gating here keeps the step list honest on other hosts.)
+    if (is_darwin) {
+        const ios_include = b.option([]const u8, "ios-include", "Include dir for webp/stb headers when cross-compiling the iOS lib") orelse "/opt/homebrew/include";
+        addIosLib(b, version, ios_include, .{ .step = "ios-lib", .abi = .none, .sdk = "iphoneos" });
+        addIosLib(b, version, ios_include, .{ .step = "ios-lib-sim", .abi = .simulator, .sdk = "iphonesimulator" });
+    }
 }
 
 /// `zig build vz-agent` → `zig-out/guest/vz-agent` (static aarch64 Linux ELF),
@@ -302,6 +291,14 @@ fn addVzAgent(
     step.dependOn(&install.step);
 
     // Host-side tests of the same source.
+    //
+    // POSIX-only: `serveConnection` is OS-agnostic, but the harness around it
+    // is not — it drives the request -> spawn -> stream -> exit path over a
+    // socketpair with fork/pipe/waitpid, none of which Windows has. The guest
+    // binary itself still cross-compiles everywhere (it is aarch64-linux-musl
+    // regardless of host), so only the HOST test arm is gated.
+    if (host_target.result.os.tag == .windows) return;
+
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/vz_agent.zig"),
@@ -524,42 +521,71 @@ fn readLlamaTag(b: *std.Build) ?[]const u8 {
     return if (trimmed.len == 0) null else b.dupe(trimmed);
 }
 
-fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
-    // Link the prebuilt libllama staged by scripts/fetch-llama.sh. The dylib's
-    // install-name is @rpath/libllama.dylib; we add an rpath to its build-tree
-    // location so `zig build run` / unit tests resolve it in dev. The app bundle
-    // and CLI tarball rewrite that reference to @executable_path/... and re-sign
-    // with the Developer ID (see release.yml / app/build.sh).
+fn addLlamaLib(b: *std.Build, module: *std.Build.Module, os_tag: std.Target.Os.Tag) void {
     module.addIncludePath(b.path("lib/llama/include"));
-    module.addLibraryPath(b.path("lib/llama/lib"));
-    // use_pkg_config = .no: a Homebrew `llama.cpp` install ships a llama.pc that
-    // would otherwise hijack this link (pulling in /opt/homebrew's version + its
-    // separate libggml). We want exactly the pinned dylib staged in lib/llama/lib.
-    module.linkSystemLibrary("llama", .{ .use_pkg_config = .no });
-    // @loader_path resolves against the BINARY's own location at launch,
-    // not the launching process's cwd. A bare relative string here (e.g.
-    // "lib/llama/lib") gets baked verbatim into LC_RPATH when `zig build`
-    // runs with cwd == build root (b.build_root.path is null in that case,
-    // so b.path() can't make it absolute) and dyld then resolves that
-    // relative string against argv[0]'s cwd, breaking any launch from
-    // outside the repo root. An absolute path avoids that but bakes in a
-    // machine-specific location, so the build isn't relocatable. This is
-    // relative to the binary itself, so it stays correct from any launch
-    // cwd and survives copying the whole zig-out + lib tree elsewhere.
-    //
-    // This module backs two different binaries at two different depths
-    // under the build root, so one entry can't serve both: the installed
-    // exe lands at zig-out/bin/mlx-serve (@loader_path = zig-out/bin/, 2
-    // levels up to root), while `zig build test` runs straight out of
-    // .zig-cache/o/<hash>/test (@loader_path = that dir, 3 levels up to
-    // root). dyld tries every LC_RPATH entry in order and silently skips
-    // ones that don't resolve, so listing both depths here is safe — each
-    // binary finds its own and ignores the other.
-    module.addRPath(.{ .cwd_relative = "@loader_path/../../lib/llama/lib" });
-    module.addRPath(.{ .cwd_relative = "@loader_path/../../../lib/llama/lib" });
+
+    switch (os_tag) {
+        .windows => {
+            // The prebuilt Windows release ships DLLs with NO import libraries,
+            // so the link target IS the DLL: lld resolves it directly under the
+            // gnu ABI (build.zig pins that above; msvc refuses with "bad file
+            // type. Did you specify a DLL instead of an import library?").
+            // lib/llama/bin therefore doubles as the link-time library path.
+            //
+            // There is no rpath on Windows: the loader searches the
+            // executable's own directory, which is why build() installs the
+            // whole DLL set beside mlx-serve.exe. That set must stay complete
+            // even though we link only llama -- ggml.dll dlopens its backends
+            // (ggml-cuda.dll, the per-microarch ggml-cpu-*.dll) BY FILENAME at
+            // init, so a missing one silently downgrades the backend rather
+            // than failing the link.
+            module.addLibraryPath(b.path("lib/llama/bin"));
+            module.linkSystemLibrary("llama", .{ .use_pkg_config = .no });
+            // ggml is a SEPARATE DLL in the Windows release (the macOS
+            // XCFramework merges llama + ggml + ggml-metal into one dylib, so
+            // this has no macOS counterpart). `--version` reports
+            // ggml_version()/ggml_commit(), which live in ggml-base.
+            module.linkSystemLibrary("ggml-base", .{ .use_pkg_config = .no });
+        },
+        .macos => {
+            module.addLibraryPath(b.path("lib/llama/lib"));
+            // use_pkg_config = .no: a Homebrew `llama.cpp` install ships a llama.pc that
+            // would otherwise hijack this link (pulling in /opt/homebrew's version + its
+            // separate libggml). We want exactly the pinned dylib staged in lib/llama/lib.
+            module.linkSystemLibrary("llama", .{ .use_pkg_config = .no });
+            // @loader_path resolves against the BINARY's own location at launch,
+            // not the launching process's cwd. A bare relative string here (e.g.
+            // "lib/llama/lib") gets baked verbatim into LC_RPATH when `zig build`
+            // runs with cwd == build root (b.build_root.path is null in that case,
+            // so b.path() can't make it absolute) and dyld then resolves that
+            // relative string against argv[0]'s cwd, breaking any launch from
+            // outside the repo root. An absolute path avoids that but bakes in a
+            // machine-specific location, so the build isn't relocatable. This is
+            // relative to the binary itself, so it stays correct from any launch
+            // cwd and survives copying the whole zig-out + lib tree elsewhere.
+            //
+            // This module backs two different binaries at two different depths
+            // under the build root, so one entry can't serve both: the installed
+            // exe lands at zig-out/bin/mlx-serve (@loader_path = zig-out/bin/, 2
+            // levels up to root), while `zig build test` runs straight out of
+            // .zig-cache/o/<hash>/test (@loader_path = that dir, 3 levels up to
+            // root). dyld tries every LC_RPATH entry in order and silently skips
+            // ones that don't resolve, so listing both depths here is safe -- each
+            // binary finds its own and ignores the other.
+            module.addRPath(.{ .cwd_relative = "@loader_path/../../lib/llama/lib" });
+            module.addRPath(.{ .cwd_relative = "@loader_path/../../../lib/llama/lib" });
+        },
+        else => {
+            module.addLibraryPath(b.path("lib/llama/lib"));
+            module.linkSystemLibrary("llama", .{ .use_pkg_config = .no });
+            // ELF equivalent of @loader_path. Same two-depth reasoning as macOS.
+            module.addRPath(.{ .cwd_relative = "$ORIGIN/../../lib/llama/lib" });
+            module.addRPath(.{ .cwd_relative = "$ORIGIN/../../../lib/llama/lib" });
+        },
+    }
 
     // Our clean C shim over llama.h (src/llama_ffi.zig mirrors lib/llama_shim/llama_shim.h).
-    // C11 for pthread_once-based one-time backend init.
+    // C11 for the one-time backend init.
     module.addIncludePath(b.path("lib/llama_shim"));
     module.addCSourceFile(.{
         .file = b.path("lib/llama_shim/llama_shim.c"),
@@ -689,5 +715,182 @@ fn verifyBrewDeps(b: *std.Build) void {
             );
             std.process.exit(1);
         }
+    }
+}
+
+/// Everything the exe module and the test module share. They were hand-
+/// duplicated before, which is how they drifted (the test module carried an
+/// extra `linkSystemLibrary("c++")` the exe did not); one helper makes that
+/// class of bug unbuildable.
+const SharedOpts = struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    build_options: *std.Build.Step.Options,
+    ds4_metal_sources: *std.Build.Module,
+    is_darwin: bool,
+    gguf_only: bool,
+    macos_sdk_frameworks: ?[]const u8,
+};
+
+fn makeSharedModule(b: *std.Build, root: std.Build.LazyPath, o: SharedOpts) *std.Build.Module {
+    const t = o.target;
+    const opt = o.optimize;
+
+    // webp: Homebrew's on macOS, our own stub everywhere else. `src/server.zig`
+    // imports "webp" unconditionally, so the module must always exist -- see
+    // lib/webp_stub/webp/decode.h for why a stub rather than a vendored copy.
+    const webp_header: std.Build.LazyPath = if (o.is_darwin)
+        .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }
+    else
+        b.path("lib/webp_stub/webp/decode.h");
+    const webp_include: std.Build.LazyPath = if (o.is_darwin)
+        .{ .cwd_relative = "/opt/homebrew/include" }
+    else
+        b.path("lib/webp_stub");
+
+    const mod = b.createModule(.{
+        .root_source_file = root,
+        .target = t,
+        .optimize = opt,
+        .link_libcpp = true,
+        .imports = &.{
+            .{ .name = "build_options", .module = o.build_options.createModule() },
+            .{ .name = "ds4_metal_sources", .module = o.ds4_metal_sources },
+            .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), t, opt, "") },
+            .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), t, opt, "") },
+            .{ .name = "webp", .module = addCHeaderModule(b, webp_header, webp_include, t, opt, "") },
+        },
+    });
+
+    // Jinja2 template engine (from wangzhaode's jinja.cpp + nlohmann/json).
+    //
+    // macOS links the pre-compiled static archive checked in at
+    // lib/jinja_cpp/libjinja.a. That archive is a Mach-O and cannot serve any
+    // other host, so every other target compiles the same sources from scratch
+    // through Zig's bundled clang -- which also removes the separate rebuild
+    // step. Rebuild the macOS archive with: cd lib/jinja_cpp && for f in
+    // jinja_wrapper caps lexer parser runtime jinja_string value; do clang++
+    // -std=c++17 -O2 -DNDEBUG -I . -c $f.cpp -o obj/$f.o; done && ar rcs
+    // libjinja.a obj/*.o
+    if (o.is_darwin) {
+        mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
+    } else {
+        const jinja_flags = &[_][]const u8{ "-std=c++17", "-O2", "-DNDEBUG" };
+        for ([_][]const u8{
+            "jinja_wrapper", "caps", "lexer", "parser", "runtime", "jinja_string", "value",
+        }) |name| {
+            mod.addCSourceFile(.{
+                .file = b.path(b.fmt("lib/jinja_cpp/{s}.cpp", .{name})),
+                .flags = jinja_flags,
+            });
+        }
+    }
+    mod.addIncludePath(b.path("lib/jinja_cpp"));
+
+    // stb_image for JPEG/PNG decoding in the vision pipeline
+    mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
+    // stb_image_write for PNG encoding (native image-generation endpoint)
+    mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = &.{"-O2"} });
+    mod.addIncludePath(b.path("lib"));
+
+    if (!o.is_darwin) {
+        mod.addCSourceFile(.{ .file = b.path("lib/webp_stub/webp_stub.c"), .flags = &.{"-O2"} });
+        mod.addIncludePath(b.path("lib/webp_stub"));
+    }
+
+    // xatlas UV unwrapping (MIT, vendored amalgamation) + C shim for the
+    // Hunyuan3D texture paint stage. See lib/xatlas/xatlas_shim.h + src/uvwrap.zig.
+    // Portable C++ with no Apple dependency, and src/uvwrap.zig's tests are
+    // hermetic (zero MLX), so it is compiled in every configuration.
+    mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+    mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+    mod.addIncludePath(b.path("lib/xatlas"));
+
+    if (!o.gguf_only) {
+        // ds4 inference engine for DSV4-Flash (Metal backend, macOS only). See
+        // `lib/ds4/` submodule pinned at 613e9b2 and `src/arch/ds4.zig`. Kernel
+        // sources are embedded via `lib/ds4_metal_sources.zig` and extracted at
+        // runtime to ~/.mlx-serve/ds4-metal/<hash>/.
+        addDs4Sources(b, mod);
+        mod.addIncludePath(b.path("lib/ds4"));
+
+        // ANE prefill-MLP offload (perf-plan-aug-17 P5): objc bridge to the
+        // private AppleNeuralEngine framework (dlopen'd at runtime -- the probe
+        // returns unavailable on machines/OSes without it) + the per-layer MLP
+        // MIL program builder. See lib/ane/ + src/ane.zig; provenance in NOTICE.
+        addAneSources(b, mod);
+    }
+
+    // llama.cpp libllama for generic GGUF models. Staged by
+    // scripts/fetch-llama.sh into lib/llama/. On macOS that is a single
+    // self-contained dylib from the XCFramework (Metal backend); on Windows it
+    // is the prebuilt CUDA DLL set. See src/arch/llama.zig.
+    addLlamaLib(b, mod, t.result.os.tag);
+
+    if (!o.gguf_only) {
+        // mlx + mlx-c: self-built from the pinned submodules (lib/mlx-src,
+        // lib/mlxc-src) into lib/mlx by scripts/build-mlx.sh, with NAX kernels
+        // enabled (the Homebrew bottle ships without them). MUST come before the
+        // /opt/homebrew lib path so a leftover brew mlx-c can never win the link.
+        addMlxLib(b, mod);
+    }
+
+    if (o.is_darwin) {
+        // webp include/lib paths (homebrew)
+        mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+        mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+        mod.linkSystemLibrary("webp", .{});
+
+        if (o.macos_sdk_frameworks) |fw_path| {
+            mod.addFrameworkPath(.{ .cwd_relative = fw_path });
+        }
+        mod.linkFramework("IOKit", .{});
+        mod.linkFramework("CoreFoundation", .{});
+        mod.linkFramework("Foundation", .{});
+        // Metal and IOSurface are only referenced by the ds4 Metal backend and
+        // the ANE bridge, both of which a -Dgguf-only macOS build drops.
+        if (!o.gguf_only) {
+            mod.linkFramework("Metal", .{});
+            mod.linkFramework("IOSurface", .{});
+        }
+    }
+
+    return mod;
+}
+
+/// Configure-time check that scripts/fetch-llama.sh has staged libllama for
+/// this host. Mirrors verifyMlxStage: fail loudly with the fix rather than let
+/// the linker emit a bare -lllama error. GGUF is the ONLY engine off Apple, so
+/// a missing stage there is fatal rather than a degraded build.
+fn verifyLlamaStage(b: *std.Build, os_tag: std.Target.Os.Tag) void {
+    const probe = switch (os_tag) {
+        .macos => "lib/llama/lib/libllama.dylib",
+        .windows => "lib/llama/bin/llama.dll",
+        else => "lib/llama/lib/libllama.so",
+    };
+    buildRootHandle(b).access(b.graph.io, probe, .{}) catch {
+        std.debug.print(
+            "\n[mlx-serve] lib/llama is not staged ({s} missing). Run:\n" ++
+                "  ./scripts/fetch-llama.sh\n\n",
+            .{probe},
+        );
+        std.process.exit(1);
+    };
+}
+
+/// Copy every DLL staged in lib/llama/bin into the install prefix's bin dir.
+/// Enumerated at CONFIGURE time from what fetch-llama.sh actually staged, so a
+/// llama.cpp release that adds or renames a backend DLL needs no edit here.
+fn installLlamaDlls(b: *std.Build) void {
+    var dir = buildRootHandle(b).openDir(b.graph.io, "lib/llama/bin", .{ .iterate = true }) catch return;
+    defer dir.close(b.graph.io);
+    var it = dir.iterate();
+    while (it.next(b.graph.io) catch return) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".dll")) continue;
+        b.getInstallStep().dependOn(&b.addInstallBinFile(
+            b.path(b.fmt("lib/llama/bin/{s}", .{entry.name})),
+            b.dupe(entry.name),
+        ).step);
     }
 }

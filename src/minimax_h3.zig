@@ -1491,7 +1491,7 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
         const normed = try rmsNormLast(v4, nw, cfg.qk_norm_eps, s);
         if (rope) |rp| {
             defer _ = mlx.mlx_array_free(normed);
-    qkvn[i] = try applyRopePub(normed, rp, half, hd, s);
+            qkvn[i] = try applyRopePub(normed, rp, half, hd, s);
         } else {
             qkvn[i] = normed;
         }
@@ -2076,10 +2076,10 @@ pub const Model = struct {
 
     pub fn deinit(self: *Model) void {
         for ([_]mlx.mlx_array{
-            self.video_patch_w, self.video_patch_b, self.audio_patch_w, self.audio_patch_b,
-            self.condition_bias, self.te_in_w,      self.te_in_b,       self.te_out_w,
-            self.te_out_b,      self.inv_freq,      self.final_norm,    self.video_out_w,
-            self.video_out_b,   self.audio_out_w,   self.audio_out_b,   self.refiner_final_norm,
+            self.video_patch_w,  self.video_patch_b, self.audio_patch_w, self.audio_patch_b,
+            self.condition_bias, self.te_in_w,       self.te_in_b,       self.te_out_w,
+            self.te_out_b,       self.inv_freq,      self.final_norm,    self.video_out_w,
+            self.video_out_b,    self.audio_out_w,   self.audio_out_b,   self.refiner_final_norm,
         }) |a| _ = mlx.mlx_array_free(a);
         self.condition_proj.deinit();
         for (self.refiner) |*b| b.deinit();
@@ -2129,10 +2129,10 @@ pub const Model = struct {
             }
         };
         for ([_]mlx.mlx_array{
-            self.video_patch_w, self.video_patch_b, self.audio_patch_w, self.audio_patch_b,
-            self.condition_bias, self.te_in_w,      self.te_in_b,       self.te_out_w,
-            self.te_out_b,      self.inv_freq,      self.final_norm,    self.video_out_w,
-            self.video_out_b,   self.audio_out_w,   self.audio_out_b,   self.refiner_final_norm,
+            self.video_patch_w,  self.video_patch_b, self.audio_patch_w, self.audio_patch_b,
+            self.condition_bias, self.te_in_w,       self.te_in_b,       self.te_out_w,
+            self.te_out_b,       self.inv_freq,      self.final_norm,    self.video_out_w,
+            self.video_out_b,    self.audio_out_w,   self.audio_out_b,   self.refiner_final_norm,
         }) |x| push.arr(vec, x);
         push.lin(vec, &self.condition_proj);
         for (self.refiner) |*b| {
@@ -3773,7 +3773,7 @@ fn generateOne(
                 // half-matching adapter is otherwise a silent no-op that looks
                 // exactly like a working one.
                 log.info("[minimax-h3] lora {d}/{d}: {d}/{d} modules, scale {d:.2}{s} — {s}\n", .{
-                    i + 1,          stack.count, n, Model.LORA_TARGETS, sc,
+                    i + 1,                            stack.count,             n, Model.LORA_TARGETS, sc,
                     if (is_turbo) " (turbo)" else "", std.fs.path.basename(p),
                 });
                 // The Turbo file names every target; anything less is a broken
@@ -4481,8 +4481,8 @@ test "minimax h3 live: generates a clip" {
 
     const prompt = envStr("MINIMAX_H3_PROMPT") orelse
         "A calico cat sits on a sunlit windowsill, slowly blinking as it watches rain streak down the glass. " ++
-        "The camera holds steady in a close medium shot. Warm afternoon light rims the cat's fur against the cool grey outside. " ++
-        "overall_soundscape: steady rainfall against glass with a soft room tone and the cat's quiet purring.";
+            "The camera holds steady in a close medium shot. Warm afternoon light rims the cat's fur against the cool grey outside. " ++
+            "overall_soundscape: steady rainfall against glass with a soft room tone and the cat's quiet purring.";
 
     var res = try generate(a, io, .{
         .tokenizer_dir = tokdir,
@@ -4538,8 +4538,9 @@ fn envU32(name: [:0]const u8, dflt: u32) u32 {
 /// `gen.estimatePeakResidentBytes`: a residency bill computed against the OTHER
 /// answer is either an OOM (billed shed, ran full) or a refused load.
 pub fn adalnPrecomputeOn() bool {
-    const raw = envStr("MINIMAX_H3_ADALN_PRECOMPUTE") orelse return true;
-    return !std.mem.eql(u8, raw, "0");
+    // Delegates: the residency estimator in gen_common.zig needs this same
+    // answer and must stay buildable without the H3 backend compiled in.
+    return @import("gen_common.zig").h3AdalnPrecomputeOn();
 }
 
 fn allFinite(x: mlx.mlx_array, s: S) !bool {
@@ -5176,9 +5177,9 @@ test "minimax h3: reference sizing matches the reference node" {
         );
         testing.expectEqual(jsonU32(o.get("out_w").?), got.w) catch |e| {
             std.debug.print("image {d}x{d} gen {d}x{d} {s}: w {d}\n", .{
-                jsonU32(o.get("in_w").?), jsonU32(o.get("in_h").?),
+                jsonU32(o.get("in_w").?),  jsonU32(o.get("in_h").?),
                 jsonU32(o.get("gen_w").?), jsonU32(o.get("gen_h").?),
-                o.get("mode").?.string, got.w,
+                o.get("mode").?.string,    got.w,
             });
             return e;
         };
@@ -6353,12 +6354,12 @@ test "minimax h3: loraAdd sums every attached adapter onto the base output" {
 
     const shAT = [_]c_int{ 3, 2 };
     const shBT = [_]c_int{ 2, 4 };
-    const at = mlx.mlx_array_new_data(@constCast(@ptrCast(&AT)), &shAT, 2, f32t);
+    const at = mlx.mlx_array_new_data(@ptrCast(@constCast(&AT)), &shAT, 2, f32t);
     defer _ = mlx.mlx_array_free(at);
-    const bt = mlx.mlx_array_new_data(@constCast(@ptrCast(&BT)), &shBT, 2, f32t);
+    const bt = mlx.mlx_array_new_data(@ptrCast(@constCast(&BT)), &shBT, 2, f32t);
     defer _ = mlx.mlx_array_free(bt);
     const shX = [_]c_int{ 2, 3 };
-    const x = mlx.mlx_array_new_data(@constCast(@ptrCast(&X)), &shX, 2, f32t);
+    const x = mlx.mlx_array_new_data(@ptrCast(@constCast(&X)), &shX, 2, f32t);
     defer _ = mlx.mlx_array_free(x);
 
     // Turbo at 1.0 plus a style adapter at 0.5 — the stacking case, on the
@@ -6371,7 +6372,7 @@ test "minimax h3: loraAdd sums every attached adapter onto the base output" {
 
     const zbuf = [_]f32{ 0, 0, 0, 0, 0, 0, 0, 0 }; // zero base: the deltas alone come back
     const shZ = [_]c_int{ 2, 4 };
-    const zero = mlx.mlx_array_new_data(@constCast(@ptrCast(&zbuf)), &shZ, 2, f32t);
+    const zero = mlx.mlx_array_new_data(@ptrCast(@constCast(&zbuf)), &shZ, 2, f32t);
     const got = try loraAdd(zero, x, slot, s); // consumes `zero`
     defer _ = mlx.mlx_array_free(got);
     try mlx.check(mlx.mlx_array_eval(got));
@@ -6390,7 +6391,7 @@ test "minimax h3: loraAdd sums every attached adapter onto the base output" {
     // An empty slot is the identity — and returns the SAME handle, since the
     // no-adapter path must cost nothing on a 50-block DiT.
     const empty: LoraSlot = .{};
-    const base2 = mlx.mlx_array_new_data(@constCast(@ptrCast(&zbuf)), &shZ, 2, f32t);
+    const base2 = mlx.mlx_array_new_data(@ptrCast(@constCast(&zbuf)), &shZ, 2, f32t);
     defer _ = mlx.mlx_array_free(base2);
     const same = try loraAdd(base2, x, empty, s);
     try testing.expectEqual(base2.ctx, same.ctx);
@@ -6416,8 +6417,8 @@ test "minimax h3: an adapter file resolves to our own module names, dotted or fl
     const bv = [_]f32{ 0.5, 0.6, 0.7, 0.8 };
     const ash = [_]c_int{ 2, 2 };
     const bsh = [_]c_int{ 2, 2 };
-    const aarr = mlx.mlx_array_new_data(@constCast(@ptrCast(&av)), &ash, 2, mlx.mlx_dtype.float32);
-    const barr = mlx.mlx_array_new_data(@constCast(@ptrCast(&bv)), &bsh, 2, mlx.mlx_dtype.float32);
+    const aarr = mlx.mlx_array_new_data(@ptrCast(@constCast(&av)), &ash, 2, mlx.mlx_dtype.float32);
+    const barr = mlx.mlx_array_new_data(@ptrCast(@constCast(&bv)), &bsh, 2, mlx.mlx_dtype.float32);
     defer _ = mlx.mlx_array_free(aarr);
     defer _ = mlx.mlx_array_free(barr);
     // One module under the reference's own key shape (ComfyUI writes the

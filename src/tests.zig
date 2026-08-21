@@ -1,21 +1,33 @@
 // Test root — imports all modules to run their embedded tests.
 // Run with: zig build test
+//
+// This is the PORTABLE root: everything
+// whose tests are hermetic with respect to the inference backend: templating,
+// tool-call parsing, the HTTP surfaces, discovery, tokenization, and the
+// pure-Zig mesh/image helpers.
+//
+// The MLX-backed roots live in src/tests_all.zig, which build.zig selects as
+// the test root INSTEAD of this file when MLX is compiled in. They are
+// selected by FILE rather than by a comptime `if` because a dead
+// `if (cond) _ = @import(x)` branch still registers x's tests -- the test
+// collector works on the reference graph, not on which branch survives
+// analysis -- so the MLX imports must not appear in this file at all.
+//
+// Keeping the portable list explicit (rather than deriving it by subtraction)
+// is deliberate: a new module lands in exactly one list on purpose, and a
+// module that quietly grows an MLX dependency breaks the Windows/Linux build
+// at compile time instead of at run time.
+
+const build_cfg = @import("build_cfg.zig");
 
 test {
+    // ── Portable: no MLX, no Metal, no Apple frameworks ──
     _ = @import("log.zig");
     _ = @import("version.zig");
+    _ = @import("platform.zig");
     _ = @import("chat.zig");
     _ = @import("format_corpus_test.zig");
     _ = @import("tool_traffic_replay_test.zig");
-    _ = @import("server.zig");
-    _ = @import("model.zig");
-    _ = @import("generate.zig");
-    _ = @import("transformer.zig");
-    _ = @import("vision.zig");
-    _ = @import("qwen_vision.zig");
-    _ = @import("muse_vision.zig");
-    _ = @import("lfm2_vision.zig");
-    _ = @import("mrope.zig");
     _ = @import("regex.zig");
     _ = @import("json_schema.zig");
     _ = @import("json_grammar.zig");
@@ -23,62 +35,31 @@ test {
     _ = @import("responses.zig");
     _ = @import("ws.zig");
     _ = @import("pld_index.zig");
-    _ = @import("kv_quant.zig");
-    _ = @import("drafter.zig");
-    _ = @import("dflash.zig");
-    _ = @import("mtp.zig");
-    _ = @import("diffusion.zig");
-    _ = @import("deepseek_v4.zig");
-    _ = @import("kokoro.zig");
-    _ = @import("kokoro_g2p.zig");
+    _ = @import("loop_detect.zig");
     _ = @import("tokenizer.zig");
-    _ = @import("prefix_cache.zig");
     _ = @import("metrics.zig");
     _ = @import("status.zig");
-    _ = @import("kv_disk_cache.zig");
     _ = @import("model_discovery.zig");
     _ = @import("gguf_meta.zig");
-    _ = @import("model_registry.zig");
-    _ = @import("scheduler.zig");
-    _ = @import("ds4_ffi.zig");
-    _ = @import("arch/ds4.zig");
     _ = @import("llama_ffi.zig");
-    _ = @import("arch/llama.zig");
     _ = @import("wav.zig");
-    _ = @import("tts.zig");
-    _ = @import("flux.zig");
-    _ = @import("krea.zig");
-    _ = @import("mage_flow.zig");
-    _ = @import("lora.zig");
-    _ = @import("ane.zig");
-    _ = @import("nsfw.zig");
-    _ = @import("ltx_video.zig");
-    _ = @import("ltx_diffvae.zig");
-    _ = @import("ltx_diffvae_kernel.zig");
-    _ = @import("ltx_diffvae_forward.zig");
-    _ = @import("ltx_audio.zig");
-    _ = @import("minimax_h3.zig");
-    _ = @import("minimax_h3_vision.zig");
-    _ = @import("minimax_h3_vae.zig");
-    _ = @import("minimax_h3_audio.zig");
     _ = @import("png.zig");
     _ = @import("marching_cubes.zig");
     _ = @import("glb.zig");
-    _ = @import("hunyuan3d.zig");
-    _ = @import("acestep.zig");
-    _ = @import("music3.zig");
     _ = @import("uvwrap.zig");
-    _ = @import("hunyuan3d_paint.zig");
-    _ = @import("hunyuan3d_paint_unet.zig");
     _ = @import("rasterize.zig");
     _ = @import("texinpaint.zig");
-    _ = @import("bake.zig");
     _ = @import("multipart.zig");
-    _ = @import("gen.zig");
     _ = @import("gen_sse.zig");
     _ = @import("ollama.zig");
     _ = @import("cli.zig");
     _ = @import("launch.zig");
     _ = @import("lan.zig");
-    _ = @import("mlx.zig");
+    _ = @import("model_registry.zig");
+    _ = @import("scheduler.zig");
+    _ = @import("server.zig");
+
+    // ── MLX-backed: the native transformer, spec decode, media generation ──
+
+    _ = if (build_cfg.llama_enabled) @import("arch/llama.zig") else struct {};
 }

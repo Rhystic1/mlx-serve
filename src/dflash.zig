@@ -91,29 +91,12 @@ pub const DflashConfig = struct {
     }
 };
 
-/// Does this config.json declare the DFlash contract? ALL THREE fields must
-/// be present — `model_type` (`*_assistant`) is only the discovery-level
-/// "this is a drafter" signal, never the DFlash detection.
-pub fn isDflashConfigJson(root: std.json.ObjectMap) bool {
-    return dflashContractObject(root) != null;
-}
-
-/// The object holding the DFlash contract triple: DFlash2 checkpoints nest it
-/// under `dflash_config`, v1 assistants declare it at the root. Null when
-/// neither shape declares all three fields.
-fn dflashContractObject(root: std.json.ObjectMap) ?std.json.ObjectMap {
-    if (root.get("dflash_config")) |dc| {
-        if (dc == .object and hasContractTriple(dc.object)) return dc.object;
-    }
-    if (hasContractTriple(root)) return root;
-    return null;
-}
-
-fn hasContractTriple(o: std.json.ObjectMap) bool {
-    return o.get("block_size") != null and
-        o.get("mask_token_id") != null and
-        o.get("target_layer_ids") != null;
-}
+// The contract predicate moved to src/dflash_contract.zig so discovery can
+// classify a drafter without pulling this file (and transformer.zig +
+// deepseek_v4.zig) in behind it. Re-exported: one contract, one definition.
+const dflash_contract = @import("dflash_contract.zig");
+pub const isDflashConfigJson = dflash_contract.isDflashConfigJson;
+const dflashContractObject = dflash_contract.dflashContractObject;
 
 /// Read `<dir>/config.json` and answer whether it declares DFlash. Any
 /// read/parse failure is a quiet false — the caller falls through to the

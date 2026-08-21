@@ -1,23 +1,25 @@
 const std = @import("std");
 const build_options = @import("build_options");
-const mlx = @import("mlx.zig");
+const mlx = if (@import("build_cfg.zig").mlx_enabled) @import("mlx.zig") else @import("mlx_stub.zig");
 const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
-const transformer_mod = @import("transformer.zig");
-const generate_mod = @import("generate.zig");
+const transformer_mod = if (@import("build_cfg.zig").mlx_enabled) @import("transformer.zig") else @import("transformer_stub.zig");
+const generate_mod = if (@import("build_cfg.zig").mlx_enabled) @import("generate.zig") else @import("generate_stub.zig");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
 const model_registry_mod = @import("model_registry.zig");
-const drafter_mod = @import("drafter.zig");
-const mtp_mod = @import("mtp.zig");
+const drafter_mod = if (@import("build_cfg.zig").mlx_enabled) @import("drafter.zig") else @import("spec_stub.zig");
+const mtp_mod = if (@import("build_cfg.zig").mlx_enabled) @import("mtp.zig") else @import("spec_stub.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
-const vision_mod = @import("vision.zig");
-const ds4_arch = @import("arch/ds4.zig");
-const llama_arch = @import("arch/llama.zig");
-const ds4_ffi = @import("ds4_ffi.zig");
-const gen_mod = @import("gen.zig");
+const vision_mod = if (@import("build_cfg.zig").mlx_enabled) @import("vision.zig") else @import("vision_stub.zig");
+const build_cfg = @import("build_cfg.zig");
+const platform = @import("platform.zig");
+const ds4_arch = if (build_cfg.ds4_enabled) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const llama_arch = if (build_cfg.llama_enabled) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const ds4_ffi = if (build_cfg.ds4_enabled) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
+const gen_mod = if (@import("build_cfg.zig").mlx_enabled) @import("gen.zig") else @import("gen_stub.zig");
 const cli_mod = @import("cli.zig");
 const launch_mod = @import("launch.zig");
 const log = @import("log.zig");
@@ -30,7 +32,6 @@ pub const VERSION: []const u8 = build_options.version;
 // by the `--version` report, which runs before any engine init.
 extern "c" fn ggml_version() [*:0]const u8;
 extern "c" fn ggml_commit() [*:0]const u8;
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 // GGUF file-format version — the compiled `GGUF_VERSION` in
 // lib/llama/include/gguf.h. Keep in sync if a llama.cpp bump changes it.
@@ -87,7 +88,6 @@ fn printUsage(io: std.Io) void {
         \\                      hermes, aider); starts the MLX Core app if the
         \\                      server is down. `mlx-serve launch <agent> -h` for
         \\                      options
-
         \\
         \\Options:
         \\  --model <dir>       Path to MLX model directory
@@ -621,7 +621,7 @@ pub fn main(init: std.process.Init) !void {
             // DSpark (DeepSeek-V4 draft stages) is OPT-IN: the stages cost
             // ~11 GB resident, so the default leaves them lazy and serves
             // serial. deepseek_v4.initModel reads the env at model load.
-            _ = setenv("MLX_SERVE_DSV4_DSPARK", "1", 1);
+            platform.setEnv("MLX_SERVE_DSV4_DSPARK", "1", true);
             // Same flag, embedded engine: arm ds4's DSpark runtime when a
             // DSpark support GGUF sits beside a served .gguf model.
             ds4_dspark = true;
@@ -720,7 +720,7 @@ pub fn main(init: std.process.Init) !void {
             // compression, some quality impact). Auto-enables flash-attn
             // in the shim because llama's plain SDPA needs F16/F32 KV.
             i += 1;
-            const arch_llama = @import("arch/llama.zig");
+            const arch_llama = llama_arch;
             if (arch_llama.LlamaKvQuant.fromString(args[i])) |q| {
                 server_mod.llama_kv_quant = q;
             } else {
@@ -877,7 +877,7 @@ pub fn main(init: std.process.Init) !void {
         else
             null;
         if (chosen) |p| {
-            if (log.openFile(p, log.default_max_bytes)) |_| {
+            if (log.openFile(io, p, log.default_max_bytes)) |_| {
                 log.info("Logging to {s} (rotates at {d} MB)\n", .{ p, log.default_max_bytes / (1024 * 1024) });
             } else |e| {
                 log.warn("could not open log file {s}: {s} (stderr only)\n", .{ p, @errorName(e) });
@@ -1690,7 +1690,7 @@ fn runGenServe(
         .ds4_dspark = ds4_dspark,
         .ane_prefill = ane_prefill,
         .ane_chunk_resolver = server_mod.pinPrefillChunk,
-            .ane_headroom_resolver = server_mod.aneGateHeadroom,
+        .ane_headroom_resolver = server_mod.aneGateHeadroom,
         .metrics = server_mod.g_metrics,
     };
 
@@ -1819,7 +1819,7 @@ fn runHeadlessServe(
         .ds4_dspark = ds4_dspark,
         .ane_prefill = ane_prefill,
         .ane_chunk_resolver = server_mod.pinPrefillChunk,
-            .ane_headroom_resolver = server_mod.aneGateHeadroom,
+        .ane_headroom_resolver = server_mod.aneGateHeadroom,
         .metrics = server_mod.g_metrics,
     };
 
