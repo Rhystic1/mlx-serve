@@ -35,7 +35,11 @@ NC='\033[0m'
 
 EMBED_MODEL="${EMBED_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/bge-small-en-v1.5-8bit}"
 CHAT_MODEL="${CHAT_TEST_MODEL:-$HOME/.mlx-serve/models/Qwen3-0.6B-nvfp4}"
-if [ ! -d "$EMBED_MODEL" ]; then
+# A model is a DIRECTORY (MLX safetensors) or a FILE (a .gguf). The dir-only
+# check skipped every GGUF embedder, which is the only kind that exists on a
+# build with no MLX -- so the whole script silently opted out of the backend it
+# was pointed at.
+if [ ! -d "$EMBED_MODEL" ] && [ ! -f "$EMBED_MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_embeddings: encoder model not found at $EMBED_MODEL"
     exit 0
 fi
@@ -72,8 +76,17 @@ trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
 
 embed() { # embed <json-input> [model]
     local input="$1" model="${2:-mlx-serve}"
+    # The body goes through a FILE, not the command line. The over-limit
+    # check deliberately builds an input longer than the model window, and
+    # past a couple of thousand tokens -d "$body" exceeds the OS argument
+    # limit -- surfacing as "Argument list too long" from curl, i.e. the
+    # harness failing in a way that looks nothing like the server.
+    local bodyfile
+    bodyfile=$(mktemp)
+    printf '{"model":"%s","input":%s}' "$model" "$input" > "$bodyfile"
     curl -s -m 120 "$BASE/v1/embeddings" -H 'Content-Type: application/json' \
-        -d "{\"model\":\"$model\",\"input\":$input}"
+        --data-binary "@$bodyfile"
+    rm -f "$bodyfile"
 }
 
 echo "=== /v1/embeddings: encoder-only default model ==="
@@ -215,9 +228,17 @@ check "ready encoder advertises meta.embedding_max_length (auto = model window)"
     "$([ -n "$META_LIMIT" ] && [ "$META_LIMIT" -gt 0 ] && echo 1 || echo 0)" "got '$META_LIMIT'"
 
 # Over-window input: an explicit structured 400 naming the input index and
-# both counts — never a silent truncation (issue #117). 600 words > any
-# BERT-class 512 window; the index must identify the SECOND input.
-LONG_INPUT=$(python3 -c "print(' '.join(['tokenized']*600))")
+# both counts — never a silent truncation (issue #117); the index must
+# identify the SECOND input.
+#
+# The length is derived from the limit this server just ADVERTISED rather than
+# a fixed 600 words. A constant only exceeds a BERT-class 512 window: pointed
+# at a 2048-window encoder (nomic-embed) the "over-limit" input is comfortably
+# under the limit, the 400 never comes, and the check fails while the server is
+# behaving perfectly. One word is at least one token, so overshooting the
+# advertised token limit by 2x is over the limit for any tokenizer.
+LONG_WORDS=$(( META_LIMIT * 2 ))
+LONG_INPUT=$(python3 -c "print(' '.join(['tokenized']*$LONG_WORDS))")
 OVER_RESP=$(embed "[\"short one\", \"$LONG_INPUT\"]")
 check "over-limit input earns a 400 naming index + counts (issue #117)" \
     "$(echo "$OVER_RESP" | grep -q 'Input at index 1 exceeds the maximum embedding input length' && echo 1 || echo 0)" \
@@ -227,7 +248,7 @@ stop_server
 
 # --- 5. hot-load encoder alongside a chat default ---
 echo "=== /v1/embeddings: hot-load alongside chat model ==="
-if [ ! -d "$CHAT_MODEL" ]; then
+if [ ! -d "$CHAT_MODEL" ] && [ ! -f "$CHAT_MODEL" ]; then
     echo -e "  ${YELLOW}SKIP${NC} chat model not found at $CHAT_MODEL"
 else
     ENCODER_ID=$(basename "$EMBED_MODEL")

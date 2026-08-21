@@ -6,6 +6,18 @@
 # join/detach that never came. A long Claude Code session therefore grew from
 # the model's 4-5 GB working set toward 10 GB while MLX cache_bytes stayed tiny.
 
+
+# The measurement IS vmmap: this test counts the server's Stack regions before
+# and after a burst of connections, which is how a leaked joinable thread shows
+# up. vmmap is a macOS tool with no portable equivalent (Windows stack
+# reservations are not enumerable this way), so off Darwin there is nothing to
+# measure and a run reports "nothing was measured" as a FAILURE. Skip by name
+# instead; porting this means finding a different observable, not a different
+# spelling of vmmap.
+if [ "$(uname -s)" != "Darwin" ]; then
+    echo "SKIP: thread reaping is measured with vmmap (macOS-only)"
+    exit 0
+fi
 set -u
 
 PORT="${1:-11483}"

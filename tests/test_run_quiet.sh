@@ -21,6 +21,16 @@ if [ ! -x "$BIN" ]; then
     exit 0
 fi
 
+# REPL mode only engages on a TTY, and `script` is how we give a child one.
+# Git Bash ships no `script`, and Windows has no pty a POSIX tool can hand a
+# native process anyway -- without this guard the transcript comes back EMPTY,
+# check 1 ("no skip lines") passes because there are no lines at all, and only
+# check 2 fails. A vacuous pass is worse than a skip.
+if ! command -v script >/dev/null 2>&1; then
+    echo "SKIP: no script(1) on this host — REPL mode needs a pty"
+    exit 0
+fi
+
 SCRATCH=$(mktemp -d)
 trap 'rm -rf "$SCRATCH"' EXIT
 FAKE_HOME="$SCRATCH/home"
@@ -58,6 +68,14 @@ check() { # $1 = description, $2 = 0/1 (0 = ok)
 
 # 1. Default `run`: no skip lines in the REPL transcript.
 run_case "$SCRATCH/default.txt"
+# An empty transcript would satisfy the check below without proving anything --
+# the fixture must have produced SOME output for "no skip lines in it" to mean
+# "the quieting worked".
+if [ ! -s "$SCRATCH/default.txt" ]; then
+    check "run (default) produced a transcript at all" 1
+else
+    check "run (default) produced a transcript at all" 0
+fi
 if grep -q "\[discovery\] skip" "$SCRATCH/default.txt"; then
     check "run (default) does not print [discovery] skip lines" 1
 else

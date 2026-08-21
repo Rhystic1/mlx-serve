@@ -14,6 +14,19 @@
 # past the gate the answer is no longer the gate's 503.
 #
 # Usage: ./tests/test_media_eviction_gate.sh [port]
+
+. "$(dirname "$0")/lib/portable_env.sh"
+
+# Media generation is an MLX subsystem: in the portable (GGUF-only) build every
+# backend refuses by name and a load dies "MlxUnavailable" long before the
+# eviction gate this test is about gets a chance to answer. The 500 that comes
+# back is correct for that build and tells us nothing about the gate, so skip
+# by name rather than report a red gate. Keyed on the BUILD, so a Mac
+# configured with -Dgguf-only skips here too.
+if ! mlxserve_has_mlx "${BINARY:-./zig-out/bin/mlx-serve}"; then
+    echo "SKIP: media generation needs MLX; this is a GGUF-only build"
+    exit 0
+fi
 set -uo pipefail
 PORT="${1:-11374}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
