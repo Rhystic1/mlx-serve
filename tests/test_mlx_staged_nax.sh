@@ -19,6 +19,16 @@
 #
 # Usage: ./tests/test_mlx_staged_nax.sh
 
+
+# MLX has no build off Apple silicon: no dylibs, no metallib, no NAX kernels to
+# check for. A portable (-Dgguf-only) build has llama.cpp as its entire
+# inference floor, so every assertion below is about something that is absent
+# by design rather than missing by accident. Skip BY NAME -- a failing run here
+# reads as a broken MLX stage.
+if [ "$(uname -s)" != "Darwin" ]; then
+    echo "SKIP: MLX is Apple-only — nothing staged to verify on $(uname -s)"
+    exit 0
+fi
 set -u
 cd "$(dirname "$0")/.." || exit 1
 

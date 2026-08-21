@@ -807,21 +807,21 @@ fn tryAddModel(
         // before they reach the tokenizer/weight loaders.
         break :blk switch (peekConfig(io, allocator, parent, name)) {
             .missing_or_unparseable => {
-                log.info("[discovery] skip {s}: config.json missing or unparseable", .{name});
+                log.info("[discovery] skip {s}: config.json missing or unparseable\n", .{name});
                 return true;
             },
             .unsupported_arch => |mt| {
                 defer allocator.free(mt);
-                log.info("[discovery] skip {s}: unsupported model_type '{s}'", .{ name, mt });
+                log.info("[discovery] skip {s}: unsupported model_type '{s}'\n", .{ name, mt });
                 return true;
             },
             .unsupported_quant => |mode| {
                 defer allocator.free(mode);
-                log.info("[discovery] skip {s}: unsupported quantization mode '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)", .{ name, mode });
+                log.info("[discovery] skip {s}: unsupported quantization mode '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)\n", .{ name, mode });
                 return true;
             },
             .drafter => {
-                log.info("[discovery] skip {s}: DFlash drafter sidecar, not a standalone model", .{name});
+                log.info("[discovery] skip {s}: DFlash drafter sidecar, not a standalone model\n", .{name});
                 return true;
             },
             .supported => |mt| mt, // ownership moves to the DiscoveredModel
@@ -834,7 +834,7 @@ fn tryAddModel(
     if (requiredMediaMarker(model_type)) |marker| {
         const present = if (sub.statFile(io, marker, .{})) |st| st.kind == .file else |_| false;
         if (!present) {
-            log.info("[discovery] skip {s}: {s} without {s} (incomplete media pack)", .{ name, model_type, marker });
+            log.info("[discovery] skip {s}: {s} without {s} (incomplete media pack)\n", .{ name, model_type, marker });
             allocator.free(model_type);
             return true;
         }

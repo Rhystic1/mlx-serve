@@ -87,7 +87,16 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "[fetch-zig] downloading $URL"
-curl -fSL --retry 3 -o "$TMP/zig.$KIND" "$URL"
+# ONE variable owns the archive's local name. Deriving the download name from
+# KIND and the extract name from a literal extension is how the unix path broke:
+# "zig.tar" was written and "zig.tar.xz" was untarred, which Windows never
+# noticed because its KIND happens to spell "zip".
+# Keep the asset's OWN filename, extension included: PowerShell's
+# Expand-Archive (the last-resort Windows extractor) refuses a -LiteralPath
+# that does not end in .zip, so a generic name would swap one silent
+# host-specific break for another.
+ARCHIVE="$TMP/$ASSET"
+curl -fSL --retry 3 -o "$ARCHIVE" "$URL"
 
 echo "[fetch-zig] extracting"
 if [ "$KIND" = "zip" ]; then
@@ -95,15 +104,15 @@ if [ "$KIND" = "zip" ]; then
   # /c/Windows/System32/tar.exe, which does. Try unzip, then bsdtar, then
   # PowerShell — one of the three exists on every Windows dev box.
   if command -v unzip >/dev/null 2>&1; then
-    unzip -q "$TMP/zig.zip" -d "$TMP"
+    unzip -q "$ARCHIVE" -d "$TMP"
   elif /c/Windows/System32/tar.exe --version >/dev/null 2>&1; then
-    /c/Windows/System32/tar.exe -xf "$(cygpath -w "$TMP/zig.zip")" -C "$(cygpath -w "$TMP")"
+    /c/Windows/System32/tar.exe -xf "$(cygpath -w "$ARCHIVE")" -C "$(cygpath -w "$TMP")"
   else
     powershell.exe -NoProfile -Command \
-      "Expand-Archive -Force -LiteralPath '$(cygpath -w "$TMP/zig.zip")' -DestinationPath '$(cygpath -w "$TMP")'"
+      "Expand-Archive -Force -LiteralPath '$(cygpath -w "$ARCHIVE")' -DestinationPath '$(cygpath -w "$TMP")'"
   fi
 else
-  tar xf "$TMP/zig.tar.xz" -C "$TMP"
+  tar xf "$ARCHIVE" -C "$TMP"
 fi
 
 # The archive's top-level dir is the asset name minus its extension.

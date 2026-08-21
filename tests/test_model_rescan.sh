@@ -38,6 +38,7 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
+. "$(dirname "$0")/lib/portable_env.sh"
 ROOT_DIR="$(mktemp -d)"
 LOG="$(mktemp)"
 SERVER_PID=""
@@ -102,9 +103,15 @@ RESCAN=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/models/rescan")
 check "incomplete media pack is not absorbed (got $RESCAN)" \
     "$(echo "$RESCAN" | grep -q '"added":0' && echo 1 || echo 0)"
 
+# The path travels in a JSON BODY, so it must be in the SERVER's own form: the
+# shell rewrites POSIX paths on the way into argv (which is why --model-dir
+# above works) but not inside a payload, and a literal "/tmp/..." reaching a
+# native Windows server is refused as "no loadable model directory" -- a correct
+# answer to the wrong question, which reads as this assertion failing. Identity
+# on macOS/Linux.
 LOAD=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/load-model" \
     -H 'Content-Type: application/json' \
-    -d "{\"model\":\"$ROOT_DIR/org/fragment\"}")
+    -d "{\"model\":\"$(mlxserve_host_path "$ROOT_DIR/org/fragment")\"}")
 check "load-by-path refuses the incomplete pack by name (got $LOAD)" \
     "$(echo "$LOAD" | grep -qi 'incomplete media pack' && echo 1 || echo 0)"
 HEALTH=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health")

@@ -75,6 +75,49 @@ mlx_llama_session *mlx_llama_session_create_kv_quant(mlx_llama_engine *e,
                                                      char *err, size_t errlen);
 void mlx_llama_session_free(mlx_llama_session *s);
 
+// ── Embeddings ─────────────────────────────────────────────────────────────
+//
+// An embedding context is a SEPARATE context, not a mode of a generation one:
+// `llama_context_params.embeddings` and `pooling_type` are fixed at creation,
+// and a pooled context produces no per-token logits to sample from. So an
+// embedding model gets its own session and never shares one with chat.
+
+// Width of one embedding vector for this model.
+int32_t mlx_llama_n_embd(mlx_llama_engine *e);
+
+// The context length this checkpoint was TRAINED at. The GGUF stub config is
+// built before the engine opens and has to guess (8192), which is wrong in
+// both directions: it over-promises on a 2048-window embedder and
+// under-reports a 262144 one. Once the engine is open the model itself knows.
+int32_t mlx_llama_n_ctx_train(mlx_llama_engine *e);
+
+// Is this checkpoint an EMBEDDING model rather than a generative one?
+// Answered from the POOLING type it declares -- an embedding model reduces its
+// token states to one vector per sequence, a generative model does not.
+// Probed with a 32-token context, so the KV allocation it costs is noise.
+//
+// The answer drives what the server ADVERTISES: an encoder-only checkpoint
+// must not claim "chat", and must claim "embeddings".
+bool mlx_llama_is_encoder_only(mlx_llama_engine *e);
+
+// Create a session for embeddings. Same lifetime and free function as a
+// generation session (mlx_llama_session_free). NULL on failure, with the
+// reason in `err`.
+mlx_llama_session *mlx_llama_embed_session_create(mlx_llama_engine *e, int32_t n_ctx,
+                                                 char *err, size_t errlen);
+
+// Embed one token sequence into `out` (which must hold at least
+// mlx_llama_n_embd floats). Returns the number of floats written, or -1 with
+// the reason in `err`.
+//
+// The session's memory is CLEARED first: an embedding is a property of the
+// input alone, so carrying KV across calls would make the answer depend on
+// what was embedded before it.
+int32_t mlx_llama_session_embed(mlx_llama_session *s,
+                                const int32_t *tokens, int32_t n_tokens,
+                                float *out, int32_t out_cap,
+                                char *err, size_t errlen);
+
 // Decode a contiguous run of tokens, appending to the KV cache from the current
 // position. Chunked internally. 0 ok, -1 on failure. Caller drives prompt-prefix
 // reuse by trimming first (see mlx_llama_session_trim) and passing only the
@@ -85,8 +128,14 @@ int32_t mlx_llama_session_sync(mlx_llama_session *s, const int32_t *tokens, int3
 // Drop all KV entries at positions >= n_keep (i.e. keep the first n_keep tokens),
 // leaving the cache at position n_keep so the next sync continues from there.
 // No-op when n_keep >= current position. Used for prompt-prefix reuse: keep the
-// common prefix, discard the divergent tail. Returns 0 (the underlying seq_rm of
-// a whole tail never fails for our single-sequence usage).
+// common prefix, discard the divergent tail.
+//
+// Returns 0 when the session now holds exactly the first n_keep tokens.
+// Returns 1 when a partial trim was REFUSED and the whole session was cleared
+// instead: a recurrent/hybrid memory (GatedDeltaNet, Mamba, RWKV) has no
+// history to rewind to. The caller must then treat the session as EMPTY and
+// re-feed the whole prompt -- reusing a prefix it no longer holds serves the
+// request from the wrong position.
 int32_t mlx_llama_session_trim(mlx_llama_session *s, int32_t n_keep);
 
 // Clear the entire KV cache (position → 0). For a prompt that shares nothing with

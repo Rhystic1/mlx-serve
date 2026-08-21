@@ -78,6 +78,33 @@ if llama_asset_plan Plan9 x86_64 "$T" >/dev/null 2>&1; then
   fail "llama_asset_plan accepted an unsupported OS"
 else pass; fi
 
+# ── 4. The downloaded path and the extracted path must be the SAME path ────
+# A pure-helper test proves the resolver picks the right ASSET; it cannot see
+# that the script then saves the download under one name and untars another.
+# That is exactly what happened: the Windows port changed the download to
+# `-o "$TMP/zig.$KIND"` (so "$TMP/zig.tar" on macOS and Linux) and left the
+# extract reading "$TMP/zig.tar.xz". Windows was unaffected because its KIND
+# spells "zip" and matches by luck, so the break was invisible on the host
+# being worked on -- while macOS and Linux could no longer stage a toolchain
+# from a clean tree at all.
+#
+# A source scan rather than a run: fetching the real archive is hundreds of MB,
+# and the defect is a coupling between two lines, which is readable.
+# Pull the argument curl saves to, and the argument each extractor reads from.
+# Generic on purpose: the check is "these name the same thing", not "they spell
+# it the way it is spelled today".
+DL_PATH=$(grep -oE -- '-o "[^"]+" "\$URL"' scripts/fetch-zig.sh | head -1 | sed -E 's/-o "([^"]+)".*//')
+TAR_PATH=$(grep -oE 'tar xf "[^"]+"' scripts/fetch-zig.sh | head -1 | sed -E 's/tar xf "([^"]+)"//')
+ZIP_PATH=$(grep -oE 'unzip -q "[^"]+"' scripts/fetch-zig.sh | head -1 | sed -E 's/unzip -q "([^"]+)"//')
+if [ -z "$DL_PATH" ] || [ -z "$TAR_PATH" ] || [ -z "$ZIP_PATH" ]; then
+  fail "could not find the download / extract paths in fetch-zig.sh (did they move?)"
+else
+  if [ "$DL_PATH" = "$TAR_PATH" ]; then pass
+  else fail "fetch-zig.sh downloads to '$DL_PATH' but untars '$TAR_PATH' — the unix path cannot work"; fi
+  if [ "$DL_PATH" = "$ZIP_PATH" ]; then pass
+  else fail "fetch-zig.sh downloads to '$DL_PATH' but unzips '$ZIP_PATH' — the Windows path cannot work"; fi
+fi
+
 echo ""
 echo "toolchain fetch helpers: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -224,7 +224,9 @@ build-from-source)
   echo "  Upstream ships only cpu / vulkan / sycl / openvino for Linux, and a" >&2
   echo "  cpu build would report CUDA support it does not have." >&2
   echo "  Build from source instead:" >&2
-  echo "    scripts/build-llama-cuda.sh   (not yet implemented — Windows first)" >&2
+  echo "    scripts/build-llama-cuda.sh" >&2
+  echo "  (needs cmake + the CUDA toolkit; it refuses to stage a build that did" >&2
+  echo "   not actually produce libggml-cuda.so)" >&2
   exit 1
   ;;
 

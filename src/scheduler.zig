@@ -2473,6 +2473,39 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         } else |_| {}
     }
 
+    // The stub config's context is a GUESS made before the engine opened (8192
+    // — the GGUF's trained window is not readable until then). Now that the
+    // model is open it can be asked, and a window SMALLER than the guess is
+    // corrected down: nomic-embed trains at 2048, so the server was
+    // advertising 8192 and accepting embedding inputs four times longer than
+    // the checkpoint has ever seen, with no 400 and no visible failure.
+    //
+    // Only ever DOWNWARD, and only when --ctx-size was not given. The guess
+    // doubles as a memory bound: this value sizes the libllama KV allocation,
+    // so adopting a 262144-token trained window because the model mentions one
+    // would turn a working load into an OOM. Raising it stays an explicit
+    // --ctx-size decision.
+    if (sch.gguf_ctx_size == 0) {
+        const trained = engine.nCtxTrain();
+        if (trained > 0 and @as(u32, @intCast(trained)) < params.config.max_position_embeddings) {
+            log.info("[llama] context: {d} (model's trained window, below the {d} default)\n", .{
+                trained, params.config.max_position_embeddings,
+            });
+            params.config.max_position_embeddings = @intCast(trained);
+        }
+    }
+
+    // An encoder-only GGUF (BERT, nomic-embed) is an EMBEDDING model, not a
+    // chat one. The stub config is built before the engine opens and defaults
+    // this to false, so without correcting it here nomic-embed advertises
+    // "chat" (and not "embeddings") in /v1/models and text-gen requests to it
+    // reach the sampler instead of the named "use /v1/embeddings" 400. The
+    // model itself is the authority; asking costs nothing.
+    params.config.is_encoder_only = engine.isEncoderOnly();
+    if (params.config.is_encoder_only) {
+        log.info("[llama] encoder-only checkpoint: serving embeddings, not chat\n", .{});
+    }
+
     const entry = params.entry;
     entry.llama_engine = engine;
     entry.config = params.config;
@@ -4020,7 +4053,68 @@ fn finishVisionRequest(sch: *Scheduler, req: *VisionEncodeRequest, err_name: []c
 /// encoder-only forward pass via `generate.computeEmbeddingsBatch(xfm, ...)`,
 /// resets the global xfm.cache between requests (encoder-only does not
 /// share KV state across embeddings), and wakes the conn thread.
+/// Embed a batch through the llama.cpp engine. Runs on the inference thread
+/// like every other engine call -- a libllama context is not thread-safe, and
+/// the generation path already reaches this engine from here only.
+///
+/// The embedding session is created on FIRST USE rather than at load: a chat
+/// model would otherwise pay for a second libllama context (its own compute
+/// buffers, its own KV allocation) that nothing ever asks for.
+fn runEmbedRequestLlama(sch: *Scheduler, req: *EmbedRequest, engine: *arch_llama.LlamaEngine) void {
+    const ctx_size: i32 = if (req.model.config) |c| @intCast(c.max_position_embeddings) else 0;
+    if (req.model.llama_embed_session == null) {
+        req.model.llama_embed_session = engine.createEmbedSession(ctx_size) catch |err| {
+            finishEmbedRequest(sch, req, @errorName(err));
+            return;
+        };
+    }
+    const sess = req.model.llama_embed_session.?;
+
+    const results = req.allocator.alloc([]f32, req.token_seqs.len) catch |err| {
+        finishEmbedRequest(sch, req, @errorName(err));
+        return;
+    };
+    // Cleanup is explicit at each failure point rather than `errdefer`: this
+    // function reports failure by calling `finishEmbedRequest` and returning
+    // void, so an errdefer here would never run.
+    var filled: usize = 0;
+
+    for (req.token_seqs, 0..) |ids, i| {
+        // i32 is libllama's token type; the server tokenized with this same
+        // engine's vocabulary, so the values are in range by construction.
+        const i32_ids = req.allocator.alloc(i32, ids.len) catch |err| {
+            for (results[0..filled]) |r| req.allocator.free(r);
+            req.allocator.free(results);
+            finishEmbedRequest(sch, req, @errorName(err));
+            return;
+        };
+        defer req.allocator.free(i32_ids);
+        for (ids, 0..) |t, j| i32_ids[j] = @intCast(t);
+
+        results[i] = sess.embed(req.allocator, i32_ids) catch |err| {
+            for (results[0..filled]) |r| req.allocator.free(r);
+            req.allocator.free(results);
+            finishEmbedRequest(sch, req, @errorName(err));
+            return;
+        };
+        filled += 1;
+    }
+
+    req.done_mu.lockUncancelable(sch.io);
+    defer req.done_mu.unlock(sch.io);
+    req.results = results;
+    req.done = true;
+    req.done_cond.broadcast(sch.io);
+}
+
 fn runEmbedRequest(sch: *Scheduler, req: *EmbedRequest) void {
+    // GGUF models own their whole stack -- tokenizer, weights and now the
+    // embedding context -- so they never touch the MLX encoder below. Checked
+    // FIRST because `transformer` is non-null on the GGUF path too (a shell),
+    // so the MLX arm does not fail in a way that names the real reason.
+    if (req.model.llama_engine) |engine| {
+        return runEmbedRequestLlama(sch, req, engine);
+    }
     const xfm_ptr = req.model.transformer.?;
     xfm_ptr.resetCache() catch |err| {
         finishEmbedRequest(sch, req, @errorName(err));

@@ -27,6 +27,7 @@ const prefix_cache_mod = if (@import("build_cfg.zig").mlx_enabled) @import("pref
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const token_mask_mod = @import("token_mask.zig");
 const model_discovery = @import("model_discovery.zig");
+const platform = @import("platform.zig");
 const arch_ds4 = if (@import("build_cfg.zig").ds4_enabled) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
 const arch_llama = if (@import("build_cfg.zig").llama_enabled) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const gen_mod = if (@import("build_cfg.zig").mlx_enabled) @import("gen.zig") else @import("gen_stub.zig");
@@ -221,6 +222,15 @@ pub const LoadedModel = struct {
     /// are baked into the libllama context at create-time.
     llama_kv_type_k: i32 = 0,
     llama_kv_type_v: i32 = 0,
+    /// Lazily created embedding session for a GGUF model (`/v1/embeddings`).
+    /// Kept apart from `llama_sessions` because it is not a cache entry and
+    /// never competes with them: `embeddings` and `pooling_type` are fixed
+    /// when a libllama context is created, so an embedding context can never
+    /// serve generation and a generation context can never be pooled. Created
+    /// on first use so a chat-only model never pays for it, and freed on the
+    /// same paths as the generation sessions -- it holds a context bound to
+    /// the engine's model and must go before the engine does.
+    llama_embed_session: ?*arch_llama.LlamaSession = null,
 
     // ── Bookkeeping. Updated under `ModelRegistry.mutex`. ──
 
@@ -277,6 +287,10 @@ pub const LoadedModel = struct {
     pub fn deinit(self: *LoadedModel) void {
         for (self.llama_sessions.items) |entry| entry.session.free();
         self.llama_sessions.deinit(self.allocator);
+        if (self.llama_embed_session) |es| {
+            es.free();
+            self.llama_embed_session = null;
+        }
         self.llama_session_busy = false;
         if (self.ds4_engine) |engine| {
             engine.close();
@@ -388,6 +402,10 @@ pub const LoadedModel = struct {
         for (self.llama_sessions.items) |entry| entry.session.free();
         self.llama_sessions.clearRetainingCapacity();
         self.llama_session_busy = false;
+        if (self.llama_embed_session) |es| {
+            es.free();
+            self.llama_embed_session = null;
+        }
         if (self.ds4_engine) |engine| {
             engine.close();
             self.ds4_engine = null;
@@ -694,8 +712,9 @@ pub const ModelRegistry = struct {
     /// a small embedding encoder and registers it here no matter which org
     /// dir the chat model (and thus --model-dir) points at.
     pub fn registerByPath(self: *ModelRegistry, io: std.Io, abs_path: []const u8) ![]const u8 {
-        var trimmed = abs_path;
-        while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
+        // Host-aware: Windows accepts both separators, so a '/'-only trim
+        // leaves a trailing backslash and basename comes back empty.
+        const trimmed = platform.trimTrailingSeps(abs_path);
         const base = std.fs.path.basename(trimmed);
         if (base.len == 0) return error.InvalidModelPath;
 

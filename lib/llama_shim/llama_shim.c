@@ -6,6 +6,9 @@
 #include "llama_shim.h"
 
 #include "llama.h"
+#ifndef __APPLE__
+#include "ggml-backend.h"
+#endif
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -30,6 +33,30 @@ static pthread_once_t g_backend_once = PTHREAD_ONCE_INIT;
 
 static void backend_init_once(void) {
     llama_backend_init();
+    // ggml dlopens its compute backends (CUDA, the per-uarch CPU variants) by
+    // FILENAME at runtime; `llama_backend_init` does not do it for us. The
+    // registry's own auto-load searches the directory of the RUNNING
+    // executable, which is right for the installed server (the whole DLL set
+    // ships beside mlx-serve.exe) and wrong for anything else — a `zig build
+    // test` binary lives under .zig-cache and loaded ZERO backends, so every
+    // model-gated llama test died `no backends are loaded` no matter what was
+    // on PATH. Calling it explicitly is the documented contract, and
+    // MLX_LLAMA_BACKEND_DIR points it at the staged tree (lib/llama/bin) for
+    // any binary that is not the installed one. Loading is additive and
+    // idempotent — a backend already registered is not registered twice — so
+    // doing both is safe.
+#ifndef __APPLE__
+    // Apple only: the XCFramework merges llama + ggml + ggml-metal into ONE
+    // dylib with its backends compiled IN, so there is nothing to dlopen and
+    // nothing to link for it. Everywhere else ggml ships the backends as
+    // separate shared objects and this call is what registers them.
+    const char *dir = getenv("MLX_LLAMA_BACKEND_DIR");
+    if (dir && dir[0] != '\0') {
+        ggml_backend_load_all_from_path(dir);
+    } else {
+        ggml_backend_load_all();
+    }
+#endif
 }
 
 static void copy_err(char *err, size_t errlen, const char *msg) {
@@ -198,12 +225,152 @@ int32_t mlx_llama_session_sync(mlx_llama_session *s, const int32_t *tokens, int3
     return 0;
 }
 
+// ── Embeddings ─────────────────────────────────────────────────────────────
+
+int32_t mlx_llama_n_embd(mlx_llama_engine *e) {
+    return llama_model_n_embd(e->model);
+}
+
+int32_t mlx_llama_n_ctx_train(mlx_llama_engine *e) {
+    return llama_model_n_ctx_train(e->model);
+}
+
+// Build the context params an embedding session needs. Split out so
+// mlx_llama_has_pooling can ask the same question the session will answer.
+static struct llama_context_params embed_ctx_params(int32_t n_ctx) {
+    struct llama_context_params cp = llama_context_default_params();
+    if (n_ctx > 0) cp.n_ctx = (uint32_t)n_ctx;
+    cp.embeddings = true;
+    // UNSPECIFIED means "use whatever the checkpoint declares". Naming a
+    // pooling type here would override the model's own -- a CLS model asked to
+    // mean-pool returns a plausible vector that is simply not this model's
+    // embedding, and nothing about it looks wrong.
+    cp.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
+    // No causal mask: an embedding encoder is bidirectional. Generative
+    // checkpoints used as embedders keep causal attention, which llama.cpp
+    // decides from the model's own architecture, so this only relaxes it where
+    // the model says it is an encoder.
+    cp.n_ubatch = cp.n_batch;
+    return cp;
+}
+
+bool mlx_llama_is_encoder_only(mlx_llama_engine *e) {
+    // NOT llama_model_has_encoder(): llama.cpp reserves that for true
+    // encoder-decoder architectures (T5), and reports every BERT-family
+    // embedding model as a plain decoder -- so it answers false for exactly
+    // the checkpoints this question is about (measured on nomic-embed).
+    //
+    // The authoritative signal is the POOLING type the checkpoint declares:
+    // an embedding model pools its token states into one vector per sequence,
+    // a generative one does not. That is only readable from a context, so
+    // probe with a deliberately tiny one -- n_ctx is what sizes the KV
+    // allocation, and 32 tokens of it costs nothing even on a 27B.
+    struct llama_context_params cp = embed_ctx_params(32);
+    struct llama_context *ctx = llama_init_from_model(e->model, cp);
+    if (!ctx) return false;
+    const enum llama_pooling_type pt = llama_pooling_type(ctx);
+    llama_free(ctx);
+    return pt != LLAMA_POOLING_TYPE_NONE;
+}
+
+mlx_llama_session *mlx_llama_embed_session_create(mlx_llama_engine *e, int32_t n_ctx,
+                                                 char *err, size_t errlen) {
+    struct llama_context *ctx = llama_init_from_model(e->model, embed_ctx_params(n_ctx));
+    if (!ctx) {
+        copy_err(err, errlen, "llama_init_from_model failed (embeddings)");
+        return NULL;
+    }
+    mlx_llama_session *s = (mlx_llama_session *)calloc(1, sizeof(*s));
+    if (!s) {
+        llama_free(ctx);
+        copy_err(err, errlen, "out of memory allocating embed session");
+        return NULL;
+    }
+    s->ctx = ctx;
+    s->engine = e;
+    s->pos = 0;
+    return s;
+}
+
+int32_t mlx_llama_session_embed(mlx_llama_session *s,
+                                const int32_t *tokens, int32_t n_tokens,
+                                float *out, int32_t out_cap,
+                                char *err, size_t errlen) {
+    const int32_t n_embd = llama_model_n_embd(s->engine->model);
+    if (n_tokens <= 0) {
+        copy_err(err, errlen, "empty token sequence");
+        return -1;
+    }
+    if (out_cap < n_embd) {
+        copy_err(err, errlen, "output buffer smaller than n_embd");
+        return -1;
+    }
+
+    // An embedding depends on its input alone. Without this clear the previous
+    // sequence is still resident and positions continue from it, so the second
+    // call in a batch embeds "previous text + this text".
+    llama_memory_clear(llama_get_memory(s->ctx), true);
+    s->pos = 0;
+
+    // An explicit batch rather than llama_batch_get_one: pooling reduces over
+    // the tokens whose logits flag is set, and get_one sets only the LAST one.
+    // With that, a mean-pooled model returns the mean of a single token.
+    struct llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+    for (int32_t i = 0; i < n_tokens; i++) {
+        batch.token[i] = (llama_token)tokens[i];
+        batch.pos[i] = i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = 1;
+    }
+    batch.n_tokens = n_tokens;
+
+    const int32_t rc = llama_decode(s->ctx, batch);
+    llama_batch_free(batch);
+    if (rc != 0) {
+        copy_err(err, errlen, "llama_decode failed during embedding");
+        return -1;
+    }
+    s->pos = n_tokens;
+
+    const float *src = llama_get_embeddings_seq(s->ctx, 0);
+    if (!src) {
+        // No pooling: the model produces one vector PER TOKEN and there is no
+        // single sequence embedding. Take the last token's, which is what a
+        // generative checkpoint used as an embedder means.
+        src = llama_get_embeddings_ith(s->ctx, n_tokens - 1);
+    }
+    if (!src) {
+        copy_err(err, errlen, "no embeddings produced (is this an embedding model?)");
+        return -1;
+    }
+    memcpy(out, src, (size_t)n_embd * sizeof(float));
+    return n_embd;
+}
+
 int32_t mlx_llama_session_trim(mlx_llama_session *s, int32_t n_keep) {
     if (n_keep < 0) n_keep = 0;
     if (n_keep >= s->pos) return 0; // nothing resident beyond n_keep
-    // Single-sequence (seq 0) usage: remove positions [n_keep, inf). Removing a
-    // whole tail of one sequence never returns false (see llama.h seq_rm doc).
-    llama_memory_seq_rm(llama_get_memory(s->ctx), 0, n_keep, -1);
+    // Single-sequence (seq 0) usage: remove positions [n_keep, inf).
+    //
+    // This return value is LOAD-BEARING and was previously discarded on the
+    // belief that removing a whole tail never fails. That holds for a KV cache
+    // and is false for a RECURRENT one: a hybrid checkpoint (GatedDeltaNet,
+    // Mamba, RWKV) keeps a fixed-size rolling state per layer with no history
+    // to roll back to, so `llama_memory_recurrent::seq_rm` refuses any p0 > 0
+    // and leaves the state exactly as it was. Ignoring that produced a session
+    // whose recurrent layers still held the OLD tail while `pos` claimed they
+    // did not, and the request answered from the wrong position -- live on
+    // Qwen3.8-27B (2026-08-20) an identical repeat request echoed prompt tokens
+    // back, and the one after it returned an empty completion.
+    //
+    // A refusal is not an error: the only correct recovery is to drop
+    // everything and let the caller cold-prefill, which is what `1` reports.
+    if (!llama_memory_seq_rm(llama_get_memory(s->ctx), 0, n_keep, -1)) {
+        llama_memory_clear(llama_get_memory(s->ctx), true);
+        s->pos = 0;
+        return 1;
+    }
     s->pos = n_keep;
     return 0;
 }
