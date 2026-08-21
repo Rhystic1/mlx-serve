@@ -3793,7 +3793,7 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     // The dir is validated exactly like discovery (config.json, supported
     // model_type + quant mode) before anything is registered; the load then
     // proceeds under the directory-basename id.
-    if (std.mem.startsWith(u8, requested_id, "/")) {
+    if (platform.looksAbsolutePath(requested_id)) {
         const registry = global_registry orelse {
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
             return;
@@ -4013,9 +4013,8 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_
     } else |_| {
         requested_id = parseModelFromBody(request_body) orelse "";
     }
-    if (std.mem.startsWith(u8, requested_id, "/")) {
-        var trimmed = requested_id;
-        while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
+    if (platform.looksAbsolutePath(requested_id)) {
+        const trimmed = platform.trimTrailingSeps(requested_id);
         requested_id = std.fs.path.basename(trimmed);
     }
 
@@ -4407,6 +4406,26 @@ fn handleEmbeddings(
         seqs.deinit(allocator);
     }
     for (texts.items) |text| {
+        // GGUF: the engine owns the real vocabulary. `lm.tokenizer` on this
+        // path is the decode-only STUB the cold load attaches (empty vocab, no
+        // merges), so encoding through it would hand the embedder ids that
+        // mean nothing -- and produce a confident, wrong vector rather than an
+        // error. `add_special` is true so the checkpoint's own [CLS]/[SEP] (or
+        // BOS/EOS) land exactly where it was trained to see them, which is the
+        // position a CLS-pooled model reads.
+        if (lm.llama_engine) |engine| {
+            const i32_ids = engine.tokenizeText(allocator, text, true) catch |err| {
+                log.err("  embedding tokenize failed: {s}\n", .{@errorName(err)});
+                try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to tokenize embedding input", null);
+                return;
+            };
+            defer allocator.free(i32_ids);
+            const ids = try allocator.alloc(u32, i32_ids.len);
+            for (i32_ids, 0..) |t, i| ids[i] = @intCast(t);
+            total_tokens += ids.len;
+            try seqs.append(allocator, ids);
+            continue;
+        }
         const raw_ids = try tok.encode(allocator, text);
         // Bidirectional embedding models (EmbeddingGemma) declare
         // add_bos_token + add_eos_token; the SentencePiece encode path adds

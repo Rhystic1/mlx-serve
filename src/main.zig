@@ -935,7 +935,7 @@ pub fn main(init: std.process.Init) !void {
         }
         // Above every serve dispatch (GGUF/headless/media return early below).
         if (server_mod.shouldWarnOpenBind(host_explicit, server_mod.g_lan_share_spec != null, host)) {
-            log.warn("Listening on {s}:{d} — reachable by every device on the network this Mac is on.\n", .{ host, port });
+            log.warn("Listening on {s}:{d} — reachable by every device on the network this machine is on.\n", .{ host, port });
             log.warn("Restrict to this Mac with --host 127.0.0.1 (a future version will make that the default).\n", .{});
         }
     }
@@ -2062,7 +2062,10 @@ fn runLlamaOffline(
     };
     defer allocator.free(gguf_path);
 
-    log.info("[llama] backend: Metal, model: {s}\n", .{gguf_path});
+    // ggml picks its own backend at init (Metal on Apple, CUDA here, CPU as
+    // the fallback) and logs which one it registered, so naming one in OUR log
+    // was only ever right on a Mac.
+    log.info("[llama] model: {s}\n", .{gguf_path});
 
     var engine = llama_arch.LlamaEngine.open(allocator, gguf_path, .{}) catch |err| {
         log.err("[llama] engine open failed: {s}\n", .{@errorName(err)});
