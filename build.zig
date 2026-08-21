@@ -202,10 +202,13 @@ pub fn build(b: *std.Build) void {
     // set is not. Without this the process dies at load, before a single test
     // runs, and the build reports only a bare exit code.
     if (target.result.os.tag == .windows) {
-        // Point PATH at the install bin dir, where installLlamaDlls already
-        // put the whole set beside mlx-serve.exe, and make the test depend on
-        // that install so the DLLs exist before it runs.
-        run_unit_tests.step.dependOn(b.getInstallStep());
+        // Point PATH at the STAGED tree (lib/llama/bin) -- the source of the
+        // set `installLlamaDlls` copies. Deliberately NOT the install dir plus a
+        // dependency on the install step: that made `zig build test` reinstall
+        // mlx-serve.exe, so the whole suite failed AccessDenied whenever a
+        // server was running out of zig-out/bin -- i.e. exactly while someone
+        // was testing against one. The staged tree is what fetch-llama.sh
+        // populates and the tests need nothing else from the install.
         // `getEnvMap` returns the RunStep's inherited environment, so this
         // PREPENDS rather than replacing PATH -- clobbering it would break any
         // tool the tests shell out to.
@@ -215,7 +218,31 @@ pub fn build(b: *std.Build) void {
             "PATH",
             // Relative on purpose: a RunStep's cwd is the build root, and
             // Windows resolves relative PATH entries against it.
-            b.fmt("zig-out\\bin;lib\\llama\\bin;{s}", .{prev}),
+            b.fmt("lib\\llama\\bin;{s}", .{prev}),
+        );
+    }
+
+    // ggml dlopens its compute backends BY FILENAME out of the running
+    // executable's directory, which for a test binary is .zig-cache/o/<hash>/
+    // -- empty. Without this every model-gated llama test dies `no backends are
+    // loaded` even with the libraries reachable: loading a shared object and
+    // registering a backend are two different things.
+    //
+    // NOT Windows-only, which is where this first bit: the staged tree's own
+    // directory NAME differs per host (the Windows release ships DLLs under
+    // bin/, a CMake build puts shared objects under lib/), so gating the whole
+    // thing on Windows left Linux with no backend dir at all -- and an ELF
+    // rpath, which does get the libraries LOADED, hides it right up until the
+    // first model-gated test. macOS needs nothing: the XCFramework has its
+    // backends compiled in, and the shim's call is fenced `#ifndef __APPLE__`.
+    //
+    // Relative for the same reason as PATH above: a RunStep's cwd is the build
+    // root, and the shim hands this straight to
+    // ggml_backend_load_all_from_path, which resolves against that cwd.
+    if (target.result.os.tag != .macos) {
+        run_unit_tests.setEnvironmentVariable(
+            "MLX_LLAMA_BACKEND_DIR",
+            if (target.result.os.tag == .windows) "lib/llama/bin" else "lib/llama/lib",
         );
     }
     if (qwen_preprocess_fixture) |fixture| {
@@ -546,6 +573,12 @@ fn addLlamaLib(b: *std.Build, module: *std.Build.Module, os_tag: std.Target.Os.T
             // this has no macOS counterpart). `--version` reports
             // ggml_version()/ggml_commit(), which live in ggml-base.
             module.linkSystemLibrary("ggml-base", .{ .use_pkg_config = .no });
+            // The backend REGISTRY (ggml_backend_load_all*) lives in ggml.dll,
+            // not ggml-base.dll. The shim calls it explicitly at init rather
+            // than relying on the registry's own auto-load, which searches the
+            // running executable's directory -- correct for the installed
+            // server, empty for a `zig build test` binary under .zig-cache.
+            module.linkSystemLibrary("ggml", .{ .use_pkg_config = .no });
         },
         .macos => {
             module.addLibraryPath(b.path("lib/llama/lib"));
@@ -578,6 +611,12 @@ fn addLlamaLib(b: *std.Build, module: *std.Build.Module, os_tag: std.Target.Os.T
         else => {
             module.addLibraryPath(b.path("lib/llama/lib"));
             module.linkSystemLibrary("llama", .{ .use_pkg_config = .no });
+            // Same split as Windows: a CMake-built llama.cpp keeps ggml in its
+            // own shared objects, and the shim's explicit backend registration
+            // (ggml_backend_load_all*) lives in libggml. `--version` reads
+            // ggml_version()/ggml_commit() out of libggml-base.
+            module.linkSystemLibrary("ggml", .{ .use_pkg_config = .no });
+            module.linkSystemLibrary("ggml-base", .{ .use_pkg_config = .no });
             // ELF equivalent of @loader_path. Same two-depth reasoning as macOS.
             module.addRPath(.{ .cwd_relative = "$ORIGIN/../../lib/llama/lib" });
             module.addRPath(.{ .cwd_relative = "$ORIGIN/../../../lib/llama/lib" });

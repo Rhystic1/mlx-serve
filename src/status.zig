@@ -12,9 +12,13 @@ const is_macos = builtin.os.tag == .macos;
 /// report zero — it would make every load decision on wrong numbers.
 const impl = switch (builtin.os.tag) {
     .windows => @import("status_windows.zig"),
+    .linux => @import("status_linux.zig"),
     else => @This(),
 };
-const delegate = builtin.os.tag == .windows;
+/// Derived from `impl`, never re-spelled as a host list: the two must agree or
+/// a newly delegated host silently runs the Mach bodies and links against
+/// symbols it does not have.
+const delegate = impl != @This();
 
 // ── macOS Mach externs ──
 

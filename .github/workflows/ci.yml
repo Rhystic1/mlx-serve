@@ -94,3 +94,85 @@ jobs:
       - name: Run Swift tests
         working-directory: app
         run: swift test
+
+  # The portable (GGUF-only) configuration: no MLX, no Xcode, no brew. llama.cpp
+  # + CUDA is the whole inference floor off Apple silicon, so this job proves
+  # the -Dgguf-only build and its test root (src/tests.zig) stay green.
+  #
+  # No GPU on the runner and no model in the repo, so this is a build + hermetic
+  # test gate: the model-gated llama tests skip without LLAMA_TEST_MODEL, and
+  # the shell integration suite is not run here (it needs models).
+  build-test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        # The scripts are bash and the suite assumes a POSIX shell; Git Bash
+        # ships on the runner. `-eo pipefail` so a failing step actually fails.
+        shell: bash -eo pipefail {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig (pinned nightly)
+        run: |
+          bash scripts/fetch-zig.sh
+          echo "$GITHUB_WORKSPACE/.zig-toolchain" >> "$GITHUB_PATH"
+
+      - name: Fetch libllama (llama.cpp GGUF engine, CUDA build)
+        run: bash scripts/fetch-llama.sh
+
+      - name: Build mlx-serve (Zig, ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Smoke test mlx-serve binary
+        run: |
+          ./zig-out/bin/mlx-serve --version
+          ./zig-out/bin/mlx-serve --help > /dev/null
+
+      - name: Run Zig tests
+        run: zig build test --summary all
+
+      # Hermetic guard for the tests/ host shims themselves — the layer that
+      # lets the rest of the shell suite run unmodified here.
+      - name: Run host-portability guard
+        run: bash tests/test_portable_env.sh
+
+  build-test-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig (pinned nightly)
+        run: |
+          bash scripts/fetch-zig.sh
+          echo "$GITHUB_WORKSPACE/.zig-toolchain" >> "$GITHUB_PATH"
+
+      # Upstream publishes no prebuilt Linux CUDA asset, so Linux builds
+      # llama.cpp from source. CPU-ONLY here on purpose: a GitHub runner has no
+      # NVIDIA GPU and no CUDA toolkit, and installing one would put a ~4 GB
+      # download in front of every push to compile kernels nothing on the runner
+      # can execute. LLAMA_CPU_ONLY stamps "<tag>-cpu" rather than the plain
+      # tag, so this stage can never be mistaken for the CUDA one a developer
+      # builds -- `--version` prints the stamp.
+      #
+      # What this job proves is the part that actually breaks: the Zig-side
+      # Linux link (libllama + libggml + libggml-base), the ELF rpath, the
+      # backend registration, and the portable half of the test suite. The CUDA
+      # compile is NOT covered here and still needs a real box.
+      - name: Build libllama (CPU-only, from source)
+        run: LLAMA_CPU_ONLY=1 bash scripts/build-llama-cuda.sh
+
+      - name: Build mlx-serve (Zig, ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Smoke test mlx-serve binary
+        run: |
+          ./zig-out/bin/mlx-serve --version
+          ./zig-out/bin/mlx-serve --help > /dev/null
+
+      - name: Run Zig tests
+        run: zig build test --summary all
+
+      - name: Run host-portability guard
+        run: bash tests/test_portable_env.sh

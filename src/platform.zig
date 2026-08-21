@@ -162,8 +162,10 @@ pub const Handle = std.posix.fd_t;
 var winsock_started: std.atomic.Value(bool) = .init(false);
 
 /// Idempotent WSAStartup. Winsock refcounts it, and the flag only avoids the
-/// repeat call cost.
-fn ensureWinsock() void {
+/// repeat call cost. Public because `lan_net.zig` opens sockets of its own and
+/// must not depend on something else here having run first (§6.2: WSAPoll
+/// answers WSANOTINITIALISED until this has run in the process).
+pub fn ensureWinsock() void {
     if (builtin.os.tag != .windows) return;
     if (winsock_started.swap(true, .monotonic)) return;
     var wsa: [400]u8 = undefined;
@@ -298,6 +300,20 @@ pub fn peerClosed(handle: Handle) bool {
 /// Writes into `buf` and returns the slice, because the Windows fallback has to
 /// concatenate two variables.
 pub fn homeDir(buf: []u8) ?[]const u8 {
+    // An explicitly set HOME wins on every host. On POSIX that is simply the
+    // convention; on Windows it is what makes the suite's isolation idiom
+    // (`HOME=$(mktemp -d) mlx-serve ...`) mean anything -- without it a faked
+    // home is ignored and the run silently reads and writes the real
+    // ~/.mlx-serve. Git Bash sets HOME to the same directory USERPROFILE names,
+    // so a normal Windows launch resolves identically either way, and a native
+    // process that sets no HOME falls through to the Windows variables below.
+    if (std.c.getenv("HOME")) |h| {
+        const s = std.mem.span(h);
+        if (s.len > 0 and s.len <= buf.len) {
+            @memcpy(buf[0..s.len], s);
+            return buf[0..s.len];
+        }
+    }
     if (builtin.os.tag == .windows) {
         if (std.c.getenv("USERPROFILE")) |p| {
             const s = std.mem.span(p);
@@ -315,11 +331,49 @@ pub fn homeDir(buf: []u8) ?[]const u8 {
         @memcpy(buf[d.len..][0..p.len], p);
         return buf[0 .. d.len + p.len];
     }
-    const h = std.c.getenv("HOME") orelse return null;
-    const s = std.mem.span(h);
-    if (s.len == 0 or s.len > buf.len) return null;
-    @memcpy(buf[0..s.len], s);
-    return buf[0..s.len];
+    // POSIX: HOME is the only source, and it was already tried above. Reaching
+    // here means it was unset, empty, or longer than `buf`.
+    return null;
+}
+
+test "homeDir honours an explicitly set HOME on every host" {
+    // The POSIX branch always read HOME; the Windows one read USERPROFILE (then
+    // HOMEDRIVE+HOMEPATH) and nothing else. That made the suite's standard
+    // isolation idiom -- `HOME=$(mktemp -d) ./zig-out/bin/mlx-serve ...` -- a
+    // silent no-op here: six test scripts fake a home that way, and on Windows
+    // every one of them was exercising the DEVELOPER'S real ~/.mlx-serve
+    // instead, both reading its contents and being able to write into it. A
+    // fixture that does not take effect does not fail; it passes vacuously
+    // (test_run_quiet, 2026-08-20).
+    //
+    // Explicit HOME wins on every host now. Git Bash sets HOME to the same
+    // place USERPROFILE points at, so an ordinary Windows run is unchanged,
+    // and a native process that sets no HOME still falls through to the
+    // Windows variables below.
+    var buf: [1024]u8 = undefined;
+    const original = homeDir(&buf);
+    var original_copy: [1024]u8 = undefined;
+    var original_len: usize = 0;
+    if (original) |o| {
+        @memcpy(original_copy[0..o.len], o);
+        original_len = o.len;
+    }
+
+    setEnv("HOME", "/tmp/mlx-serve-home-probe", true);
+    defer {
+        if (original_len > 0 and builtin.os.tag != .windows) {
+            var restore: [1025]u8 = undefined;
+            @memcpy(restore[0..original_len], original_copy[0..original_len]);
+            restore[original_len] = 0;
+            setEnv("HOME", restore[0..original_len :0], true);
+        } else if (builtin.os.tag == .windows) {
+            unsetEnv("HOME");
+        }
+    }
+
+    var buf2: [1024]u8 = undefined;
+    const got = homeDir(&buf2) orelse return error.NoHomeDirectory;
+    try std.testing.expectEqualStrings("/tmp/mlx-serve-home-probe", got);
 }
 
 test "homeDir reports a non-empty path on this host" {
@@ -331,10 +385,50 @@ test "homeDir reports a non-empty path on this host" {
     try testing.expect(home.len > 0);
 }
 
+// ── Randomness ─────────────────────────────────────────────────────────────
+
+/// Cryptographically-strong bytes, without an `Io` handle.
+///
+/// `std.crypto.random` does not exist in this Zig, and `std.c.arc4random_buf`
+/// is defined for Darwin and glibc>=2.36 only — nothing on Windows. The LAN
+/// identity token depends on this being unguessable: it is what lets a browser
+/// recognize and skip its OWN advertisement, so a predictable one is a peer
+/// that can be impersonated into a proxy loop.
+pub fn randomBytes(buf: []u8) void {
+    if (builtin.os.tag == .windows) {
+        // RtlGenRandom, exported under its undecorated ordinal name. Present
+        // on every supported Windows and the documented way to do this
+        // without dragging in the CNG headers.
+        _ = SystemFunction036(buf.ptr, @intCast(buf.len));
+        return;
+    }
+    std.c.arc4random_buf(buf.ptr, buf.len);
+}
+
+extern "advapi32" fn SystemFunction036(buf: [*]u8, len: u32) callconv(.winapi) u8;
+
+test "randomBytes fills the buffer and does not repeat itself" {
+    var a: [32]u8 = @splat(0);
+    var b: [32]u8 = @splat(0);
+    randomBytes(&a);
+    randomBytes(&b);
+    // An all-zero return is what a stubbed-out source looks like, and it is
+    // the failure mode that matters: every instance would share a token.
+    try testing.expect(!std.mem.allEqual(u8, &a, 0));
+    try testing.expect(!std.mem.eql(u8, &a, &b));
+}
+
 // ── Environment ────────────────────────────────────────────────────────────
 
 extern "c" fn _putenv_s(name: [*:0]const u8, value: [*:0]const u8) c_int;
-extern "c" fn posixSetenvShim(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+// setenv/unsetenv are declared here rather than reached through the std C
+// bindings: this nightly carries neither on any target (the only "*setenv" in
+// std/c.zig is OpenBSD's auth_setenv), so the POSIX arm below did not compile
+// at all off Windows -- and nothing caught it, because Windows takes the other
+// arm and macOS had not been built since. They are plain libc everywhere we
+// build, and a direct extern also stops this moving under us again (§6.7).
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 /// Set an environment variable for THIS process.
 ///
@@ -347,7 +441,7 @@ pub fn setEnv(name: [*:0]const u8, value: [*:0]const u8, overwrite: bool) void {
         if (!overwrite and std.c.getenv(name) != null) return;
         _ = _putenv_s(name, value);
     } else {
-        _ = std.c.setenv(name, value, @intFromBool(overwrite));
+        _ = setenv(name, value, @intFromBool(overwrite));
     }
 }
 
@@ -357,7 +451,7 @@ pub fn unsetEnv(name: [*:0]const u8) void {
     if (builtin.os.tag == .windows) {
         _ = _putenv_s(name, "");
     } else {
-        _ = std.c.unsetenv(name);
+        _ = unsetenv(name);
     }
 }
 
@@ -486,5 +580,101 @@ test "tmpDirPath uses the native separator and is absolute" {
     try testing.expect(std.fs.path.isAbsolute(p));
     if (builtin.os.tag == .windows) {
         try testing.expect(std.mem.indexOfScalar(u8, p, '/') == null);
+    }
+}
+
+// ── Absolute-path recognition ──────────────────────────────────────────────
+
+/// Does `p` look like an ABSOLUTE path on this host?
+///
+/// Exists because `std.mem.startsWith(u8, p, "/")` is a POSIX-only spelling
+/// that reads as host-neutral. Two dispatch guards in server.zig used it to
+/// decide whether a `model` field naming a directory should go through
+/// register-by-path, so on Windows -- where an absolute path is `C:/...`, not
+/// `/...` -- that whole feature was unreachable and every load-by-path answered
+/// "Unknown model id" (found 2026-08-20 via tests/test_model_rescan.sh).
+///
+/// Deliberately a LOOKS-like test, not a validity test: the only job is to
+/// separate "this is a path" from "this is a model id" (`org/name`,
+/// `name:tag`, `id#file.gguf`). Whether the path exists or is loadable is
+/// `registerByPath`'s answer, and it already speaks both forms.
+pub fn looksAbsolutePath(p: []const u8) bool {
+    if (p.len == 0) return false;
+    // A leading slash is absolute on every host, and Windows accepts it as
+    // root-of-current-drive -- so it stays a path there too rather than being
+    // mistaken for an id.
+    if (p[0] == '/') return true;
+    if (builtin.os.tag != .windows) return false;
+    if (p[0] == '\\') return true; // UNC, or root-relative backslash
+    // Drive-qualified: X:\... or X:/...  A bare "C:" (drive-relative) is not
+    // something a client can mean as a model directory, so it does not count.
+    if (p.len >= 3 and p[1] == ':' and std.ascii.isAlphabetic(p[0]) and
+        (p[2] == '/' or p[2] == '\\')) return true;
+    return false;
+}
+
+test "looksAbsolutePath: ids are never paths, POSIX roots always are" {
+    // Model ids must NOT be mistaken for paths on any host -- these are the
+    // real id shapes (discovery org/name, Ollama name:tag, GGUF id#file).
+    try std.testing.expect(!looksAbsolutePath("org/name"));
+    try std.testing.expect(!looksAbsolutePath("qwen3:latest"));
+    try std.testing.expect(!looksAbsolutePath("org/name#model.gguf"));
+    try std.testing.expect(!looksAbsolutePath("mlx-serve"));
+    try std.testing.expect(!looksAbsolutePath(""));
+    // A POSIX absolute path is a path everywhere, including Windows.
+    try std.testing.expect(looksAbsolutePath("/Users/x/models/foo"));
+    try std.testing.expect(looksAbsolutePath("/"));
+}
+
+test "looksAbsolutePath: Windows drive and UNC forms, only on Windows" {
+    const win = builtin.os.tag == .windows;
+    // Both slash directions -- Git Bash hands over C:/..., the shell and the
+    // Windows API both produce C:\...
+    try std.testing.expectEqual(win, looksAbsolutePath("C:/Users/x/models/foo"));
+    try std.testing.expectEqual(win, looksAbsolutePath("C:" ++ [_]u8{'\\'} ++ "Users"));
+    try std.testing.expectEqual(win, looksAbsolutePath("z:/lower/drive/letter"));
+    // UNC share.
+    try std.testing.expectEqual(win, looksAbsolutePath([_]u8{ '\\', '\\' } ++ "server/share/model"));
+    // A drive letter with NO separator is drive-RELATIVE; nobody names a model
+    // directory that way, and treating it as a path would swallow the id.
+    try std.testing.expect(!looksAbsolutePath("C:"));
+}
+
+/// Strip trailing path separators from `p`, leaving a root ("/" or "C:/")
+/// alone. Windows accepts BOTH separators, so a hand-rolled `while (p[last] ==
+/// '/')` silently keeps a trailing backslash and hands `basename` an empty
+/// string.
+pub fn trimTrailingSeps(p: []const u8) []const u8 {
+    var t = p;
+    while (t.len > 1 and isSep(t[t.len - 1])) {
+        // Do not eat the separator that IS the root: "/" stays "/", and
+        // "C:/" stays "C:/" rather than collapsing to a drive-relative "C:".
+        if (t.len == 3 and t[1] == ':' and builtin.os.tag == .windows) break;
+        t = t[0 .. t.len - 1];
+    }
+    return t;
+}
+
+fn isSep(c: u8) bool {
+    if (c == '/') return true;
+    return builtin.os.tag == .windows and c == '\\';
+}
+
+test "trimTrailingSeps: both separators, roots preserved" {
+    try std.testing.expectEqualStrings("/a/b", trimTrailingSeps("/a/b/"));
+    try std.testing.expectEqualStrings("/a/b", trimTrailingSeps("/a/b///"));
+    try std.testing.expectEqualStrings("/a/b", trimTrailingSeps("/a/b"));
+    // A lone root must survive -- trimming it to "" makes basename fail with
+    // InvalidModelPath on a path that was merely odd.
+    try std.testing.expectEqualStrings("/", trimTrailingSeps("/"));
+    try std.testing.expectEqualStrings("", trimTrailingSeps(""));
+    if (builtin.os.tag == .windows) {
+        try std.testing.expectEqualStrings("C:/a", trimTrailingSeps("C:/a" ++ [_]u8{'\\'}));
+        try std.testing.expectEqualStrings("C:/a", trimTrailingSeps("C:/a/"));
+        try std.testing.expectEqualStrings("C:/", trimTrailingSeps("C:/"));
+    } else {
+        // Off Windows a backslash is an ordinary filename byte and must NOT
+        // be eaten -- doing so would rename the directory being asked for.
+        try std.testing.expectEqualStrings("/a/b" ++ [_]u8{'\\'}, trimTrailingSeps("/a/b" ++ [_]u8{'\\'}));
     }
 }
