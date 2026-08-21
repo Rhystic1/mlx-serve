@@ -1,8 +1,10 @@
 # Windows / Linux port — state and remaining work
 
-Branch: `testing/windows_linux`. Two commits on top of `main`:
+Branch: `testing/windows_linux`. Four commits on top of `main`:
 
 ```
+45cf570  fix: GGUF inference on Windows -- zero-layer KV shell, host-aware model ids
+99ff538  docs: windows-plan.md
 9f5566f  feat: GGUF-only Windows build (llama.cpp + CUDA), MLX gated out
 f947fb5  build: cross-platform toolchain fetch (Windows/Linux hosts)
 ```
@@ -55,9 +57,18 @@ CUDA is live end to end — a test binary linked against the staged `llama.dll`
 reported `ggml_cuda_init: found 1 CUDA devices … RTX 5060 Ti, compute
 capability 12.0`. The prebuilt binary covers sm_120 (Blackwell).
 
-**Not verified: nothing has ever generated a token on this build.** No GGUF
-model has been loaded. That is task 3.1 and it is the highest-value next step —
-everything above is plumbing that proves the process starts, not that it infers.
+**Inference works.** Verified against `Qwen3.8-27B-UD-IQ3_XXS` (11.9 GB IQ3_XXS)
+on an RTX 5060 Ti:
+
+- non-streaming completion returns the right text, with sane usage + timings
+- SSE streaming emits the correct chunk lifecycle
+- tool calling returns a well-formed `tool_call`, valid JSON arguments,
+  `finish_reason: "tool_calls"`
+
+Two bugs stood between "model loaded" and "token produced", both found by
+serving a real model and reading the response rather than the code — see §6.8.
+Expect more of the same shape: things that compile and load but have never
+executed on this host.
 
 ---
 
@@ -144,6 +155,13 @@ added, each with its reason stated in code:
 | 7 × `prefillMemoryNeeded` / `resolvePrefillChunk` | MLX billing math; the terms come from `transformer.zig` + `ane.zig` | No — behaviour is absent, not untested |
 | 1 × `aneGateHeadroom` | ANE is Apple hardware | No |
 | 1 × `lanShareDenial` | needs a Lan that can share; stub never does | Only if Avahi lands |
+
+Known cosmetic wart, **pre-existing and not a port regression**:
+`/v1/models` reports `"quantization":"0-bit"` for GGUF models. `quant_bits` is
+an affine-safetensors concept that is never set on the GGUF path (and
+`gguf_meta.zig` does not parse the ggml file type at all), so macOS reports the
+same. Fixing it means plumbing the GGML type through and changes macOS-visible
+API output — worth doing deliberately, not as a drive-by.
 
 The security-relevant half (`routeClass` × `SharedSet`) still runs everywhere —
 that was the point of splitting `lan.zig`.
@@ -309,6 +327,23 @@ towers into the link).
 If you see undefined `mlx_*` symbols in a build that compiled fine, this is why.
 `zig build test 2>&1 | grep "test_zcu.obj:"` names the emitting function, which
 is how to find the culprit.
+
+### 6.8 Compiles + loads is not runs
+
+Both bugs that blocked the first token had this shape, and neither was visible
+by reading the diff:
+
+- `Slot.init` builds a KVCache for **every** slot and asks for **zero layers**
+  on an embedded-engine slot (ds4/llama own their KV). The stub refused instead
+  of returning the shell, so every GGUF request failed 500 `MlxUnavailable`
+  *after tokenizing successfully*. Zero layers allocate nothing — there is no
+  MLX to be missing. **When adding a stub, ask what the caller passes on the
+  GGUF path**, not just whether the feature exists.
+- Six sites hand-rolled basename with `'/'`. A Windows path has none, so the
+  whole path became the model id and `bytes_on_disk` came back null.
+
+The general lesson: a stub that refuses is right for a feature that is absent,
+and wrong for a shared code path that merely *degenerates* on this backend.
 
 ### 6.7 This Zig nightly
 
