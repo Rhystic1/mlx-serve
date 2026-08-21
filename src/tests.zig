@@ -25,6 +25,7 @@ test {
     _ = @import("log.zig");
     _ = @import("version.zig");
     _ = @import("platform.zig");
+    _ = if (build_cfg.mlx_enabled) struct {} else @import("transformer_stub.zig");
     _ = @import("chat.zig");
     _ = @import("format_corpus_test.zig");
     _ = @import("tool_traffic_replay_test.zig");

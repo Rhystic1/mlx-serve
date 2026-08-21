@@ -128,16 +128,25 @@ pub const KVCache = struct {
 
     /// Real signature is fallible (see the "fallible re-init behind a deinit"
     /// rule in CLAUDE.md -- it builds first, then swaps). Kept fallible so the
-    /// call sites' `try` stays meaningful.
-    pub fn reinit(_: *KVCache, _: anytype, _: anytype, _: anytype) anyerror!void {
-        return Error.MlxUnavailable;
+    /// call sites' `try` stays meaningful. Same zero-layer reasoning as
+    /// `initWithConfigAndHeadDim`.
+    pub fn reinit(self: *KVCache, layers: anytype, _: anytype, _: anytype) anyerror!void {
+        if (@as(usize, @intCast(layers)) != 0) return Error.MlxUnavailable;
+        self.* = .{};
     }
 
-    /// The scheduler sizes a slot's cache from the arch's own K/V widths. An
-    /// embedded-engine slot asks for zero layers (`is_embedded`), so this is
-    /// only ever the zero-layer case here.
-    pub fn initWithConfigAndHeadDim(_: std.mem.Allocator, _: anytype, _: anytype, _: anytype) anyerror!KVCache {
-        return Error.MlxUnavailable;
+    /// The scheduler sizes a slot's cache from the arch's own K/V widths, and
+    /// builds one for EVERY slot -- an embedded-engine slot (ds4 / llama.cpp)
+    /// asks for zero layers because the engine owns its own KV.
+    ///
+    /// So this SUCCEEDS: a zero-layer cache is a shell that allocates nothing,
+    /// and there is no MLX for it to be missing. Refusing here made every GGUF
+    /// chat request fail with `MlxUnavailable` after tokenizing fine, which is
+    /// the one path this build exists to serve. A non-zero request cannot
+    /// happen: no MLX model can load here.
+    pub fn initWithConfigAndHeadDim(_: std.mem.Allocator, layers: anytype, _: anytype, _: anytype) anyerror!KVCache {
+        if (@as(usize, @intCast(layers)) != 0) return Error.MlxUnavailable;
+        return .{};
     }
 };
 /// The REAL config type, from src/kv_quant_config.zig — it is a plain settings
@@ -212,4 +221,20 @@ pub fn verifyQmmNaxAvailable() bool {
 /// about which accelerator is doing the work.
 pub fn naxStatus() []const u8 {
     return "unavailable (built without MLX)";
+}
+
+const testing = std.testing;
+
+test "KVCache init returns a zero-layer SHELL, it does not refuse" {
+    // Regression: `Slot.init` builds a cache for EVERY slot, and for an
+    // embedded-engine slot (ds4 / llama.cpp) it asks for zero layers because
+    // the engine owns its own KV. Refusing here made every GGUF chat request
+    // fail with `MlxUnavailable` AFTER tokenizing successfully -- the one path
+    // this whole build exists to serve.
+    //
+    // Zero layers allocate nothing, so there is no MLX to be unavailable. A
+    // non-zero request cannot occur: no MLX model can load in this build.
+    var cache = try KVCache.initWithConfigAndHeadDim(testing.allocator, 0, KVQuantConfig.dense, 128);
+    defer cache.deinit();
+    try testing.expectEqual(@as(usize, 0), cache.step);
 }

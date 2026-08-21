@@ -1933,3 +1933,64 @@ test "probeModelDir refuses an incomplete media pack by name" {
 
     try testing.expectError(error.IncompleteMediaPack, probeModelDir(io, allocator, dir));
 }
+
+/// The registry id for a model given by PATH (`--model <abs path>`, or
+/// `/v1/load-model`): the basename, with a `.gguf` suffix stripped.
+///
+/// Uses `std.fs.path.basename`, which is host-aware, rather than scanning for
+/// '/'. Three copies of this in main.zig hand-rolled the scan and so produced
+/// the ENTIRE PATH as the id on Windows, where a path contains no '/' at all --
+/// name, which no client can send back in a request body.
+///
+/// Note this is a PATH question, not an ID question. Model ids are `org/name`
+/// and always use '/' regardless of host; `lan_policy.SharedSet` and
+/// `ollama.zig` split ids on '/' ON PURPOSE and must not be "fixed" to use the
+/// host separator.
+pub fn modelIdFromPath(path: []const u8) []const u8 {
+    const base = std.fs.path.basename(path);
+    if (base.len == 0) return path;
+    if (std.mem.endsWith(u8, base, ".gguf")) return base[0 .. base.len - ".gguf".len];
+    return base;
+}
+
+test "modelIdFromPath: the id is the basename, on every host's separator" {
+    // A `--model <abs path>` launch registers under a basename-derived id. The
+    // derivation was hand-rolled with '/' only, so on Windows nothing split and
+    // the WHOLE PATH became the id -- `/v1/models` advertised
+    // "C:\Users\...\Qwen3.8-27B-UD-IQ3_XXS.gguf" as the model name, which no
+    // client can sensibly send back in a request body.
+    try std.testing.expectEqualStrings("model", modelIdFromPath("/models/org/model"));
+    try std.testing.expectEqualStrings("model", modelIdFromPath("/models/org/model/"));
+    try std.testing.expectEqualStrings("model", modelIdFromPath("model"));
+
+    // `.gguf` is stripped: the id names the MODEL, not the file on disk.
+    try std.testing.expectEqualStrings("Qwen3.8-27B-UD-IQ3_XXS", modelIdFromPath("/m/Qwen3.8-27B-UD-IQ3_XXS.gguf"));
+
+    if (builtin.os.tag == .windows) {
+        try std.testing.expectEqualStrings(
+            "Qwen3.8-27B-UD-IQ3_XXS",
+            modelIdFromPath("C:\\Users\\me\\models\\unsloth\\Qwen3.8-27B-GGUF\\Qwen3.8-27B-UD-IQ3_XXS.gguf"),
+        );
+        try std.testing.expectEqualStrings("model", modelIdFromPath("C:\\models\\org\\model\\"));
+        // Mixed separators are normal on Windows (our own defaultLogPath emits
+        // forward slashes), so both must split.
+        try std.testing.expectEqualStrings("model", modelIdFromPath("C:\\models/org\\model"));
+    }
+}
+
+test "no hand-rolled path basename survives in main.zig" {
+    // CLASS GUARD. The bug this pins was six copies of `lastIndexOfScalar(u8,
+    // <path>, '/')` in main.zig: on Windows a path contains no '/', so nothing
+    // split and `/v1/models` advertised a full `C:\...` path as the model id
+    // (and reported bytes_on_disk: null). std.fs.path.basename/dirname are
+    // host-aware; a '/' scan is only ever correct for a model ID.
+    //
+    // Scoped to main.zig because model IDs are `org/name` and DO split on '/'
+    // on every host -- lan_policy.SharedSet and ollama.zig scan ids on purpose
+    // and must not be caught by this.
+    const src = @embedFile("main.zig");
+    const needle = "lastIndexOfScalar(u8, " ++ "p, '/')";
+    try std.testing.expect(std.mem.indexOf(u8, src, needle) == null);
+    const needle2 = "lastIndexOfScalar(u8, " ++ "gguf_path_owned, '/')";
+    try std.testing.expect(std.mem.indexOf(u8, src, needle2) == null);
+}

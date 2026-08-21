@@ -1180,13 +1180,12 @@ pub fn main(init: std.process.Init) !void {
         //    takes ownership of `discovery_storage` (if any) and, once
         //    the inference thread completes loading, ownership of
         //    config/tok/chat_config too.
-        const model_id = blk: {
-            var p = model_dir;
-            while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
-            if (p.len == 0) break :blk config.model_type;
-            if (std.mem.lastIndexOfScalar(u8, p, '/')) |slash_idx| break :blk p[slash_idx + 1 ..];
-            break :blk p;
-        };
+        // Host-aware basename (see model_discovery.modelIdFromPath): a
+        // hand-rolled '/' scan yields the WHOLE PATH as the id on Windows.
+        const model_id = if (model_dir.len == 0)
+            config.model_type
+        else
+            model_discovery.modelIdFromPath(model_dir);
 
         const discovery_for_registry = discovery_storage;
         discovery_storage = null; // ownership moves to the registry
@@ -1607,12 +1606,9 @@ fn autoResidentMemBytes(explicit: bool, val: u64) u64 {
     return @as(u64, max_rec) * 4 / 5;
 }
 
+/// Host-aware; see model_discovery.modelIdFromPath for why a '/' scan is wrong.
 fn dirBasename(path: []const u8) []const u8 {
-    var p = path;
-    while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
-    if (p.len == 0) return p;
-    if (std.mem.lastIndexOfScalar(u8, p, '/')) |i| return p[i + 1 ..];
-    return p;
+    return std.fs.path.basename(path);
 }
 
 /// Native media-generation serve mode (image / audio / video) with the media
@@ -1952,15 +1948,7 @@ fn runDs4Serve(
     };
 
     // ── Registry + scheduler scaffolding. Mirror the MLX serve branch. ──
-    const model_id = blk: {
-        var p = gguf_path_owned;
-        while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
-        if (std.mem.lastIndexOfScalar(u8, p, '/')) |slash_idx| {
-            const name = p[slash_idx + 1 ..];
-            break :blk if (std.mem.endsWith(u8, name, ".gguf")) name[0 .. name.len - 5] else name;
-        }
-        break :blk p;
-    };
+    const model_id = model_discovery.modelIdFromPath(gguf_path_owned);
 
     const effective_max_resident_mem: u64 = if (max_resident_mem_explicit) max_resident_mem else 0;
     if (effective_max_resident_mem > 0) {
@@ -1988,9 +1976,11 @@ fn runDs4Serve(
     // Path is absolute; split into parent dir + basename so we can use the
     // 0.16-era `Dir.statFile` API.
     const gguf_bytes: ?u64 = blk: {
-        const slash = std.mem.lastIndexOfScalar(u8, gguf_path_owned, '/') orelse break :blk null;
-        const parent = gguf_path_owned[0..slash];
-        const name = gguf_path_owned[slash + 1 ..];
+        // std.fs.path.dirname/basename, not a '/' scan: on Windows the latter
+        // found no separator, so this reported `bytes_on_disk: null` for every
+        // GGUF.
+        const parent = std.fs.path.dirname(gguf_path_owned) orelse break :blk null;
+        const name = std.fs.path.basename(gguf_path_owned);
         var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch break :blk null;
         defer dir.close(io);
         const st = dir.statFile(io, name, .{}) catch break :blk null;
@@ -2227,15 +2217,7 @@ fn runLlamaServe(
         .allocator = allocator,
     };
 
-    const model_id = blk: {
-        var p = gguf_path_owned;
-        while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
-        if (std.mem.lastIndexOfScalar(u8, p, '/')) |slash_idx| {
-            const name = p[slash_idx + 1 ..];
-            break :blk if (std.mem.endsWith(u8, name, ".gguf")) name[0 .. name.len - 5] else name;
-        }
-        break :blk p;
-    };
+    const model_id = model_discovery.modelIdFromPath(gguf_path_owned);
 
     const effective_max_resident_mem: u64 = if (max_resident_mem_explicit) max_resident_mem else 0;
     if (effective_max_resident_mem > 0) {
@@ -2258,9 +2240,11 @@ fn runLlamaServe(
     defer registry.deinit();
 
     const gguf_bytes: ?u64 = blk: {
-        const slash = std.mem.lastIndexOfScalar(u8, gguf_path_owned, '/') orelse break :blk null;
-        const parent = gguf_path_owned[0..slash];
-        const name = gguf_path_owned[slash + 1 ..];
+        // std.fs.path.dirname/basename, not a '/' scan: on Windows the latter
+        // found no separator, so this reported `bytes_on_disk: null` for every
+        // GGUF.
+        const parent = std.fs.path.dirname(gguf_path_owned) orelse break :blk null;
+        const name = std.fs.path.basename(gguf_path_owned);
         var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch break :blk null;
         defer dir.close(io);
         const st = dir.statFile(io, name, .{}) catch break :blk null;
