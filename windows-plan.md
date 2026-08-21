@@ -35,7 +35,7 @@ can build the portable configuration with `-Dgguf-only` to check it.
 
 ## 2. Verified working today
 
-`zig build` and `zig build test` both pass on Windows. **907 tests pass, 18
+`zig build` and `zig build test` both pass on Windows. **910 tests pass, 18
 skipped, 0 fail.**
 
 ```
@@ -74,26 +74,30 @@ executed on this host.
 
 ## 3. Remaining work, in priority order
 
-### 3.1 Actually serve a model  ← DO THIS FIRST
+### 3.1 Widen the surface that has actually run  <- DO THIS FIRST
 
-Nothing here has run inference. Until a GGUF model produces tokens, the port is
-unproven where it matters.
+chat/completions (streaming and not) and tool calling are proven. Everything
+else on the HTTP surface has never executed on Windows. In rough value order:
+
+- `/v1/messages` (Anthropic -- this is what Claude Code speaks)
+- `/api/chat`, `/api/generate`, `/api/tags` (Ollama)
+- `/v1/responses` (+ its WebSocket upgrade -- `ws.zig` is untested here)
+- `/v1/completions`, `continue_final_message`, JSON-schema / grammar mode
+- multi-turn with the prefix cache, concurrent requests, cancellation mid-stream
 
 ```bash
-.zig-toolchain/zig.exe build -Doptimize=ReleaseFast
-# put any small GGUF in %USERPROFILE%\.mlx-serve\models\<org>\<repo>\
-./zig-out/bin/mlx-serve.exe --serve --host 127.0.0.1 --port 8080
+./zig-out/bin/mlx-serve.exe --model <abs .gguf> --serve --host 127.0.0.1 --port 8080
 curl -s http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model":"<id>","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
 
-Then work outward: streaming, `/v1/messages` (Anthropic), `/api/chat` (Ollama),
-tool calling, `continue_final_message`. Expect problems in the **connection
-lifecycle** rather than in llama.cpp — see §6.2, the accept loop does not behave
-the way it does on POSIX.
+Expect trouble in the **connection lifecycle** rather than in llama.cpp -- see
+6.2, the accept loop does not behave the way it does on POSIX. Cancellation is
+the one to watch: it runs through `peerClosed`, which is rewritten on this host.
 
-Watch for: `n_gpu_layers` defaults to 999 (`arch/llama.zig` `OpenOptions`), so
-offload should be automatic; confirm it in the log rather than assuming.
+`n_gpu_layers` defaults to 999 (`arch/llama.zig` `OpenOptions`), so offload
+should be automatic -- confirm it in the log rather than assuming.
+
 
 ### 3.2 Run the shell integration suite
 
