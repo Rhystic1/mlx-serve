@@ -131,6 +131,10 @@ ports almost verbatim, only `LoadLibraryA` becomes `dlopen`).
 Do NOT quietly fall back to the cpu tarball. A build that reports CUDA support
 it does not have is worse than one that refuses.
 
+While here: Linux may also get LAN discovery nearly free via
+`avahi-compat-libdns_sd`, which exposes the identical `DNSService*` API our
+`lan_bonjour.zig` already calls. Unverified — see §3.5.
+
 ### 3.4 Claw back the three features the user asked for
 
 The shim (`lib/llama_shim/llama_shim.h`, 25 functions) exposes text generation
@@ -148,7 +152,78 @@ the staged set:
   what was lost with MTP/DFlash. Needs shim work plus scheduler wiring; do it
   last, and measure before claiming anything (`/bench` skill rules apply).
 
-### 3.5 Un-skip what deserves it
+### 3.5 LAN sharing / Bonjour discovery — port it, do not rewrite it
+
+`--lan-share` / `--lan-discover` are currently no-ops off Apple
+(`lan_transport_stub.zig`). **There is a working implementation to draw on:
+`../zig-ai`**, which is explicitly a proof of concept of mlx-serve on
+Windows/Linux and already did this job.
+
+Read `../zig-ai/bonjour.md` first — it is a port plan of OUR `lan.zig`, written
+against our line numbers, and it settles most of the design questions.
+
+What is there:
+
+| File | Lines | Tests | What it is |
+|---|---|---|---|
+| `src/server/mdns.zig` | 970 | 8 | Hand-rolled mDNS (RFC 6762) responder + browser, pure Zig, zero deps |
+| `src/server/rawsock.zig` | 641 | 6 | The socket layer under it |
+| `src/server/lan.zig` | 1446 | 18 | A direct port of our `lan.zig` |
+
+Its tests include a real two-responder local discovery test, and the module is
+wired into that server (`api.zig`, `auth.zig`) rather than sitting standalone.
+I have not seen it run across a real LAN, so treat "works" as "has tests and is
+integrated", not "field-proven".
+
+**The shape of our side is already right.** The `lan.zig` split done for this
+port left exactly a transport-shaped hole:
+
+```
+lan_policy.zig          portable, shared    <- ALREADY the interop spec
+lan_bonjour.zig         Apple dns_sd
+lan_transport_stub.zig  no-op               <- replace this
+```
+
+zig-ai copied our pure layer verbatim: same `SERVICE_TYPE = "_mlxserve._tcp"`,
+byte-identical `txtBuild`. So `lan_policy.zig` is already the shared spec and
+must not drift — **any change to the id form, TXT format or `X-MLX-*` headers
+breaks interop with zig-ai and with macOS mlx-serve.** Change it in both or
+neither.
+
+Two routes, and bonjour.md argues for doing them in this order:
+
+1. **Linux may be nearly free.** `avahi-compat-libdns_sd` exposes the *identical*
+   `DNSService*` C API, so `lan_bonjour.zig`'s FFI block may link unmodified
+   (`libdns_sd.so.1`, Debian `libavahi-compat-libdnssd1-dev`). bonjour.md flags
+   this as **UNVERIFIED** and says to prove it with a ~20-line program against
+   the seven entry points we use before planning around it. If it holds, Linux
+   costs an import gate; if not, Linux joins Windows on the hand-rolled module.
+2. **Windows needs the hand-rolled module.** Apple's `dnssd.dll` ships with
+   iTunes / Bonjour Print Services and cannot be assumed present.
+
+Long term one hand-rolled module on both platforms is likely better than two
+paths — and if it turns out clean, macOS could adopt it and drop its dns_sd FFI.
+
+Carry these across, they are already-paid-for knowledge:
+
+- **Windows joins the multicast group on only ONE interface for `INADDR_ANY`,
+  and on a box with Hyper-V / WSL / VPN adapters that is frequently the wrong
+  one** (mdns.zig's header). Join every up interface explicitly.
+- DNS name compression must be **parsed** (peers emit it) but need not be
+  **emitted**.
+- Keep the two-tier failure counters (`PEER_DROP_FAILS` 3 / `KNOWN_MAX_FAILS`
+  24). Our comment records a real production bug: one transient resolve hiccup
+  evicting a live peer, producing alternating success/404 on a peer that never
+  went down. A single counter reintroduces it.
+- **The gate lands WITH sharing, never after.** This opens an inference surface
+  to the network; `routeClass` x `SharedSet` is the whole defence and it already
+  runs on every host.
+
+Acceptance test is interop in both directions: this build discovering and using
+a macOS mlx-serve's model, and the Mac using ours.
+
+
+### 3.6 Un-skip what deserves it
 
 18 tests skip. Most are pre-existing env-gated live tests. The ones this port
 added, each with its reason stated in code:
@@ -170,23 +245,23 @@ API output — worth doing deliberately, not as a drive-by.
 The security-relevant half (`routeClass` × `SharedSet`) still runs everywhere —
 that was the point of splitting `lan.zig`.
 
-### 3.6 CI
+### 3.7 CI
 
 `.github/workflows/ci.yml` is `runs-on: macos-26` only. A
 `windows-latest` job would need: `scripts/fetch-zig.sh` (already works there),
 `scripts/fetch-llama.sh` (already works there), `zig build -Dgguf-only`,
 `zig build test`. No brew, no mlx build, no Xcode steps.
 
-### 3.7 Things deliberately left broken
+### 3.8 Things deliberately left broken
 
 Each is named at its call site; do not "fix" one by making it silently succeed.
 
 - **WebP input** — `lib/webp_stub/` returns NULL from `WebPDecodeRGB`, which the
   single call site already treats as "cannot decode". PNG/JPEG still work via
   stb. Lift by vendoring real libwebp.
-- **LAN sharing** — `--lan-share` / `--lan-discover` are no-ops. Linux could use
-  Avahi; Windows has no equivalent. The streaming proxy itself is portable, but
-  without discovery there is nothing to proxy to.
+- **LAN sharing** — `--lan-share` / `--lan-discover` are no-ops. This one has a
+  clear path and a reference implementation; see §3.5 rather than treating it as
+  permanent.
 - **Media generation, ds4, ANE, MTP/DFlash/PLD/drafter, MLX safetensors** — all
   refuse by name.
 
