@@ -50,6 +50,24 @@ pub extern fn mlx_llama_session_create_kv_quant(
 ) ?*Session;
 pub extern fn mlx_llama_session_free(s: ?*Session) void;
 
+// ── Embeddings ─────────────────────────────────────────────────────────────
+// An embedding context is created with `embeddings = true` and the model's own
+// pooling type, both of which are fixed at creation -- so it is a SEPARATE
+// session from any generation one, never a mode of it.
+pub extern fn mlx_llama_n_embd(e: *Engine) i32;
+pub extern fn mlx_llama_n_ctx_train(e: *Engine) i32;
+pub extern fn mlx_llama_is_encoder_only(e: *Engine) bool;
+pub extern fn mlx_llama_embed_session_create(e: *Engine, n_ctx: i32, err: ?[*]u8, errlen: usize) ?*Session;
+pub extern fn mlx_llama_session_embed(
+    s: *Session,
+    tokens: [*]const i32,
+    n_tokens: i32,
+    out: [*]f32,
+    out_cap: i32,
+    err: ?[*]u8,
+    errlen: usize,
+) i32;
+
 /// ggml_type values from lib/llama/include/ggml.h that we expose for KV
 /// quantization. F16 is the default (matches `mlx_llama_session_create`).
 pub const GgmlType = struct {

@@ -16,6 +16,7 @@ pub const Error = error{
     SessionCreateFailed,
     SessionSyncFailed,
     SessionEvalFailed,
+    EmbedFailed,
     TokenizeFailed,
     OutOfMemory,
 };
@@ -230,6 +231,53 @@ pub const LlamaEngine = struct {
         };
         return sess;
     }
+
+    /// Width of one embedding vector for this checkpoint.
+    pub fn nEmbd(self: *LlamaEngine) i32 {
+        return ffi.mlx_llama_n_embd(self.handle);
+    }
+
+    /// Context length this checkpoint was trained at, or 0 if it does not say.
+    pub fn nCtxTrain(self: *LlamaEngine) i32 {
+        return ffi.mlx_llama_n_ctx_train(self.handle);
+    }
+
+    /// Is this an EMBEDDING checkpoint rather than a generative one? Answered
+    /// from the POOLING type it declares (see the shim -- NOT
+    /// `llama_model_has_encoder`, which answers false for every BERT-family
+    /// embedder). Drives what the model ADVERTISES: nomic-embed cannot chat,
+    /// and a server that lists it as a chat model sends every discovery client
+    /// somewhere it will only get nonsense.
+    pub fn isEncoderOnly(self: *LlamaEngine) bool {
+        return ffi.mlx_llama_is_encoder_only(self.handle);
+    }
+
+    /// Create a session for embeddings. Separate from a generation session by
+    /// necessity: `embeddings` and `pooling_type` are context-creation
+    /// parameters, and a pooled context exposes no per-token logits to sample.
+    /// Freed with the same `free()`.
+    pub fn createEmbedSession(self: *LlamaEngine, ctx_size: i32) Error!*LlamaSession {
+        var err_buf: [256]u8 = undefined;
+        const raw = ffi.mlx_llama_embed_session_create(self.handle, ctx_size, &err_buf, err_buf.len);
+        if (raw == null) {
+            log.err("[llama] embed_session_create failed: {s} (ctx={d})\n", .{
+                std.mem.sliceTo(&err_buf, 0), ctx_size,
+            });
+            return Error.SessionCreateFailed;
+        }
+        const sess = self.allocator.create(LlamaSession) catch {
+            ffi.mlx_llama_session_free(raw);
+            return Error.OutOfMemory;
+        };
+        sess.* = .{
+            .allocator = self.allocator,
+            .engine = self,
+            .handle = raw.?,
+            .ctx_size = ctx_size,
+            .resident = .empty,
+        };
+        return sess;
+    }
 };
 
 /// Plan 5 #2: KV quant for the llama.cpp engine. Mapped from the CLI/body
@@ -264,6 +312,23 @@ pub const LlamaKvQuant = enum(u8) {
     }
 };
 
+/// Decode `mlx_llama_session_trim`'s return value: did it leave the first
+/// `n_keep` tokens resident (false), or refuse and clear the whole session
+/// (true)? Split out so the "1 means start over" half of the contract has a
+/// guard that does not need a hybrid GGUF on disk -- the failure it exists for
+/// only reproduces on a recurrent checkpoint, and reading the value as a plain
+/// ok/error code silently reinstates the bug.
+pub fn trimClearedSession(rc: i32) bool {
+    return rc == 1;
+}
+
+test "trimClearedSession: 1 means the session was cleared, 0 means trimmed" {
+    try std.testing.expect(trimClearedSession(1));
+    try std.testing.expect(!trimClearedSession(0));
+    // A negative code is not a "cleared" report -- the session is untouched.
+    try std.testing.expect(!trimClearedSession(-1));
+}
+
 /// Length of the longest common prefix of two token sequences. Pure helper so
 /// the prompt-prefix reuse logic in `LlamaSession.sync` is unit-testable without
 /// a model. An off-by-one here would corrupt KV reuse, so it's covered directly.
@@ -283,6 +348,12 @@ pub const LlamaSession = struct {
     /// `eval`), in position order. `sync` diffs the next prompt against this to
     /// reuse the common prefix; it always mirrors the C session's KV exactly.
     resident: std.ArrayList(i32),
+    /// How many times a partial trim was REFUSED by the underlying memory and
+    /// the session cleared instead (see `trimClearedSession`). Non-zero means
+    /// this checkpoint's memory is recurrent/hybrid and cannot rewind, so a
+    /// diverging prompt cold-prefills by necessity. Kept as a counter rather
+    /// than a bool so a test can tell "never happened" from "happened once".
+    trim_refusals: u32 = 0,
 
     pub fn free(self: *LlamaSession) void {
         self.resident.deinit(self.allocator);
@@ -308,8 +379,22 @@ pub const LlamaSession = struct {
         if (common == prompt_ids.len and common > 0) common -= 1;
 
         if (common < self.resident.items.len) {
-            _ = ffi.mlx_llama_session_trim(self.handle, @intCast(common));
-            self.resident.shrinkRetainingCapacity(common);
+            const rc = ffi.mlx_llama_session_trim(self.handle, @intCast(common));
+            if (trimClearedSession(rc)) {
+                // Recurrent/hybrid memory refused the partial trim and cleared
+                // itself instead (see llama_shim.h). The prefix we were about
+                // to reuse is gone, so this request cold-prefills. Logged at
+                // debug because it is the NORMAL outcome for such a checkpoint
+                // whenever a prompt diverges from what is resident -- a
+                // straight continuation still matches as a pure prefix and
+                // never reaches this branch at all.
+                log.debug("[llama] partial trim refused (recurrent memory); cold prefill\n", .{});
+                self.trim_refusals +|= 1;
+                self.resident.clearRetainingCapacity();
+                common = 0;
+            } else {
+                self.resident.shrinkRetainingCapacity(common);
+            }
         }
 
         const suffix = prompt_ids[common..];
@@ -371,6 +456,56 @@ pub const LlamaSession = struct {
             return Error.SessionEvalFailed;
         }
         self.resident.append(self.allocator, token) catch return Error.OutOfMemory;
+    }
+
+    /// Embed one token sequence. Allocates and returns the vector.
+    ///
+    /// Only valid on a session from `createEmbedSession`. The session's memory
+    /// is cleared inside the shim first, so the result depends on `ids` alone
+    /// and a batch of inputs cannot bleed into each other -- which also means
+    /// an embed session keeps no `resident` mirror worth maintaining.
+    pub fn embed(self: *LlamaSession, allocator: std.mem.Allocator, ids: []const i32) Error![]f32 {
+        const n_embd = self.engine.nEmbd();
+        if (n_embd <= 0) return Error.EmbedFailed;
+        const out = allocator.alloc(f32, @intCast(n_embd)) catch return Error.OutOfMemory;
+        errdefer allocator.free(out);
+        var err_buf: [256]u8 = undefined;
+        const n = ffi.mlx_llama_session_embed(
+            self.handle,
+            ids.ptr,
+            @intCast(ids.len),
+            out.ptr,
+            n_embd,
+            &err_buf,
+            err_buf.len,
+        );
+        if (n != n_embd) {
+            log.err("[llama] session_embed failed: {s}\n", .{std.mem.sliceTo(&err_buf, 0)});
+            return Error.EmbedFailed;
+        }
+        // L2-normalize. The MLX encoder normalizes every row it returns, and
+        // `/v1/embeddings` truncates-then-renormalizes for the `dimensions`
+        // option assuming unit input, so an unnormalized vector here would make
+        // the same server's embeddings incomparable across backends. llama.cpp
+        // pools without normalizing (nomic-embed measures ~22), so it is ours
+        // to do.
+        //
+        // Accumulate in f64: a 4096-wide sum of squares in f32 loses enough to
+        // move the last digits of every component.
+        var mag: f64 = 0;
+        for (out) |v| mag += @as(f64, v) * @as(f64, v);
+        // A genuinely zero vector cannot be normalized; hand it back as-is
+        // rather than dividing by zero and returning NaNs that look like data.
+        if (mag > 0) {
+            const inv = 1.0 / @sqrt(mag);
+            for (out) |*v| v.* = @floatCast(@as(f64, v.*) * inv);
+        }
+
+        // The shim cleared the memory, so nothing of `ids` is resident and the
+        // mirror must say so -- a stale mirror would make a later `sync` on
+        // this handle reuse a prefix that is not there.
+        self.resident.clearRetainingCapacity();
+        return out;
     }
 
     pub fn argmax(self: *LlamaSession) i32 {
@@ -474,6 +609,130 @@ test "llama: syncWithFallback matches sync on the happy path" {
     try std.testing.expectEqual(@as(i32, 0), c3);
 }
 
+// Model-gated regression: the SAME prompt served twice. This is the shape every
+// multi-turn conversation and every retry hits, and it is the one `sync` branch
+// the extend-the-prefix test above never reaches — there, the new prompt is
+// LONGER than what is resident, so `common < prompt.len` and the back-off never
+// runs. Here the whole prompt is already resident AND a generated tail sits
+// past it, so `sync` must back off one position, trim the tail plus that
+// position, and re-decode it. Get the trim wrong and the request answers from
+// the wrong position: live on Windows (2026-08-20) the second identical request
+// echoed PROMPT tokens back and the third returned an empty completion with
+// `finish_reason: "stop"`.
+//
+// The bar is the FIRST token, not the whole continuation: it is the token the
+// restored position is supposed to predict, so it convicts a position error on
+// its own, and it cannot drift the way a longer greedy run can.
+test "llama: re-serving an identical prompt over a generated tail restores the same logits" {
+    const allocator = std.testing.allocator;
+    const path = testModelPath() orelse return error.SkipZigTest;
+
+    var engine = try LlamaEngine.open(allocator, path, .{});
+    defer engine.close();
+
+    const prompt = try engine.tokenizeText(allocator, "The history of the Roman Empire is long and", true);
+    defer allocator.free(prompt);
+
+    var sess = try engine.createSession(4096);
+    defer sess.free();
+
+    // Turn 1: cold prefill, then generate a few tokens so the resident KV holds
+    // prompt + generated — the state a finished request leaves behind.
+    _ = try sess.sync(prompt);
+    const cold_first = sess.argmax();
+    var tok = cold_first;
+    var i: usize = 0;
+    while (i < 4 and !engine.isEog(tok)) : (i += 1) {
+        try sess.eval(tok);
+        tok = sess.argmax();
+    }
+    try std.testing.expect(sess.resident.items.len > prompt.len);
+
+    // Turn 2: the identical prompt. Every token of it is resident, so this is
+    // the back-off-and-trim path.
+    const cached = try sess.sync(prompt);
+    // How much is reused is memory-dependent and not the invariant: a KV cache
+    // keeps everything but the backed-off position, while a recurrent/hybrid
+    // one cannot rewind at all and legitimately starts from zero. What must
+    // hold either way is the state below.
+    try std.testing.expect(cached == @as(i32, @intCast(prompt.len - 1)) or cached == 0);
+    // The session must be back to exactly the prompt — no generated tail left.
+    try std.testing.expectEqualSlices(i32, prompt, sess.resident.items);
+    try std.testing.expectEqual(@as(i32, @intCast(prompt.len)), sess.pos());
+    // ...and predict what the cold prefill predicted.
+    try std.testing.expectEqual(cold_first, sess.argmax());
+}
+
+// Model-gated: embeddings through llama.cpp's own embedding API.
+//
+// Set LLAMA_TEST_EMBED_MODEL to an EMBEDDING gguf (e.g. nomic-embed-text);
+// pointing it at a chat model exercises the no-pooling arm instead, which is a
+// different contract, so the two are separate variables on purpose.
+fn testEmbedModelPath() ?[]const u8 {
+    const raw = std.c.getenv("LLAMA_TEST_EMBED_MODEL") orelse return null;
+    const slice = std.mem.sliceTo(raw, 0);
+    return if (slice.len == 0) null else slice;
+}
+
+test "llama: embeddings are deterministic, input-dependent, and isolated" {
+    const allocator = std.testing.allocator;
+    const path = testEmbedModelPath() orelse return error.SkipZigTest;
+
+    var engine = try LlamaEngine.open(allocator, path, .{});
+    defer engine.close();
+
+    const n_embd = engine.nEmbd();
+    try std.testing.expect(n_embd > 0);
+
+    var sess = try engine.createEmbedSession(512);
+    defer sess.free();
+
+    const a1 = try engine.tokenizeText(allocator, "the quick brown fox", true);
+    defer allocator.free(a1);
+    const b1 = try engine.tokenizeText(allocator, "quantum chromodynamics lattice gauge theory", true);
+    defer allocator.free(b1);
+
+    const ea = try sess.embed(allocator, a1);
+    defer allocator.free(ea);
+    const eb = try sess.embed(allocator, b1);
+    defer allocator.free(eb);
+    try std.testing.expectEqual(@as(usize, @intCast(n_embd)), ea.len);
+
+    // Finite, and L2-NORMALIZED. Unit length is the server's embedding
+    // contract, not a detail: the MLX encoder normalizes every row, and
+    // `/v1/embeddings`'s `dimensions` option truncates and then RE-normalizes
+    // on the assumption that it started from a unit vector. A raw llama.cpp
+    // pooled vector is not normalized (nomic-embed measures ~22), so without
+    // this the same server hands out two incomparable kinds of embedding
+    // depending on which backend loaded the model.
+    var mag: f64 = 0;
+    for (ea) |v| {
+        try std.testing.expect(std.math.isFinite(v));
+        mag += @as(f64, v) * @as(f64, v);
+    }
+    try std.testing.expect(mag > 0);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), @sqrt(mag), 1e-4);
+
+    // Different inputs must differ. Without this an embedder that returns a
+    // constant (wrong pooling, uninitialised buffer) passes everything else.
+    var same = true;
+    for (ea, eb) |x, y| {
+        if (x != y) {
+            same = false;
+            break;
+        }
+    }
+    try std.testing.expect(!same);
+
+    // The SAME input must reproduce, and -- the actual regression risk -- it
+    // must reproduce AFTER another input has been embedded on this session. If
+    // the shim did not clear memory between calls, this second `a` would be
+    // embedded as "b then a" and quietly differ.
+    const ea2 = try sess.embed(allocator, a1);
+    defer allocator.free(ea2);
+    try std.testing.expectEqualSlices(f32, ea, ea2);
+}
+
 test "commonPrefixLen: shared prefix, divergence, and bounds" {
     const a = [_]i32{ 1, 2, 3, 4, 5 };
     // Identical → full length.
@@ -537,7 +796,11 @@ test "llama: prefix reuse is byte-identical to cold decode" {
     try sess.eval(warm_tok);
 
     const cached = try sess.sync(full);
-    try std.testing.expect(cached > 0); // reused the shared prefix
+    // Reuse is a property of the MEMORY, not of correctness: a recurrent/hybrid
+    // checkpoint refuses the partial trim and cold-prefills instead, which is
+    // exactly why it must still produce the cold tokens below. On a plain KV
+    // cache a zero here would be the trim bug this test exists for.
+    try std.testing.expect(cached > 0 or sess.trim_refusals > 0);
     try std.testing.expect(cached <= @as(i32, @intCast(full.len)));
 
     var tok = sess.argmax();
