@@ -14,6 +14,7 @@ const std = @import("std");
 const net = @import("lan_net.zig");
 const log = @import("log.zig");
 const policy = @import("lan_policy.zig");
+const platform = @import("platform.zig");
 
 const PeerModel = policy.PeerModel;
 const freePeerModels = policy.freePeerModels;
@@ -65,10 +66,10 @@ pub const RemoteLookup = union(enum) { found: Remote, peer_unknown, model_unlist
 /// the discovery thread, hence the lock.
 pub const Table = struct {
     alloc: std.mem.Allocator,
-    /// pthread mutex, not `std.Io.Mutex`: lookups run on conn threads and the
-    /// discovery thread, none of which should block through an Io handle for a
-    /// micro critical section (same rationale as log.zig's sink_mutex).
-    mu: std.c.pthread_mutex_t = .{},
+    /// `platform.Mutex`, not `std.Io.Mutex`: lookups run on conn threads and
+    /// the discovery thread, none of which carries an `Io` handle to block
+    /// through for a micro critical section.
+    mu: platform.Mutex = .{},
     map: std.StringHashMap(Peer),
 
     pub fn init(alloc: std.mem.Allocator) Table {
@@ -82,10 +83,10 @@ pub const Table = struct {
     }
 
     fn lock(tbl: *Table) void {
-        _ = std.c.pthread_mutex_lock(&tbl.mu);
+        tbl.mu.lock();
     }
     fn unlock(tbl: *Table) void {
-        _ = std.c.pthread_mutex_unlock(&tbl.mu);
+        tbl.mu.unlock();
     }
 
     /// Tri-state on purpose. `model_unlisted` is definitive — the peer
@@ -339,33 +340,24 @@ const TestSink = struct {
     }
 };
 
-fn testListener(port_out: *u16) !i32 {
-    const lst = std.c.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-    if (lst < 0) return error.Sock;
-    errdefer _ = std.c.close(lst);
-    var sa: std.posix.sockaddr.in = .{ .port = 0, .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
-    if (std.c.bind(lst, @ptrCast(&sa), @sizeOf(std.posix.sockaddr.in)) != 0) return error.Sock;
-    var sa_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
-    if (std.c.getsockname(lst, @ptrCast(&sa), &sa_len) != 0) return error.Sock;
-    port_out.* = std.mem.bigToNative(u16, sa.port);
-    if (std.c.listen(lst, 1) != 0) return error.Sock;
-    return lst;
+fn testListener(port_out: *u16) !net.Socket {
+    return net.listenLoopback(port_out);
 }
 
 test "lan: tunnel forwards the rewritten request and pumps a chunked streaming response" {
     const a = t.allocator;
     var port: u16 = 0;
     const lst = try testListener(&port);
-    defer _ = std.c.close(lst);
+    defer net.close(lst);
 
     const FakePeer = struct {
-        fn say(c: i32, msg: []const u8) void {
-            _ = std.c.write(c, msg.ptr, msg.len);
+        fn say(c: net.Socket, msg: []const u8) void {
+            net.writeAll(c, msg) catch {};
         }
-        fn run(listener: i32) void {
-            const c = std.c.accept(listener, null, null);
-            if (c < 0) return;
-            defer _ = std.c.close(c);
+        fn run(listener: net.Socket) void {
+            const c = net.acceptOne(listener);
+            if (c == net.invalid_socket) return;
+            defer net.close(c);
             var req: [4096]u8 = undefined;
             var got: usize = 0;
             while (got < req.len) {
@@ -380,8 +372,7 @@ test "lan: tunnel forwards the rewritten request and pumps a chunked streaming r
                 std.mem.indexOf(u8, req[0..got], "POST /v1/chat/completions HTTP/1.1") != null;
             say(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
             say(c, if (rewritten) "data: ok\n\n" else "data: WRONG-REQUEST\n\n");
-            const ts = std.c.timespec{ .sec = 0, .nsec = 20_000_000 };
-            _ = std.c.nanosleep(&ts, null); // force a second pump iteration
+            platform.sleepMs(20); // force a second pump iteration
             say(c, "data: [DONE]\n\n");
         }
     };
@@ -407,7 +398,7 @@ test "lan: tunnel to a dead peer fails before writing anything to the client" {
     const a = t.allocator;
     var port: u16 = 0;
     const lst = try testListener(&port);
-    _ = std.c.close(lst); // port now refuses connections
+    net.close(lst); // port now refuses connections
 
     var sink = TestSink{ .alloc = a };
     defer sink.buf.deinit(a);

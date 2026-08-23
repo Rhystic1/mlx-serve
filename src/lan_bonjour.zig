@@ -22,6 +22,7 @@ const policy = @import("lan_policy.zig");
 /// shared with the hand-rolled mDNS transport. Only DISCOVERY is dns_sd.
 const peers_mod = @import("lan_peers.zig");
 const net = @import("lan_net.zig");
+const platform = @import("platform.zig");
 const SERVICE_TYPE = policy.SERVICE_TYPE;
 const RemoteId = policy.RemoteId;
 const splitRemoteId = policy.splitRemoteId;
@@ -121,8 +122,8 @@ pub const Lan = struct {
         std.c.arc4random_buf(&rnd, rnd.len);
         _ = std.fmt.bufPrint(&l.token_hex, "{x:0>16}", .{std.mem.readInt(u64, &rnd, .big)}) catch unreachable;
 
-        var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
-        var raw_name: []const u8 = opts.name orelse std.posix.gethostname(&host_buf) catch "mac";
+        var host_buf: [256]u8 = undefined;
+        var raw_name: []const u8 = opts.name orelse platform.hostName(&host_buf) orelse "mac";
         if (std.mem.endsWith(u8, raw_name, ".local")) raw_name = raw_name[0 .. raw_name.len - ".local".len];
         l.name = sanitizeName(&l.name_buf, raw_name);
 

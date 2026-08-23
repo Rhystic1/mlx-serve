@@ -83,8 +83,8 @@ pub const Lan = struct {
         platform.randomBytes(&rnd);
         _ = std.fmt.bufPrint(&l.token_hex, "{x:0>16}", .{std.mem.readInt(u64, &rnd, .big)}) catch unreachable;
 
-        var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
-        var raw_name: []const u8 = opts.name orelse std.posix.gethostname(&host_buf) catch "mlx-serve";
+        var host_buf: [256]u8 = undefined;
+        var raw_name: []const u8 = opts.name orelse platform.hostName(&host_buf) orelse "mlx-serve";
         if (std.mem.endsWith(u8, raw_name, ".local")) raw_name = raw_name[0 .. raw_name.len - ".local".len];
         l.name = sanitizeName(&l.name_buf, raw_name);
 

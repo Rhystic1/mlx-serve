@@ -62,4 +62,10 @@ test {
     _ = policy;
     _ = transport;
     _ = @import("lan_peers.zig");
+    // Reached from the transport as ordinary imports, which does NOT register
+    // their tests: the collector only follows `_ =` references out of a test
+    // block. Without these two lines `lan_mdns`'s wire-format tests and
+    // `lan_net`'s host-clock/interface tests are compiled and never run.
+    _ = @import("lan_mdns.zig");
+    _ = @import("lan_net.zig");
 }

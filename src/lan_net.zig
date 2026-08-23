@@ -38,6 +38,29 @@ extern "ws2_32" fn closesocket(s: usize) callconv(.winapi) c_int;
 extern "ws2_32" fn ioctlsocket(s: usize, cmd: c_long, arg: *c_ulong) callconv(.winapi) c_int;
 extern "ws2_32" fn WSAPoll(fds: [*]WsaPollFd, n: u32, timeout: i32) callconv(.winapi) i32;
 extern "ws2_32" fn gethostname(name: [*]u8, len: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn getaddrinfo(node: ?[*:0]const u8, service: ?[*:0]const u8, hints: ?*const AddrInfoA, res: *?*AddrInfoA) callconv(.winapi) c_int;
+extern "ws2_32" fn freeaddrinfo(ai: ?*AddrInfoA) callconv(.winapi) void;
+extern "ws2_32" fn listen(s: usize, backlog: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn accept(s: usize, addr: ?*anyopaque, len: ?*c_int) callconv(.winapi) usize;
+extern "ws2_32" fn getsockname(s: usize, addr: *anyopaque, len: *c_int) callconv(.winapi) c_int;
+
+// Declared here rather than taken from `std.os.windows.kernel32`, which does
+// not export it in this Zig.
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+
+/// Windows orders `ai_canonname` BEFORE `ai_addr`; glibc is the other way
+/// round. Only `family` and `addr` are read, but the layout has to be right
+/// for those two to land.
+const AddrInfoA = extern struct {
+    flags: c_int = 0,
+    family: c_int = 0,
+    socktype: c_int = 0,
+    protocol: c_int = 0,
+    addrlen: usize = 0,
+    canonname: ?[*:0]u8 = null,
+    addr: ?*anyopaque = null,
+    next: ?*AddrInfoA = null,
+};
 
 const WsaPollFd = extern struct { fd: usize, events: i16, revents: i16 };
 const FIONBIO: c_long = @bitCast(@as(u32, 0x8004667e));
@@ -78,7 +101,7 @@ pub fn close(s: Socket) void {
 }
 
 pub fn monoMs() i64 {
-    if (is_windows) return @intCast(std.os.windows.kernel32.GetTickCount64());
+    if (is_windows) return @intCast(GetTickCount64());
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
@@ -202,16 +225,24 @@ pub fn localIp4Addresses(out: [][4]u8) [][4]u8 {
         // gethostname + the resolver, rather than iphlpapi: it needs no extra
         // link dependency and returns the host's own addresses, which is all
         // the join loop wants.
+        platform.ensureWinsock();
         var host: [256]u8 = undefined;
         if (gethostname(&host, host.len) != 0) return out[0..0];
         const name = std.mem.sliceTo(&host, 0);
-        var buf: [64]u8 = undefined;
-        const zname = std.fmt.bufPrintZ(&buf, "{s}", .{name}) catch return out[0..0];
-        const list = std.net.getAddressList(std.heap.page_allocator, zname, 0) catch return out[0..0];
-        defer list.deinit();
-        for (list.addrs) |a| {
-            if (a.any.family != AF_INET or n == out.len) continue;
-            out[n] = @bitCast(a.in.sa.addr);
+        if (name.len == 0) return out[0..0];
+        host[name.len] = 0; // gethostname terminates on success; be explicit
+        const zname: [*:0]const u8 = @ptrCast(&host);
+
+        const hints = AddrInfoA{ .family = AF_INET, .socktype = SOCK_STREAM };
+        var res: ?*AddrInfoA = null;
+        if (getaddrinfo(zname, null, &hints, &res) != 0) return out[0..0];
+        defer freeaddrinfo(res);
+        var it = res;
+        while (it) |ai| : (it = ai.next) {
+            if (ai.family != AF_INET or n == out.len) continue;
+            const raw = ai.addr orelse continue;
+            const sa: *const std.posix.sockaddr.in = @ptrCast(@alignCast(raw));
+            out[n] = @bitCast(sa.addr);
             n += 1;
         }
         return out[0..n];
@@ -249,6 +280,48 @@ extern "c" fn freeifaddrs(p: ?*Ifaddrs) void;
 
 /// Non-blocking connect with a real deadline: a blocking connect to a
 /// powered-off host can hang for the kernel's full SYN-retry budget (~75 s).
+// ── Loopback listener ───────────────────────────────────────────────────────
+//
+// The server proper listens through `std.Io`; these two exist so the tunnel
+// tests can stand up a REAL peer on a real port on every host. Expressed here
+// rather than in the test file because the raw calls differ per host in the
+// same way everything else in this file does — a test rig written against
+// `std.c` compiles on POSIX and fails on Windows, where `fd_t` is a pointer.
+
+/// Bind + listen on 127.0.0.1 with a kernel-chosen port, reported in `port_out`.
+pub fn listenLoopback(port_out: *u16) Error!Socket {
+    var sa = sockaddrIn(.{ 127, 0, 0, 1 }, 0);
+    const len: c_int = @sizeOf(std.posix.sockaddr.in);
+    if (is_windows) {
+        platform.ensureWinsock();
+        const s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s == invalid_socket) return error.SocketFailed;
+        errdefer close(s);
+        if (bind(s, &sa, len) != 0) return error.SocketFailed;
+        var blen: c_int = len;
+        if (getsockname(s, &sa, &blen) != 0) return error.SocketFailed;
+        if (listen(s, 1) != 0) return error.SocketFailed;
+        port_out.* = std.mem.bigToNative(u16, sa.port);
+        return s;
+    }
+    const s = std.c.socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return error.SocketFailed;
+    errdefer close(s);
+    if (std.c.bind(s, @ptrCast(&sa), @intCast(len)) != 0) return error.SocketFailed;
+    var blen: std.posix.socklen_t = @intCast(len);
+    if (std.c.getsockname(s, @ptrCast(&sa), &blen) != 0) return error.SocketFailed;
+    if (std.c.listen(s, 1) != 0) return error.SocketFailed;
+    port_out.* = std.mem.bigToNative(u16, sa.port);
+    return s;
+}
+
+/// Accept a single connection, or `invalid_socket` if the listener is gone.
+pub fn acceptOne(listener: Socket) Socket {
+    if (is_windows) return accept(listener, null, null);
+    const c = std.c.accept(listener, null, null);
+    return if (c < 0) invalid_socket else c;
+}
+
 pub fn connectTimeout(ip4: [4]u8, port: u16, timeout_ms: i32) Error!Socket {
     if (is_windows) platform.ensureWinsock();
     const s: Socket = if (is_windows)
@@ -333,3 +406,34 @@ pub fn read(s: Socket, buf: []u8) Error!usize {
 }
 
 extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
+
+// ── Tests ──
+
+const testing = std.testing;
+
+test "monoMs is monotonic and advances in milliseconds" {
+    // The Windows arm reaches a different clock entirely, so this pins the
+    // unit as much as the direction: a seconds- or nanosecond-scaled source
+    // would fail one of the two bounds.
+    const a = monoMs();
+    platform.sleepMs(30);
+    const b = monoMs();
+    try testing.expect(b >= a);
+    try testing.expect(b - a >= 20);
+    try testing.expect(b - a < 5000);
+}
+
+test "localIp4Addresses stays inside the caller's buffer" {
+    // Best-effort by contract: an empty result is a pass. What must hold is
+    // that it never writes past `out`, never reports the unspecified address,
+    // and answers identically when handed a one-slot buffer.
+    var buf: [8][4]u8 = undefined;
+    const all = localIp4Addresses(&buf);
+    try testing.expect(all.len <= buf.len);
+    for (all) |ip| try testing.expect(!std.mem.eql(u8, &ip, &[_]u8{ 0, 0, 0, 0 }));
+
+    var one: [1][4]u8 = undefined;
+    const capped = localIp4Addresses(&one);
+    try testing.expect(capped.len <= 1);
+    if (all.len > 0) try testing.expectEqual(@as(usize, 1), capped.len);
+}

@@ -678,3 +678,106 @@ test "trimTrailingSeps: both separators, roots preserved" {
         try std.testing.expectEqualStrings("/a/b" ++ [_]u8{'\\'}, trimTrailingSeps("/a/b" ++ [_]u8{'\\'}));
     }
 }
+
+// ── Cross-thread mutex ─────────────────────────────────────────────────────
+
+/// A plain non-recursive mutex for threads that carry no `std.Io` handle.
+///
+/// `std.Io.Mutex` is the codebase-wide idiom and stays that everywhere an `Io`
+/// is in scope. This exists for the handful of bare `std.Thread`s that have
+/// none (the LAN discovery thread and the connection threads that read its
+/// table), which previously reached for `std.c.pthread_mutex_t` directly —
+/// that type is `void` on Windows, so the whole file failed to compile there.
+/// Windows gets an SRWLOCK: same shape, no allocation, no initializer call,
+/// zero-initialized means unlocked.
+pub const Mutex = switch (builtin.os.tag) {
+    .windows => struct {
+        srw: std.os.windows.SRWLOCK = .{},
+
+        pub fn lock(m: *@This()) void {
+            std.os.windows.ntdll.RtlAcquireSRWLockExclusive(&m.srw);
+        }
+        pub fn unlock(m: *@This()) void {
+            std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&m.srw);
+        }
+    },
+    else => struct {
+        mu: std.c.pthread_mutex_t = .{},
+
+        pub fn lock(m: *@This()) void {
+            _ = std.c.pthread_mutex_lock(&m.mu);
+        }
+        pub fn unlock(m: *@This()) void {
+            _ = std.c.pthread_mutex_unlock(&m.mu);
+        }
+    },
+};
+
+// ── Host name ──────────────────────────────────────────────────────────────
+
+extern "ws2_32" fn gethostname(name: [*]u8, namelen: c_int) callconv(.winapi) c_int;
+
+/// This host's name, written into `buf`, or null if the host will not say.
+///
+/// `std.posix.gethostname` wants a `*[HOST_NAME_MAX]u8`, and that constant is
+/// `void` on Windows — the POSIX call cannot even be spelled there. Winsock
+/// has its own `gethostname`, which needs Winsock started first.
+pub fn hostName(buf: []u8) ?[]const u8 {
+    if (buf.len == 0) return null;
+    switch (builtin.os.tag) {
+        .windows => {
+            ensureWinsock();
+            const cap: c_int = @intCast(@min(buf.len, @as(usize, @intCast(std.math.maxInt(c_int)))));
+            if (gethostname(buf.ptr, cap) != 0) return null;
+            const name = std.mem.sliceTo(buf, 0);
+            return if (name.len == 0) null else name;
+        },
+        else => {
+            var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+            const name = std.posix.gethostname(&host_buf) catch return null;
+            if (name.len == 0 or name.len > buf.len) return null;
+            @memcpy(buf[0..name.len], name);
+            return buf[0..name.len];
+        },
+    }
+}
+
+test "Mutex serializes increments from several threads" {
+    // A no-op or per-thread lock loses updates here: 4 threads x 20k
+    // unsynchronized read-modify-writes on one counter reliably drops some.
+    const N = 4;
+    const PER = 20_000;
+    const Shared = struct {
+        mu: Mutex = .{},
+        n: u64 = 0,
+        fn bump(s: *@This()) void {
+            for (0..PER) |_| {
+                s.mu.lock();
+                defer s.mu.unlock();
+                s.n += 1;
+            }
+        }
+    };
+    var shared = Shared{};
+    var threads: [N]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Shared.bump, .{&shared});
+    for (threads) |t| t.join();
+    try testing.expectEqual(@as(u64, N * PER), shared.n);
+}
+
+test "Mutex is usable unlocked-then-relocked on one thread" {
+    var mu = Mutex{};
+    mu.lock();
+    mu.unlock();
+    mu.lock();
+    mu.unlock();
+}
+
+test "hostName reports a non-empty name on this host" {
+    var buf: [256]u8 = undefined;
+    const name = hostName(&buf) orelse return error.NoHostName;
+    try testing.expect(name.len > 0);
+    try testing.expect(name.len <= buf.len);
+    // A truncated/unterminated read shows up as an embedded NUL.
+    try testing.expect(std.mem.indexOfScalar(u8, name, 0) == null);
+}
