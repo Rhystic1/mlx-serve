@@ -32,8 +32,8 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
 # directory made this skip on every host whose only checkpoints are .gguf --
 # i.e. on exactly the hosts the hand-rolled mDNS transport was written for.
 model_exists() { [ -d "$1" ] || [ -f "$1" ]; }
-if ! model_exists "$MODEL" && [ -d "$HOME/.mlx-serve/models/gemma-4-e4b-it-4bit" ]; then
-    MODEL="$HOME/.mlx-serve/models/gemma-4-e4b-it-4bit"
+if ! model_exists "$MODEL" && [ -d "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit" ]; then
+    MODEL="$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit"
 fi
 if ! model_exists "$MODEL"; then
     echo -e "${YELLOW}SKIP${NC} test_lan_share: $MODEL not found."

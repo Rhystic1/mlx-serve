@@ -24,6 +24,26 @@ pub const MAX_PIXELS: u32 = 14 * 14 * 4 * 1280; // 1003520
 
 pub const Resized = struct { h: u32, w: u32 };
 
+/// Engine ceiling on the image area, whatever the checkpoint's processor
+/// declares. Qwen3.8 packs ship `longest_edge: 16777216` (16.7 Mpx); the
+/// reference survives that behind flash attention, while our ViT
+/// MATERIALIZES the full bidirectional score matrix per layer — a 5100x3300
+/// photo became 65k patches and an uncatchable Metal OOM (live, 26.8.9).
+/// 1536x1536: ~9.2k patches, ~2.7 GB of bf16 scores per layer at 16 heads;
+/// a 1920x1080 screenshot is barely touched (2.07 -> 2.36 Mpx cap).
+pub const ENGINE_MAX_PIXELS: u32 = 1536 * 1536;
+
+pub const PixelBounds = struct { min: u32, max: u32, clamped: bool };
+
+/// The bounds the resize actually uses: the checkpoint's when sane, the
+/// processor defaults otherwise, and never above ENGINE_MAX_PIXELS.
+pub fn effectivePixelBounds(cfg_min: u32, cfg_max: u32) PixelBounds {
+    const min = if (cfg_min > 0) cfg_min else MIN_PIXELS;
+    const declared = if (cfg_max >= min) cfg_max else @max(MAX_PIXELS, min);
+    const max = @max(min, @min(declared, ENGINE_MAX_PIXELS));
+    return .{ .min = min, .max = max, .clamped = max < declared };
+}
+
 /// Python `round()` is round-half-to-EVEN (banker's rounding); Zig's
 /// `std.math.round` is round-half-away-from-zero. `_smart_resize_image` uses the
 /// Python builtin, so we must match it for byte-faithful grids. Inputs here are
@@ -345,21 +365,22 @@ pub fn imageTokenCount(resized: Resized, patch: u32, merge: u32) u32 {
     return (gh / merge) * (gw / merge);
 }
 
-/// Build the processor's `pixel_values` [N, C*tps*ps*ps] from a normalized CHW
-/// image, in merge-block token order with feature layout [C, tps, py, px] — the
-/// exact ordering of mlx-vlm's `_process_one` transpose. `img_chw` is
-/// `[C, rh, rw]` already rescaled+normalized ((x/255−0.5)/0.5). The temporal
-/// axis duplicates the single frame `tps` times. Caller owns the result.
-pub fn buildPixelValues(
+/// Build one temporal-patch group's `pixel_values` [N, C*tps*ps*ps] from `tps`
+/// REAL consecutive decoded frames, in merge-block token order with feature
+/// layout [C, tps, py, px] — the exact ordering of mlx-vlm's `_process_one`
+/// transpose. Each `frames[tt]` is `[C, rh, rw]`, already rescaled+normalized
+/// and resized to the SAME (rh, rw) as every other frame in the group (a
+/// video's whole frame set shares one patch grid). Caller owns `out`.
+pub fn buildPixelValuesVideo(
     out: []f32,
-    img_chw: []const f32,
+    frames: []const []const f32,
     C: u32,
     rh: u32,
     rw: u32,
     patch: u32,
-    tps: u32,
     merge: u32,
 ) void {
+    const tps: u32 = @intCast(frames.len);
     const gh = rh / patch;
     const gw = rw / patch;
     const mh = gh / merge;
@@ -385,14 +406,14 @@ pub fn buildPixelValues(
                     while (c < C) : (c += 1) {
                         var tt: u32 = 0;
                         while (tt < tps) : (tt += 1) {
+                            const frame = frames[tt];
                             var py: u32 = 0;
                             while (py < patch) : (py += 1) {
                                 const y = row * patch + py;
                                 var px: u32 = 0;
                                 while (px < patch) : (px += 1) {
                                     const x = col * patch + px;
-                                    // Temporal axis duplicates the single frame.
-                                    out[base + f] = img_chw[@as(usize, c) * plane + @as(usize, y) * rw + x];
+                                    out[base + f] = frame[@as(usize, c) * plane + @as(usize, y) * rw + x];
                                     f += 1;
                                 }
                             }
@@ -403,6 +424,26 @@ pub fn buildPixelValues(
             }
         }
     }
+}
+
+/// Build one still IMAGE's `pixel_values` — the `tps` slots the Conv3d-as-Linear
+/// weight expects are filled by duplicating the single frame, per Qwen's own
+/// image processor (there is no second real frame for a still image). Thin
+/// wrapper over `buildPixelValuesVideo`'s real per-frame path.
+pub fn buildPixelValues(
+    out: []f32,
+    img_chw: []const f32,
+    C: u32,
+    rh: u32,
+    rw: u32,
+    patch: u32,
+    tps: u32,
+    merge: u32,
+) void {
+    std.debug.assert(tps <= 8);
+    var reps: [8][]const f32 = undefined;
+    for (0..tps) |i| reps[i] = img_chw;
+    buildPixelValuesVideo(out, reps[0..tps], C, rh, rw, patch, merge);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -417,7 +458,7 @@ pub fn buildPixelValues(
 // splices these embeddings at the image-pad token positions.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const QBlock = struct {
+pub const QBlock = struct {
     norm1_w: mlx.mlx_array,
     norm1_b: mlx.mlx_array,
     norm2_w: mlx.mlx_array,
@@ -1044,6 +1085,49 @@ pub const QwenVision = struct {
         try mlx.check(mlx.mlx_reshape(&out, m2, &oshape, 3, self.s));
         return out;
     }
+
+    /// Encode one VIDEO. `patches` is the concatenation of `grid_t` temporal-
+    /// patch groups' pixel_values (see `buildPixelValuesVideo`), each group's
+    /// `grid_h*grid_w` rows packed contiguously. mlx-vlm's `cu_seqlens`
+    /// boundaries fall exactly at temporal-patch-group edges — the ViT never
+    /// attends across frames — so a group is encoded by calling the existing,
+    /// UNCHANGED single-group `forward` (pos-embed and vision-rope are spatial
+    /// only and already correct per group), concatenating the merged token
+    /// outputs along the token axis.
+    pub fn forwardVideo(self: *QwenVision, patches: mlx.mlx_array, grid_t: u32, grid_h: u32, grid_w: u32) !mlx.mlx_array {
+        std.debug.assert(grid_t > 0);
+        if (grid_t == 1) return self.forward(patches, grid_h, grid_w);
+
+        const n_per_group: c_int = @intCast(grid_h * grid_w);
+        const pshape = mlx.getShape(patches);
+        std.debug.assert(pshape.len == 2);
+        const feat = pshape[1];
+
+        var parts = try self.allocator.alloc(mlx.mlx_array, grid_t);
+        defer self.allocator.free(parts);
+        var built: usize = 0;
+        errdefer for (parts[0..built]) |p| { _ = mlx.mlx_array_free(p); };
+
+        var t: u32 = 0;
+        while (t < grid_t) : (t += 1) {
+            var group = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(group);
+            const ti: c_int = @intCast(t);
+            const start = [_]c_int{ ti * n_per_group, 0 };
+            const stop = [_]c_int{ (ti + 1) * n_per_group, feat };
+            const strides = [_]c_int{ 1, 1 };
+            try mlx.check(mlx.mlx_slice(&group, patches, &start, 2, &stop, 2, &strides, 2, self.s));
+            parts[t] = try self.forward(group, grid_h, grid_w);
+            built += 1;
+        }
+        defer for (parts) |p| { _ = mlx.mlx_array_free(p); };
+
+        const cat_vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
+        defer _ = mlx.mlx_vector_array_free(cat_vec);
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&out, cat_vec, 1, self.s));
+        return out;
+    }
 };
 
 fn getWeightLocal(weights: *const Weights, buf: *[256]u8, name: []const u8) ?mlx.mlx_array {
@@ -1108,6 +1192,23 @@ test "qwen smart_resize matches reference table" {
         try std.testing.expectEqual(c.eh, r.h);
         try std.testing.expectEqual(c.ew, r.w);
     }
+}
+
+test "qwen: a checkpoint's 16.7 Mpx bound is clamped to what the ViT can attend" {
+    const b = effectivePixelBounds(65536, 16777216);
+    try std.testing.expectEqual(ENGINE_MAX_PIXELS, b.max);
+    try std.testing.expect(b.clamped);
+    // The live crash: 5100x3300 -> 16377 merged tokens. Under the cap it
+    // is ~2300, and the engine never builds a 65k-patch score matrix.
+    const r = smartResizeImage(3300, 5100, 32, b.min, b.max);
+    try std.testing.expect(imageTokenCount(r, 16, 2) <= ENGINE_MAX_PIXELS / (32 * 32));
+    try std.testing.expect(imageTokenCount(r, 16, 2) > 2000);
+    // Defaults and sane checkpoints pass through unchanged.
+    const d = effectivePixelBounds(0, 0);
+    try std.testing.expectEqual(MIN_PIXELS, d.min);
+    try std.testing.expectEqual(MAX_PIXELS, d.max);
+    try std.testing.expect(!d.clamped);
+    try std.testing.expectEqual(@as(u32, 1003520), effectivePixelBounds(3136, 1003520).max);
 }
 
 test "qwen smart_resize honors checkpoint processor pixel bounds" {
@@ -1225,6 +1326,32 @@ test "qwen buildPixelValues merge-order + [C,tps,py,px] feature layout" {
         1, 1, 101, 101, 201, 201, // token1 row0col1
         10, 10, 110, 110, 210, 210, // token2 row1col0
         11, 11, 111, 111, 211, 211, // token3 row1col1
+    };
+    try std.testing.expectEqualSlices(f32, &expect, pv);
+}
+
+test "qwen buildPixelValuesVideo reads REAL per-frame data, not one frame duplicated" {
+    const a = std.testing.allocator;
+    // Two distinct 2x2 "frames" (single channel, patch=1, merge=2 → one token
+    // covering the whole 2x2 grid). frame0[y,x] = y*10+x; frame1 = frame0+1000
+    // so the two temporal slots are trivially distinguishable in the output.
+    const C: u32 = 1;
+    const rh: u32 = 2;
+    const rw: u32 = 2;
+    var f0: [4]f32 = .{ 0, 1, 10, 11 };
+    var f1: [4]f32 = .{ 1000, 1001, 1010, 1011 };
+    const frames = [_][]const f32{ &f0, &f1 };
+    const pv = try a.alloc(f32, 4 * 2); // 4 tokens × feat 2 (C*tps*1*1)
+    defer a.free(pv);
+    buildPixelValuesVideo(pv, &frames, C, rh, rw, 1, 2);
+    // Merge-block order over the single 2x2 block; each token's feature is
+    // [frame0_px, frame1_px] — proving both real frames land in the output,
+    // not one frame duplicated tps times (that would make both slots equal).
+    const expect = [_]f32{
+        0,    1000, // token0 row0col0
+        1,    1001, // token1 row0col1
+        10,   1010, // token2 row1col0
+        11,   1011, // token3 row1col1
     };
     try std.testing.expectEqualSlices(f32, &expect, pv);
 }

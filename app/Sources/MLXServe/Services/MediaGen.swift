@@ -501,6 +501,14 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// Chained-window long clips (server `chain_windows`): N windows joined by
     /// fl2va keyframe conditioning, so the REF2VA pack cannot serve it.
     var supportsChainedWindows: Bool = false
+    /// Last-frame keyframe conditioning (server `last_frame_image`). The other
+    /// half of fl2va — first-LAST frame to video+audio — where the first frame
+    /// is the geometry anchor (plain stretch) and the last is a follower
+    /// (aspect-preserving center-cover). LTX pins the last LATENT frame the
+    /// same way it pins the first (both anchors resized to the canvas). A
+    /// reference has no keyframe row to anchor, so on H3 this rides the same
+    /// partition complement as Turbo and chaining.
+    var supportsLastFrame: Bool = false
     /// Denoising-step range the Steps slider offers. LTX's is the default; a
     /// backend whose floor is higher declares it, because a slider that goes
     /// somewhere the model does not work is a dead range, not a fast option.
@@ -729,7 +737,8 @@ struct VideoModelPreset: Identifiable, Hashable {
             defaultQuality: .good,
             maxFrames: cap,
             frameOptions: frameLadder(maxFrames: cap),
-            description: "Generates short video clips from a text prompt (and optionally a starting image or audio track), with sound built in. The heaviest model here — it also pulls a Gemma text encoder on first use."
+            description: "Generates short video clips from a text prompt (and optionally a starting image or audio track), with sound built in. The heaviest model here — it also pulls a Gemma text encoder on first use.",
+            supportsLastFrame: true
         )
     }()
 
@@ -767,6 +776,7 @@ struct VideoModelPreset: Identifiable, Hashable {
             maxFrames: cap,
             frameOptions: frameLadder(maxFrames: cap),
             description: "The newest LTX. Generates short video clips with sound from a text prompt, and optionally a starting image or audio track. Ships its own text encoder, so nothing extra downloads on first use.",
+            supportsLastFrame: true,
             shipsOwnTextEncoder: true
         )
     }()
@@ -804,6 +814,7 @@ struct VideoModelPreset: Identifiable, Hashable {
             maxFrames: cap,
             frameOptions: frameLadder(maxFrames: cap),
             description: "The sharpest LTX we ship. Same model as the 4-bit pack at twice the weight precision — noticeably more detail in faces, fur and fine texture, for about the same generation time. Needs a Mac with plenty of memory.",
+            supportsLastFrame: true,
             shipsOwnTextEncoder: true,
             supportsDiffusionDecoder: true
         )
@@ -931,6 +942,7 @@ struct VideoModelPreset: Identifiable, Hashable {
             // derived here so the two fl2va presets cannot drift apart.
             supportsTurbo: !supportsReferences,
             supportsChainedWindows: !supportsReferences,
+            supportsLastFrame: !supportsReferences,
             // MiniMax publishes no step count at all — no default, no range, no
             // maximum — so this range is OURS. 16 is the lowest tier we have a
             // verdict on, and below ~6 the fast recipe's warmup and tail windows
@@ -1233,6 +1245,19 @@ struct MusicModelPreset: Identifiable, Hashable {
     /// nothing. `fixedSteps` stays the per-checkpoint default either way.
     var supportsSteps: Bool { family == .minimaxMusic3 }
     var stepsRange: ClosedRange<Int> { 4...100 }
+    /// Reference audio (server `ref_audio`, #259): ACE-Step feeds a 30 s
+    /// window of the clip's VAE latent into its timbre slot — ONE pooled
+    /// token among hundreds of lyric/text tokens, so it is style/timbre
+    /// guidance, never a cover (that mode needs the FSQ codes we don't
+    /// ship). Music 3 has no such slot and names the field a 400. Gates the
+    /// control AND the field.
+    var supportsReferenceAudio: Bool { family == .acestep }
+    /// Source-audio tasks (server `task` + `src_audio`): ACE-Step's `cover`
+    /// (the source's melody/structure through its FSQ codes, new caption) and
+    /// `complete` (vocal-to-BGM: the source latent as context, an instrument
+    /// list in the instruction). Music 3 names both fields a 400. Gates the
+    /// mode control AND every field it brings.
+    var supportsSourceAudio: Bool { family == .acestep }
 
     /// ACE-Step v1.5 XL Turbo, 8-bit — 4B-class DiT, 8-step distilled.
     /// Published converted repo (DiT+encoders, Oobleck VAE, Qwen3-Embedding
@@ -1672,9 +1697,6 @@ struct ImageGenRequest {
     /// (`<model>@<peer>`). The gen service then skips local resolve/load/
     /// unload — the hosting Mac loads on demand and manages its own memory.
     var lanModelId: String? = nil
-    /// Apply the server's NSFW content filter (on by default). Off → sends
-    /// `"safety": false` so the server skips it for this request.
-    var safeMode: Bool = true
     /// Image-to-image: path to a source PNG/JPEG. The server resizes it to the
     /// requested resolution, VAE-encodes it, and partially renoises.
     var initImagePath: String? = nil
@@ -1843,6 +1865,10 @@ struct VideoGenRequest {
     /// by every pipeline mode (the server VAE-encodes it and pins it as the
     /// clean first latent frame).
     var firstFrameImagePath: String? = nil
+    /// Optional last-frame image (H3 fl2va): the frame the clip lands on. The
+    /// first frame sets the geometry and this one follows it, so a pair with
+    /// mismatched aspects still produces a clean landing.
+    var lastFrameImagePath: String? = nil
     /// Optional speech/audio clip for audio-to-video: the soundtrack is frozen
     /// as conditioning (voices, lip sync and performance follow it) and the
     /// ORIGINAL clip is muxed into the mp4. Any AVFoundation-readable format;
@@ -1869,6 +1895,14 @@ struct VideoGenRequest {
     /// Chained windows (H3 fl2va): number of `numFrames`-frame windows joined
     /// by keyframe conditioning. 1 = a single ordinary window.
     var chainWindows: Int = 1
+    /// Steps for LTX's two-stage refine pass (`stage2_steps`). 0 = Auto, which
+    /// is the server's own "all 3" — sent only when the user picks a number,
+    /// so the absent field keeps meaning the default everywhere.
+    var stage2Steps: Int = 0
+    /// Audio-guidance strength for audio-to-video (`cfg_audio_scale`). Only
+    /// meaningful with a clip attached: without one there is no audio guider
+    /// to scale.
+    var cfgAudioScale: Double = 7.0
     /// ref2va references (REF2VA pack only). Images the generation follows for
     /// character/style, clips for motion and scene, audio for voice and score.
     /// Paths, resolved to base64 at request time.
@@ -1966,10 +2000,46 @@ struct MusicGenRequest {
     /// Max-quality opt-out of the server's fast recipe ("fast": false — every
     /// forward dense, ~2.8x slower at 768p, "just a smidge better").
     var bestQuality: Bool = false
+    /// Optional reference clip (48 kHz stereo WAV prepared by
+    /// `AudioReference.referenceWav`) whose style/timbre the track follows.
+    /// Only sent where `supportsReferenceAudio`.
+    var refAudioPath: String? = nil
+    /// What the track is made FROM. Anything but `.text2music` needs
+    /// `srcAudioPath` and is only sent where `supportsSourceAudio`.
+    var task: MusicTask = .text2music
+    /// The cover / complete source (48 kHz stereo WAV, full length — the
+    /// server makes the track exactly as long as this clip).
+    var srcAudioPath: String? = nil
+    /// Cover: share of the denoise steps that follow the source (1 = all).
+    var coverStrength: Double = 1.0
+    /// Cover: start from a blend with the source instead of pure noise (0 = off).
+    var coverNoiseStrength: Double = 0.0
+    /// Complete: instruments to add, from `MusicTask.trackClasses`; empty =
+    /// the model decides.
+    var trackClasses: [String] = []
     /// Set when the pane picked a network model: the LAN routing id
     /// (`<model>@<peer>`). The gen service then skips local resolve/load/
     /// unload — the hosting Mac loads on demand and manages its own memory.
     var lanModelId: String? = nil
+}
+
+/// ACE-Step generation tasks (server `task`). Raw values are the wire spelling.
+enum MusicTask: String, CaseIterable, Codable {
+    case text2music, cover, complete
+
+    var label: String {
+        switch self {
+        case .text2music: return "Text to music"
+        case .cover: return "Cover"
+        case .complete: return "Vocal to BGM"
+        }
+    }
+    var needsSource: Bool { self != .text2music }
+
+    /// The instrument vocabulary the `complete` instruction accepts (the
+    /// server refuses anything else by name).
+    static let trackClasses = ["woodwinds", "brass", "fx", "synth", "strings", "percussion",
+                               "keyboard", "guitar", "bass", "drums", "backing_vocals", "vocals"]
 }
 
 struct Model3DGenRequest {

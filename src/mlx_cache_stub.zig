@@ -16,6 +16,11 @@ const std = @import("std");
 
 pub const Error = error{MlxUnavailable};
 
+/// Minimum forwarded-prefix length for committing a CANCELLED prefill. Value
+/// mirrors prefix_cache.zig so the scheduler's gate reads the same number in
+/// every build; unreachable here because nothing ever commits an entry.
+pub const MIN_CANCELLED_COMMIT_TOKENS: usize = 256;
+
 // ── Hot prefix cache ──
 
 /// The dflash assistant context committed alongside a cached prefix. It is

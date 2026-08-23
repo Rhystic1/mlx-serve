@@ -69,6 +69,7 @@ const Generator = generate_mod.Generator;
 const SamplingParams = generate_mod.SamplingParams;
 const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = if (@import("build_cfg.zig").mlx_enabled) @import("dflash.zig") else @import("spec_stub.zig");
+const round_cost_mod = @import("round_cost.zig");
 const DflashModel = dflash_mod.DflashModel;
 const VisionEncoder = vision_mod.VisionEncoder;
 const Weights = model_mod.Weights;
@@ -842,6 +843,16 @@ pub const VisionImagePixels = struct {
     grid_w: u32 = 0,
 };
 
+/// Qwen3-VL video: pre-patchified pixel_values for ALL `grid_t` temporal-patch
+/// groups, concatenated (see `qwen_vision.buildPixelValuesVideo`). Borrowed;
+/// must outlive the encodeVision call.
+pub const VisionVideoPixels = struct {
+    pixels: []const u8,
+    grid_t: u32,
+    grid_h: u32,
+    grid_w: u32,
+};
+
 /// Phase A4: vision-encode work item. Conn thread fills `images` (raw pixel
 /// data, CPU-only) and calls `Scheduler.encodeVision`, which posts the
 /// request and blocks until the inference thread fills `result` and signals
@@ -855,17 +866,23 @@ pub const VisionEncodeRequest = struct {
     model: *model_registry_mod.LoadedModel,
     /// Per-image float32 CHW pixel buffers. Borrowed; must outlive the call.
     images: []const VisionImagePixels,
+    /// Per-video pre-patchified pixel buffers. Borrowed; must outlive the call.
+    /// Qwen-only (video_token_id != 0) — empty on every other arch.
+    videos: []const VisionVideoPixels = &.{},
     /// Gemma 4 12B unified audio: per-clip raw float32-LE 16 kHz mono sample
     /// buffers. Borrowed; must outlive the call. The inference thread frames
     /// each into 640-sample tokens and projects them through the audio embedder.
     audio: []const []const u8 = &.{},
-    /// Output: encoded embedding tensor on success — vision soft tokens followed
-    /// by audio soft tokens, concatenated along the token axis. Ownership
-    /// transfers to the caller.
+    /// Output: encoded embedding tensor on success — vision soft tokens, then
+    /// video soft tokens, then audio soft tokens, concatenated along the token
+    /// axis (matches the prompt's image/video/audio block insertion order).
+    /// Ownership transfers to the caller.
     result: ?mlx.mlx_array = null,
-    /// Output: number of vision / audio soft tokens in `result` (in that order).
-    /// The caller inserts exactly this many image / audio placeholders.
+    /// Output: number of vision / video / audio soft tokens in `result` (in
+    /// that order). The caller inserts exactly this many image / video / audio
+    /// placeholders.
     n_vision_tokens: usize = 0,
+    n_video_tokens: usize = 0,
     n_audio_tokens: usize = 0,
     /// Output: error name on failure. Owned by `allocator`; caller frees.
     error_name: ?[]const u8 = null,
@@ -3315,6 +3332,26 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         sch.allocator.destroy(v);
     };
 
+    // The measured round-cost table (`round_cost.zig`) is keyed per (chip,
+    // model, quant, OS build); restored here, written at request end.
+    {
+        var quant_buf: [32]u8 = undefined;
+        const quant = std.fmt.bufPrint(&quant_buf, "q{d}g{d}", .{
+            params.config.quant_bits,
+            params.config.quant_group_size,
+        }) catch "q?";
+        var os_buf: [64]u8 = undefined;
+        const os_build = transformer_mod.macosProductVersion(&os_buf) orelse "";
+        // The measured round-cost table rides the same identity: restored
+        // here, written at the end of any request that folded new samples.
+        const rc_key = round_cost_mod.cacheKey(&xfm_ptr.round_cost_key_buf, ane_mod.chipBrand(), params.model_dir, quant, os_build);
+        xfm_ptr.round_cost_key_len = @intCast(rc_key.len);
+        if (round_cost_mod.loadCached(sch.allocator, sch.io, rc_key)) |t| {
+            xfm_ptr.round_cost = t;
+            log.info("[spec-cost] round-cost table restored ({d} cells)\n", .{t.restored});
+        }
+    }
+
     // Assistant sidecar (optional). Loaded only when `drafter_dir` is
     // non-empty. The sidecar KIND is decided by its config CONTRACT: a
     // config declaring block_size + mask_token_id + target_layer_ids is a
@@ -3457,6 +3494,15 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 if (h.bind(xfm_ptr)) {
                     mtp_ptr = h;
                     mtp_cost_profile = h.m5NaxCostProfile(xfm_ptr);
+                    // Price the DRAFT side. The verify ladder above measures
+                    // the trunk forward and nothing else, but an m-deep round
+                    // is that forward PLUS m sequential head steps — which on
+                    // a 27B dominate the per-position marginal. Fitting the
+                    // EV surface without this under-prices depth ~9x (live
+                    // 2026-08-21: forward marginal 0.8 ms/position against a
+                    // hand-measured composite of 7.6). A cached curve already
+                    // carries it, so this is paid once per (chip, model,
+                    // quant, OS build) like the ladder itself.
                     log.info("MTP head ready (depth={d}, profile={s}).\n", .{
                         generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile),
                         @tagName(mtp_cost_profile),
@@ -3562,6 +3608,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Resolve the auto (0) cap here so every downstream reader of
     // `lm.mtp_depth` (server log lines, slot params) sees the real value.
     entry.mtp_depth = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
+    xfm_ptr.mtp_depth_free = generate_mod.Generator.mtpDepthCapFree(params.mtp_depth);
     // A MERGED drafter has no `--drafter` to echo, so the reported path comes
     // from what was actually resolved — `drafter_loaded` and `drafter_path`
     // must not disagree about the same sidecar.
@@ -3756,7 +3803,26 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 gen_req = sch.gen_queue.orderedRemove(0);
             }
         }
-        for (cleanup_batch[0..cleanup_n]) |s| s.deinit();
+        for (cleanup_batch[0..cleanup_n]) |s| {
+            // Decode-phase cancel: `complete()` pulled this slot straight
+            // into the cleanup queue, so it never went through finishSlot
+            // and its committed KV (prompt + every emitted token) would die
+            // right here with the slot. Commit it first — the same guards
+            // as a normal finish apply inside (pad-only / error / vision /
+            // empty all decline) — then flush what was committed to the
+            // SSD tier, since no finishSlot will. Normally-finished slots
+            // arrive here with `finished` already set (finishSlot committed
+            // them) and skip; errored slots decline via the error guard.
+            // Runs on the inference thread — the sole mlx caller — which is
+            // what makes the refcount-sharing snapshot legal here.
+            if (s.cancelled.load(.acquire) and !s.finished and s.error_code == null) {
+                commitSlotIfApplicable(sch, s);
+                if (s.model.prefix_cache) |*hc| {
+                    if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);
+                }
+            }
+            s.deinit();
+        }
         if (vision_n > 0 or embed_n > 0) {
             for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
             for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
@@ -3922,14 +3988,15 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         finishVisionRequest(sch, req, "VisionEncoderNotLoaded");
         return;
     };
-    if (req.images.len == 0 and req.audio.len == 0) {
+    if (req.images.len == 0 and req.videos.len == 0 and req.audio.len == 0) {
         finishVisionRequest(sch, req, "EmptyImages");
         return;
     }
 
-    // Encode all soft tokens into `emb_parts`: vision first, then audio, so the
-    // single splice channel scatters them in the same order as the placeholder
-    // blocks the conn thread injected (image block before audio block).
+    // Encode all soft tokens into `emb_parts`: vision, then video, then audio,
+    // so the single splice channel scatters them in the same order as the
+    // placeholder blocks the conn thread injected (image block, then video
+    // block, then audio block).
     var emb_parts = std.ArrayList(mlx.mlx_array).empty;
     defer emb_parts.deinit(req.allocator);
     const failParts = struct {
@@ -3967,6 +4034,26 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         }
         const es = mlx.getShape(emb);
         n_vision += @intCast(es[1]);
+        emb_parts.append(req.allocator, emb) catch |err| {
+            _ = mlx.mlx_array_free(emb);
+            failParts(sch, req, emb_parts.items, @errorName(err));
+            return;
+        };
+    }
+
+    var n_video: usize = 0;
+    for (req.videos) |vid| {
+        const n: usize = @as(usize, vid.grid_t) * vid.grid_h * vid.grid_w;
+        const feat: usize = (vid.pixels.len / 4) / n;
+        const shape = [_]c_int{ @intCast(n), @intCast(feat) };
+        const pixel_arr = mlx.mlx_array_new_data(vid.pixels.ptr, &shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(pixel_arr);
+        const emb = vision_enc.forwardVideoPatches(pixel_arr, vid.grid_t, vid.grid_h, vid.grid_w) catch |err| {
+            failParts(sch, req, emb_parts.items, @errorName(err));
+            return;
+        };
+        const es = mlx.getShape(emb);
+        n_video += @intCast(es[1]);
         emb_parts.append(req.allocator, emb) catch |err| {
             _ = mlx.mlx_array_free(emb);
             failParts(sch, req, emb_parts.items, @errorName(err));
@@ -4035,6 +4122,7 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
     defer req.done_mu.unlock(sch.io);
     req.result = combined;
     req.n_vision_tokens = n_vision;
+    req.n_video_tokens = n_video;
     req.n_audio_tokens = n_audio;
     req.done = true;
     req.done_cond.broadcast(sch.io);
@@ -4318,11 +4406,27 @@ fn dflashContextCoversPrefix(context_len: usize, prefix_len: usize) bool {
 fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // Phase D: per-model prefix cache — read off the slot's LoadedModel.
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
-    if (slot.was_pad_only) return;
     if (slot.error_code != null) return;
     if (slot.vision_embeddings != null) return;
-    const gen_ptr = if (slot.legacy_gen) |*g| g else return;
-    if (gen_ptr.generated_ids.items.len == 0) return;
+    const gen_ptr = if (slot.legacy_gen) |*g| g else {
+        // A Generator-less slot whose cache is non-empty is a prefill the
+        // client disconnected from mid-chunk-loop: initWithOptions threw
+        // error.Cancelled before `slot.legacy_gen = gen` ever ran, but every
+        // chunk that DID forward still lives in slot.cache. Commit that
+        // forwarded prefix instead of dropping it. This arm sits ABOVE the
+        // pad-only guard: `was_pad_only` starts true and only flips on the
+        // first pushed token, so a slot that never pushed one is not
+        // pad-POISONED, it is merely empty.
+        return commitCancelledPrefillSlot(slot, hc);
+    };
+    const n_gen = gen_ptr.generated_ids.items.len;
+    if (n_gen > 0 and slot.was_pad_only) return;
+    // Zero emitted tokens is worth committing only when the client cancelled
+    // between prefill completion and the first token: the KV holds exactly
+    // the prompt (cache.step == prompt_len) and the next identical request
+    // skips the whole prefill. A normally-finished empty generation is the
+    // old no-op.
+    if (n_gen == 0 and !slot.cancelled.load(.acquire)) return;
 
     // Construct the full token sequence: the original prompt + everything
     // generated this turn. The cache reflects exactly this state — Generator
@@ -4384,6 +4488,41 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     };
 }
 
+/// Logical committed length for a cancelled-prefill commit: the tokens
+/// actually forwarded into the KV when the chunk loop aborted, clamped to
+/// the prompt and gated on the floor below which an entry is LRU pollution
+/// rather than saved work. Pure so the policy is unit-testable without a slot.
+fn cancelledPrefillCommitLen(step: usize, prompt_len: usize) ?usize {
+    const len = @min(step, prompt_len);
+    if (len < prefix_cache_mod.MIN_CANCELLED_COMMIT_TOKENS) return null;
+    return len;
+}
+
+/// Commit the forwarded prefix of a prefill the client disconnected from
+/// (error.Cancelled out of `Generator.initWithOptions`; `legacy_gen` was
+/// never assigned). The partial KV in `slot.cache` is valid — every chunk
+/// that ran was a real forward — so the next request sharing this prefix
+/// skips exactly those chunks. The entry key is the forwarded prefix ONLY:
+/// `full_prompt` beyond `cache.step` was never forwarded and must not ride
+/// the key (a key longer than its KV is the alignment-error class).
+///
+/// Hybrids are excluded: their stride SSM checkpoints die with the failed
+/// Generator init, and a checkpoint-less hybrid entry restores as a cold
+/// miss ("hybrid miss") while still occupying an LRU slot — strictly worse
+/// than not committing. decode-phase cancels keep their checkpoints (the
+/// Generator is alive and `takeSsmCheckpoints` still works) and commit
+/// through the normal arm above.
+fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache) void {
+    if (slot.ssm_entries != null) return;
+    const step: usize = @intCast(slot.cache.step);
+    const len = cancelledPrefillCommitLen(step, slot.full_prompt.len) orelse return;
+    hc.commit(&slot.cache, slot.full_prompt[0..len], slot.has_tools) catch |err| {
+        log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    log.info("[hot-cache] committed {d}/{d} prompt tokens from a cancelled prefill\n", .{ len, slot.full_prompt.len });
+}
+
 /// Phase A6: finalize a slot. Commits to hot prefix cache (if applicable)
 /// before signaling completion. The order matters: commit first while the
 /// slot is alive, then markFinished — the conn thread's waitNext might
@@ -4441,7 +4580,10 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
     // finalize here instead.
-    if (slot.legacy_gen) |*g| g.logSpecStats();
+    if (slot.legacy_gen) |*g| {
+        g.logSpecStats();
+        g.persistRoundCost();
+    }
     commitSlotIfApplicable(sch, slot);
     // SSD flush runs AFTER markFinished so the client never waits on the
     // chunk-append — but everything it needs must be captured BEFORE the
@@ -4826,14 +4968,28 @@ fn runDiffusionDecodeTick(sch: *Scheduler, slot: *Slot, runner: *diffusion_mod.R
 /// draft positions. `block_size` includes the always-emitted anchor. Thinking
 /// is the actual resolved request mode; tools are neither necessary nor
 /// sufficient for a reasoning preamble.
-fn dflashGateMinimum(block_size: u32, enable_thinking: bool) f32 {
+fn dflashGateMinimum(block_size: u32, enable_thinking: bool, moe_target: bool) f32 {
     const drafts = block_size -| 1;
     if (drafts == 0) return 0;
     const calibrated_min = if (enable_thinking)
         generate_mod.Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND
     else
         generate_mod.Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND;
-    return calibrated_min * @as(f32, @floatFromInt(drafts)) / 15.0;
+    const scaled = calibrated_min * @as(f32, @floatFromInt(drafts)) / 15.0;
+    // The bar is really "round cost / serial step cost", and the whole
+    // calibration above was measured on DENSE trunks where one verify forward
+    // costs about one serial step. A sparse trunk breaks that: an A1B MoE
+    // decodes ~1B of weights per token but its verify reads every expert the
+    // block's positions route to, so a round costs far more than a step while
+    // the bar stayed at 0.53 and nothing ever disabled.
+    //
+    // Measured LFM2.5-8B-A1B + its DSpark sidecar, M4 Max, block 5, greedy:
+    // novel prose accepts 1.40/round and runs 171 tok/s against 199 serial
+    // (round cost = 1.40 x 199/171 = 1.63 steps), while an echo prompt accepts
+    // 4.00 and runs 273. A floor of 1.8 disables the losing class after its
+    // three warmup rounds and leaves the winning one untouched.
+    if (!moe_target) return scaled;
+    return @max(scaled, generate_mod.Generator.DFLASH_MOE_GATE_MIN_ACCEPTED_PER_ROUND);
 }
 
 /// Allocate the slot's KVCache state (already done in Slot.init), construct
@@ -5084,6 +5240,16 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // out of prefill_ns below (the decoding slots got the time).
     var interleave_ctx = InterleaveCtx{ .sch = sch };
 
+    // Ownership of the restored spec caches transfers AT THE CALL:
+    // initWithOptions adopts them and frees them via its own errdefers on
+    // any failure past adoption (a mid-prefill disconnect throws
+    // error.Cancelled from its chunk loop). MtpCacheRef/DflashCtx hold the
+    // KVCache BY VALUE, so a second deinit from our errdefers walked freed
+    // mlx handles — SIGSEGV in freeKVEntry (issue #266). Clear FIRST.
+    const dflash_pass = dflash_restored;
+    dflash_restored = null;
+    const mtp_pass = mtp_restored;
+    mtp_restored = null;
     var gen = try Generator.initWithOptions(
         sch.io,
         slot.allocator,
@@ -5107,6 +5273,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .dflash_min_accepted_per_round = dflashGateMinimum(
                 slot.drafter_block_size,
                 slot.enable_thinking,
+                slot.model.config.?.isMoe(),
             ),
             .mtp_enabled = use_mtp,
             .mtp = if (use_mtp) slot.mtp else null,
@@ -5126,8 +5293,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // `server.pinPrefillChunk` writes and `checkAttentionMemory`
             // reads, so the forward can never run wider than the bill.
             .pinned_prefill_chunk = if (slot.model.config) |c| c.pinned_prefill_chunk else 0,
-            .dflash_ctx_restored = dflash_restored,
-            .mtp_cache_restored = mtp_restored,
+            .dflash_ctx_restored = dflash_pass,
+            .mtp_cache_restored = mtp_pass,
             // Abandoned-prefill abort: the conn thread sets slot.cancelled
             // when the client disconnects; the chunk loop checks it between
             // chunks so a ghost 40K prefill stops within one chunk.
@@ -5143,8 +5310,6 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .logprobs_n = slot.logprobs_n,
         },
     );
-    dflash_restored = null; // ownership transferred to the Generator
-    mtp_restored = null; // ownership transferred to the Generator
     slot.prefill_interleaved_ns = interleave_ctx.decode_ns;
     gen.timeout_ns = slot.timeout_ns;
     gen.logprobs_n = slot.logprobs_n;
@@ -5187,6 +5352,13 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     // and O(active), never per token. Finished slots are excluded, so the last
     // slot's completion drives this to 0 (live == total at rest).
     defer sch.inflight_generated_tokens.store(sumInflightGeneratedTokens(active), .monotonic);
+
+    // Contention discipline for the spec cost model's kv term: it learns
+    // from realized round times, and contention only ever ADDS time. Rather
+    // than try to correct for it, a busy server simply stops sampling.
+    for (active) |s| {
+        if (s.legacy_gen) |*g| g.spec_cost_solo = active.len == 1;
+    }
 
     // Phase 3 gate: at len==1, route to legacy single-slot path. Bit-identical
     // to pre-Phase-2 behavior including PLD/drafter speculative decoding.
@@ -5585,16 +5757,111 @@ test "DFlash cache payload is committed only when it spans the trunk prefix" {
     try testing.expect(std.mem.indexOf(u8, body, "dflashContextCoversPrefix(dc.absLen(), total_len)") != null);
 }
 
+test "cancelled-prefill commit length: floor, clamp, and zero" {
+    // A cancelled prefill only pays its way into the LRU once the forwarded
+    // prefix is past the chat-template-prologue class (~dozens of tokens);
+    // below the floor the entry is pollution, not saved work.
+    try testing.expect(cancelledPrefillCommitLen(0, 1000) == null);
+    try testing.expect(cancelledPrefillCommitLen(1, 1000) == null);
+    try testing.expect(cancelledPrefillCommitLen(255, 1000) == null);
+    try testing.expectEqual(@as(?usize, 256), cancelledPrefillCommitLen(256, 1000));
+    try testing.expectEqual(@as(?usize, 300), cancelledPrefillCommitLen(300, 1000));
+    // cache.step can never exceed the prompt (restore clamps to matched and
+    // chunks stop at the tail); clamp defensively anyway so a bad step can
+    // never key tokens the KV does not hold.
+    try testing.expectEqual(@as(?usize, 1000), cancelledPrefillCommitLen(5000, 1000));
+    // A short prompt is not worth an entry at any step.
+    try testing.expect(cancelledPrefillCommitLen(50, 50) == null);
+}
+
+test "the cleanup drain commits a cancelled slot before deinit" {
+    // Class guard: a decode-phase cancel is pulled straight into the cleanup
+    // queue by `complete()` and NEVER passes through finishSlot — without a
+    // commit in the drain, its prompt+generated KV dies with the slot. The
+    // commit must run BEFORE deinit (the snapshot refcount-shares live
+    // buffers; after deinit they are freed).
+    const source = @embedFile("scheduler.zig");
+    const drain_start = std.mem.indexOf(u8, source, "for (cleanup_batch[0..cleanup_n])") orelse return error.MissingCleanupDrain;
+    const region = source[drain_start..@min(drain_start + 1600, source.len)];
+    const commit_pos = std.mem.indexOf(u8, region, "commitSlotIfApplicable") orelse return error.DrainDoesNotCommit;
+    const deinit_pos = std.mem.indexOf(u8, region, ".deinit()") orelse return error.MissingDeinit;
+    try testing.expect(commit_pos < deinit_pos);
+    // The SSD tier has no finishSlot flush on this path — the drain must
+    // flush what it just committed itself.
+    try testing.expect(std.mem.indexOf(u8, region, "flushPendingDisk") != null);
+}
+
+test "commitSlotIfApplicable routes a Generator-less slot to the cancelled-prefill commit" {
+    // Prefill abort: `Generator.initWithOptions` throws error.Cancelled from
+    // its chunk loop, so `slot.legacy_gen` is never assigned — the legacy
+    // `else return` silently dropped every chunk that DID forward. The
+    // cancelled-prefill arm must be reachable from commitSlotIfApplicable,
+    // and hybrids are excluded inside it (their stride checkpoints die with
+    // the failed Generator init; a checkpoint-less hybrid entry restores as
+    // a cold miss while still occupying an LRU slot).
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn finishSlot(") orelse return error.MissingFinishSlot;
+    const body = source[start..end];
+    const route_pos = std.mem.indexOf(u8, body, "commitCancelledPrefillSlot") orelse return error.MissingRoute;
+    // `was_pad_only` initializes TRUE and only flips on the first pushed
+    // token, so a guard on it ABOVE the Generator-less arm makes that arm
+    // unreachable (live 2026-08-22: "prefill aborted" logged, nothing
+    // committed, full re-prefill on retry).
+    const pad_pos = std.mem.indexOf(u8, body, "slot.was_pad_only") orelse return error.MissingPadGuard;
+    try testing.expect(route_pos < pad_pos);
+    // A cancel landing between prefill completion and the first token has a
+    // live Generator with zero emitted tokens and a KV holding the prompt.
+    try testing.expect(std.mem.indexOf(u8, body, "n_gen == 0 and !slot.cancelled") != null);
+
+    const cp_start = std.mem.indexOf(u8, source, "fn commitCancelledPrefillSlot(") orelse return error.MissingCancelledPrefillFn;
+    const cp_end = std.mem.indexOfPos(u8, source, cp_start + 1, "\nfn ") orelse return error.MissingCancelledPrefillEnd;
+    const cp_body = source[cp_start..cp_end];
+    try testing.expect(std.mem.indexOf(u8, cp_body, "ssm_entries != null") != null);
+    try testing.expect(std.mem.indexOf(u8, cp_body, "cancelledPrefillCommitLen") != null);
+}
+
+test "runPrefill clears restored spec-cache ownership BEFORE Generator.initWithOptions (issue #266)" {
+    // Generator.initWithOptions ADOPTS the hot-cache-restored DFlash/MTP
+    // caches and frees them via its own errdefers on any failure past the
+    // adoption point — a mid-prefill client disconnect throws
+    // error.Cancelled from its chunk loop. MtpCacheRef/DflashCtx hold their
+    // KVCache BY VALUE, so runPrefill's own errdefers then walked the same
+    // entries slice + mlx handles a second time: SIGSEGV in
+    // KVCache.deinit -> freeKVEntry (issue #266, disconnect storms on long
+    // agent prompts). Ownership transfers AT THE CALL, so the locals must
+    // be cleared before the try, never after it.
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn runPrefill(") orelse return error.MissingRunPrefill;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingRunPrefillEnd;
+    const body = source[start..end];
+    const call = std.mem.indexOf(u8, body, "try Generator.initWithOptions(") orelse return error.MissingInitCall;
+    const dfl = std.mem.indexOf(u8, body, "dflash_restored = null") orelse return error.MissingDflashClear;
+    const mtp = std.mem.indexOf(u8, body, "mtp_restored = null") orelse return error.MissingMtpClear;
+    try testing.expect(dfl < call);
+    try testing.expect(mtp < call);
+}
+
 test "DFlash gate policy follows effective block width and resolved thinking" {
     // block_size includes the always-emitted anchor, so block 16 has 15 draft
     // positions and block 7 has 6. The M5 calibration is normalized to that
     // actual draft width instead of being imposed as an absolute threshold on
     // machines without the wide verification lane.
-    try testing.expectApproxEqAbs(@as(f32, 2.0), dflashGateMinimum(16, false), 0.0001);
-    try testing.expectApproxEqAbs(@as(f32, 1.0), dflashGateMinimum(16, true), 0.0001);
-    try testing.expectApproxEqAbs(@as(f32, 0.8), dflashGateMinimum(7, false), 0.0001);
-    try testing.expectApproxEqAbs(@as(f32, 0.4), dflashGateMinimum(7, true), 0.0001);
-    try testing.expectEqual(@as(f32, 0), dflashGateMinimum(1, false));
+    try testing.expectApproxEqAbs(@as(f32, 2.0), dflashGateMinimum(16, false, false), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), dflashGateMinimum(16, true, false), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.8), dflashGateMinimum(7, false, false), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.4), dflashGateMinimum(7, true, false), 0.0001);
+    try testing.expectEqual(@as(f32, 0), dflashGateMinimum(1, false, false));
+
+    // A SPARSE target's verify reads every expert its block routes to, so the
+    // dense width scaling under-bars it: at block 5 the scaled value is 0.53
+    // and LFM2.5-8B-A1B measured break-even at 1.63 accepted/round. The floor
+    // binds there and in the thinking arm, and never lowers a bar the width
+    // scaling already set higher.
+    try testing.expectApproxEqAbs(@as(f32, 1.8), dflashGateMinimum(5, false, true), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 1.8), dflashGateMinimum(5, true, true), 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), dflashGateMinimum(16, false, true), 0.0001);
+    try testing.expectEqual(@as(f32, 0), dflashGateMinimum(1, false, true));
 }
 
 test "every server scheduler path forwards resolved thinking to the DFlash gate" {

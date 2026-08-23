@@ -15,6 +15,8 @@ const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
 const qwen_vision = @import("qwen_vision.zig");
+const QwenVision = qwen_vision.QwenVision;
+const QBlock = qwen_vision.QBlock;
 
 test "qwen vision tower prefix and patch_embed layout are PROBED, not hardcoded" {
     const allocator = std.testing.allocator;
@@ -156,4 +158,149 @@ test "qwen vision parity vs reference embeddings (QWEN_VISION_TEST_MODEL)" {
     // real bugs (a structural bug blows up mean_abs by 10-100x).
     try std.testing.expect(mean_abs < 0.02);
     try std.testing.expect(gt_030 < ref.len / 1000); // <0.1% of elements may exceed 0.30
+}
+
+test "qwen forwardVideo == per-group forward()+concat (self-consistency)" {
+    // No hermetic reference exists for ViT-forward CORRECTNESS (that needs a
+    // trained checkpoint — see the QWEN_VISION_TEST_MODEL-gated parity test
+    // above). What IS hermetically checkable, and what's new in this task, is
+    // the forwardVideo WRAPPER: does it slice `grid_t` temporal-patch groups
+    // out of the concatenated patches array and route each through the
+    // existing, unmodified single-group `forward` correctly? This builds a
+    // tiny synthetic tower (weight VALUES are arbitrary) and asserts
+    // forwardVideo(3 groups) is bit-identical to manually slicing+forward()ing
+    // each group and concatenating — the exact operation forwardVideo performs
+    // internally, so any slicing/indexing bug in the wrapper shows up here.
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+
+    const mkArr = struct {
+        fn f(shape: []const c_int, val_base: f32) mlx.mlx_array {
+            var buf: [64]f32 = undefined;
+            var total: usize = 1;
+            for (shape) |d| total *= @intCast(d);
+            for (0..total) |i| buf[i] = val_base + @as(f32, @floatFromInt(i)) * 0.01;
+            return mlx.mlx_array_new_data(&buf, shape.ptr, @intCast(shape.len), .float32);
+        }
+    }.f;
+
+    // hidden=4, 1 head of head_dim=4, depth=1, merge=1 (no reduction — keeps
+    // token counts trivial), grid 2x2 (n=4 patches/group) matching
+    // num_grid_per_side=2 exactly (identity pos-embed interpolation).
+    const hidden = [_]c_int{4};
+    const hidden2 = [_]c_int{ 4, 4 };
+    const qkv_w_shape = [_]c_int{ 12, 4 };
+    const qkv_b_shape = [_]c_int{12};
+    const patch_w_shape = [_]c_int{ 4, 1 };
+    const pos_shape = [_]c_int{ 4, 4 };
+
+    var qv = QwenVision{
+        .s = s,
+        .allocator = a,
+        .depth = 1,
+        .hidden = 4,
+        .heads = 1,
+        .head_dim = 4,
+        .merge = 1,
+        .num_grid_per_side = 2,
+        .out_hidden = 4,
+        .patch_w = mkArr(&patch_w_shape, 0.1),
+        .patch_b = mkArr(&hidden, 0.0),
+        .pos_embed = mkArr(&pos_shape, 0.2),
+        .blocks = try a.alloc(QBlock, 1),
+        .merger_norm_w = mkArr(&hidden, 1.0),
+        .merger_norm_b = mkArr(&hidden, 0.0),
+        .merger_fc1_w = mkArr(&hidden2, 0.05),
+        .merger_fc1_b = mkArr(&hidden, 0.0),
+        .merger_fc2_w = mkArr(&hidden2, 0.05),
+        .merger_fc2_b = mkArr(&hidden, 0.0),
+    };
+    qv.blocks[0] = .{
+        .norm1_w = mkArr(&hidden, 1.0),
+        .norm1_b = mkArr(&hidden, 0.0),
+        .norm2_w = mkArr(&hidden, 1.0),
+        .norm2_b = mkArr(&hidden, 0.0),
+        .qkv_w = mkArr(&qkv_w_shape, 0.03),
+        .qkv_b = mkArr(&qkv_b_shape, 0.0),
+        .proj_w = mkArr(&hidden2, 0.04),
+        .proj_b = mkArr(&hidden, 0.0),
+        .fc1_w = mkArr(&hidden2, 0.02),
+        .fc1_b = mkArr(&hidden, 0.0),
+        .fc2_w = mkArr(&hidden2, 0.02),
+        .fc2_b = mkArr(&hidden, 0.0),
+    };
+    defer {
+        _ = mlx.mlx_array_free(qv.patch_w);
+        _ = mlx.mlx_array_free(qv.patch_b);
+        _ = mlx.mlx_array_free(qv.pos_embed);
+        _ = mlx.mlx_array_free(qv.merger_norm_w);
+        _ = mlx.mlx_array_free(qv.merger_norm_b);
+        _ = mlx.mlx_array_free(qv.merger_fc1_w);
+        _ = mlx.mlx_array_free(qv.merger_fc1_b);
+        _ = mlx.mlx_array_free(qv.merger_fc2_w);
+        _ = mlx.mlx_array_free(qv.merger_fc2_b);
+        for (qv.blocks) |b| {
+            _ = mlx.mlx_array_free(b.norm1_w);
+            _ = mlx.mlx_array_free(b.norm1_b);
+            _ = mlx.mlx_array_free(b.norm2_w);
+            _ = mlx.mlx_array_free(b.norm2_b);
+            _ = mlx.mlx_array_free(b.qkv_w);
+            _ = mlx.mlx_array_free(b.qkv_b);
+            _ = mlx.mlx_array_free(b.proj_w);
+            _ = mlx.mlx_array_free(b.proj_b);
+            _ = mlx.mlx_array_free(b.fc1_w);
+            _ = mlx.mlx_array_free(b.fc1_b);
+            _ = mlx.mlx_array_free(b.fc2_w);
+            _ = mlx.mlx_array_free(b.fc2_b);
+        }
+        a.free(qv.blocks);
+    }
+
+    // grid_t=3 groups of a 2x2 grid (n=4 patches/group, feat=1) — 12 rows total.
+    const grid_t: u32 = 3;
+    const n_per_group: usize = 4;
+    var patches_buf: [12]f32 = undefined;
+    for (0..12) |i| patches_buf[i] = @as(f32, @floatFromInt(i)) * 0.1;
+    const all_shape = [_]c_int{ 12, 1 };
+    const patches_all = mlx.mlx_array_new_data(&patches_buf, &all_shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(patches_all);
+
+    const out_video = try qv.forwardVideo(patches_all, grid_t, 2, 2);
+    defer _ = mlx.mlx_array_free(out_video);
+
+    // Manual reference: slice each group from the SAME source buffer, call
+    // forward() directly, concatenate along the token axis.
+    var manual_parts: [3]mlx.mlx_array = undefined;
+    for (0..grid_t) |g| {
+        const group_shape = [_]c_int{ @intCast(n_per_group), 1 };
+        const group_arr = mlx.mlx_array_new_data(patches_buf[g * n_per_group ..].ptr, &group_shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(group_arr);
+        manual_parts[g] = try qv.forward(group_arr, 2, 2);
+    }
+    defer for (manual_parts) |p| { _ = mlx.mlx_array_free(p); };
+    const cat_vec = mlx.mlx_vector_array_new_data(&manual_parts, manual_parts.len);
+    defer _ = mlx.mlx_vector_array_free(cat_vec);
+    var out_manual = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out_manual);
+    try mlx.check(mlx.mlx_concatenate_axis(&out_manual, cat_vec, 1, s));
+
+    var v_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v_f32);
+    try mlx.check(mlx.mlx_astype(&v_f32, out_video, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(v_f32));
+    var m_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(m_f32);
+    try mlx.check(mlx.mlx_astype(&m_f32, out_manual, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(m_f32));
+
+    const v_shape = mlx.getShape(v_f32);
+    const m_shape = mlx.getShape(m_f32);
+    try std.testing.expectEqualSlices(c_int, m_shape, v_shape);
+    try std.testing.expectEqual(@as(c_int, 1), v_shape[0]);
+    try std.testing.expectEqual(@as(c_int, 12), v_shape[1]); // 3 groups × 4 merged tokens (merge=1)
+
+    const v_data = mlx.mlx_array_data_float32(v_f32) orelse return error.TestUnexpectedNullData;
+    const m_data = mlx.mlx_array_data_float32(m_f32) orelse return error.TestUnexpectedNullData;
+    const total: usize = 12 * 4; // tokens × out_hidden
+    try std.testing.expectEqualSlices(f32, m_data[0..total], v_data[0..total]);
 }

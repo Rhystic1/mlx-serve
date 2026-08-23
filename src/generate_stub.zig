@@ -208,6 +208,9 @@ pub const Generator = struct {
     /// (sidecars are trained on reasoning-mode output), never on has_tools.
     pub const DFLASH_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 2.0;
     pub const DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.0;
+    /// MoE targets verify at a lower per-round bar: their trunk forward is
+    /// cheaper relative to the drafter, so a block pays for itself sooner.
+    pub const DFLASH_MOE_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.8;
 
     // Fields the scheduler and the HTTP layer read directly off a live
     // generator. Inert: `init` never returns one. Named and typed to match

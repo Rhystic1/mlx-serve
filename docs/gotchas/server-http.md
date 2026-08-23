@@ -1393,3 +1393,31 @@ joined in order with `'\n'` (matching the Responses parser and the Anthropic
 user arm), single-part borrows the JSON's bytes / 2+ parts allocate
 (`{text, owned}`, the provenance rule), wired at all three sites. Guard:
 unit tests on the exact opencode two-part shape.
+
+
+## An adopted spec cache has ONE owner at a time (issue #266)
+
+SIGSEGV in `KVCache.deinit -> freeKVEntry -> mlx_array_free` on the inference
+thread, during long agent sessions with hot-cache hits + MTP/DFlash, typically
+in a client-disconnect storm (repeated retries of a 100k+ prompt, each
+cancelled mid-prefill).
+
+`scheduler.runPrefill` restores the MTP history / DFlash context from the hot
+prefix cache into locals guarded by `errdefer ... .deinit()`, then hands them
+to `Generator.initWithOptions` — which adopts them and ALSO guards them with
+its own `errdefer`. Any init failure past the adoption point (the common one:
+`error.Cancelled` from the chunk loop when the conn thread flags the slot on
+disconnect) frees them inside the generator; the `try` then unwinds
+runPrefill's errdefers and frees them AGAIN. `MtpCacheRef` and `DflashCtx`
+hold their `KVCache` by value, so both copies share one entries slice and the
+same mlx handles: the second `freeKVEntry` walks freed array ctxs — an
+EXC_BAD_ACCESS several frames from the disconnect that caused it (the
+`KVCache.reinit` class again, in cross-function form). It only bites on the
+restored path — a hot-cache MISS builds the caches inside the generator, where
+one errdefer owns them.
+
+Fix: ownership transfers AT THE CALL. runPrefill moves the restored caches
+into `dflash_pass`/`mtp_pass` and nulls the errdefer-guarded locals BEFORE the
+`try`, so on failure exactly one owner (the generator) frees them. Guard:
+`scheduler.zig` test "runPrefill clears restored spec-cache ownership BEFORE
+Generator.initWithOptions (issue #266)" pins the clear-before-call ordering.

@@ -856,13 +856,6 @@ test "PldDefaults: ServerConfig built from it reports the CLI values" {
 /// hoarding token buffers across a long session.
 pub var tokenize_cache_entries: u32 = 4;
 
-/// Image-generation NSFW content filter (Krea 2 Community License §4.2). ON by
-/// default; `--no-safety` disables it process-wide, or a request can opt out with
-/// `"safety": false`. The classifier (Falconsai ViT, src/nsfw.zig) is lazy-loaded
-/// from `~/.mlx-serve/models`; if it's unavailable the server fails OPEN (warns +
-/// passes the image through).
-pub var image_safety_filter: bool = true;
-
 /// Iteration 3-5 (perf-plan Phase 5 #1): cap on resident llama.cpp KV
 /// sessions per loaded GGUF model. 1 is the legacy single-session
 /// behavior (a flip between two long-doc prompts evicts the other on
@@ -3429,6 +3422,7 @@ fn renderModelEntry(
         defer mods.deinit(allocator);
         try mods.appendSlice(allocator, "[\"text\"");
         if (has_vision) try mods.appendSlice(allocator, ",\"image\"");
+        if (has_vision and config.video_token_id != 0) try mods.appendSlice(allocator, ",\"video\"");
         if (has_audio) try mods.appendSlice(allocator, ",\"audio\"");
         try mods.append(allocator, ']');
 
@@ -3586,7 +3580,9 @@ fn renderModelEntry(
     };
     defer allocator.free(caps_part);
 
-    const mods_part: []const u8 = if (sm.found and sm.has_vision)
+    const mods_part: []const u8 = if (sm.found and sm.has_vision and sm.has_video)
+        ",\"input_modalities\":[\"text\",\"image\",\"video\"]"
+    else if (sm.found and sm.has_vision)
         ",\"input_modalities\":[\"text\",\"image\"]"
     else if ((sm.found and sm.has_chat) or is_gguf_stub)
         ",\"input_modalities\":[\"text\"]"
@@ -3906,7 +3902,7 @@ const GenJob = struct {
 fn genJobRun(ctx: *anyopaque) void {
     const job: *GenJob = @ptrCast(@alignCast(ctx));
     const result = switch (job.route) {
-        .image => if (job.lm.image_engine) |e| media_mod.handleImage(job.conn.io, job.allocator, job.conn, job.body, e) else error.WrongModality,
+        .image => if (job.lm.image_engine) |e| media_mod.handleImage(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .speech => if (job.lm.audio_engine) |e| media_mod.handleAudio(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .music => if (job.lm.audio_engine) |e| media_mod.handleMusic(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .video => if (job.lm.video_engine) |e| media_mod.handleVideo(job.conn.io, job.allocator, job.conn, job.body, e) else error.WrongModality,
@@ -4948,11 +4944,13 @@ fn handleChatCompletions(
         // Content can be null for assistant messages with tool_calls
         const content_val = obj.get("content");
         var msg_images: ?[]const chat_mod.ImageData = null;
+        var msg_videos: ?[]const chat_mod.VideoData = null;
         var msg_audio: ?[]const chat_mod.AudioData = null;
         const content: []const u8 = if (content_val) |cv| switch (cv) {
             .string => |s| s,
             .array => |arr| blk: {
                 var image_list = std.ArrayList(chat_mod.ImageData).empty;
+                var video_list = std.ArrayList(chat_mod.VideoData).empty;
                 var audio_list = std.ArrayList(chat_mod.AudioData).empty;
                 for (arr.items) |part| {
                     if (part != .object) continue;
@@ -4965,6 +4963,21 @@ fn handleChatCompletions(
                         const url_val = img_obj.object.get("url") orelse continue;
                         if (url_val != .string) continue;
                         appendImageUrlContent(allocator, &image_list, url_val.string, visionPreprocFromConfig(config));
+                    } else if (std.mem.eql(u8, ptype.string, "video_url")) {
+                        // A video is, on the wire, an ordered array of already-
+                        // decoded frame images — no video codec exists anywhere
+                        // in this codebase, so frame extraction is the CLIENT's
+                        // job. Each frame string is an ordinary image data URL.
+                        const vid_obj = part.object.get("video_url") orelse continue;
+                        if (vid_obj != .object) continue;
+                        const frames_val = vid_obj.object.get("frames") orelse continue;
+                        if (frames_val != .array) continue;
+                        var frame_urls = std.ArrayList([]const u8).empty;
+                        defer frame_urls.deinit(allocator);
+                        for (frames_val.array.items) |f| {
+                            if (f == .string) frame_urls.append(allocator, f.string) catch continue;
+                        }
+                        appendVideoUrlContent(allocator, &video_list, frame_urls.items, visionPreprocFromConfig(config));
                     } else if (std.mem.eql(u8, ptype.string, "input_audio")) {
                         // OpenAI-style audio block. For the Gemma 4 12B unified
                         // engine the client sends raw 16 kHz mono float32-LE PCM
@@ -4985,6 +4998,11 @@ fn handleChatCompletions(
                     msg_images = image_list.toOwnedSlice(allocator) catch null;
                 } else {
                     image_list.deinit(allocator);
+                }
+                if (video_list.items.len > 0) {
+                    msg_videos = video_list.toOwnedSlice(allocator) catch null;
+                } else {
+                    video_list.deinit(allocator);
                 }
                 if (audio_list.items.len > 0) {
                     msg_audio = audio_list.toOwnedSlice(allocator) catch null;
@@ -5040,8 +5058,8 @@ fn handleChatCompletions(
         else
             null;
 
-        // Skip messages with no content, no tool_calls, and no images/audio
-        if (content.len == 0 and msg_tool_calls == null and msg_images == null and msg_audio == null and msg_reasoning == null and !std.mem.eql(u8, role_val.string, "tool")) continue;
+        // Skip messages with no content, no tool_calls, and no images/videos/audio
+        if (content.len == 0 and msg_tool_calls == null and msg_images == null and msg_videos == null and msg_audio == null and msg_reasoning == null and !std.mem.eql(u8, role_val.string, "tool")) continue;
 
         try messages.append(allocator, .{
             .role = role_val.string,
@@ -5049,6 +5067,7 @@ fn handleChatCompletions(
             .tool_calls = msg_tool_calls,
             .tool_call_id = tool_call_id,
             .images = msg_images,
+            .videos = msg_videos,
             .audio = msg_audio,
             .reasoning_content = msg_reasoning,
         });
@@ -5331,7 +5350,7 @@ fn handleChatCompletions(
         log.info("  drafter=disabled (logprobs requested)\n", .{});
         enable_drafter = false;
     }
-    if (enable_drafter and config.has_hybrid_layers) {
+    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) {
         log.info("  drafter=disabled (hybrid SSM architecture not yet supported for multi-token verify)\n", .{});
         enable_drafter = false;
     }
@@ -5414,13 +5433,14 @@ fn handleChatCompletions(
     }
     if (lm.vision_encoder) |ve| {
         var n_vis: usize = 0;
+        var n_vid: usize = 0;
         var n_aud: usize = 0;
-        local_ve = processVisionImages(allocator, lm, ve, messages.items, &n_vis, &n_aud) catch |err| blk: {
+        local_ve = processVisionImages(allocator, lm, ve, messages.items, &n_vis, &n_vid, &n_aud) catch |err| blk: {
             log.warn("Vision encoding failed: {}\n", .{err});
             break :blk null;
         };
         if (local_ve != null) {
-            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.audio_token_id, n_aud, config, messages.items);
+            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, messages.items);
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
@@ -5685,7 +5705,7 @@ fn handleCompletions(
     else
         (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
     if (enable_drafter and lm.drafter == null and lm.dflash == null) enable_drafter = false;
-    if (enable_drafter and config.has_hybrid_layers) enable_drafter = false;
+    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
     if (enable_drafter and enable_pld) enable_pld = false;
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
@@ -5891,7 +5911,7 @@ fn handleStreamingCompletion(
     var timer = Stopwatch.init(stream.io);
 
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -6788,13 +6808,26 @@ const StreamingTokenStream = struct {
 /// logprobs, no grammar constraint, no hybrid SSM for drafter) apply at the
 /// request-entry parse site; `pickStreamMode` re-enforces them defensively
 /// here so a missed gate at the parse site doesn't crash the dispatch.
+/// Does this trunk's architecture rule the loaded assistant sidecar out?
+///
+/// The hybrid veto exists for the GEMMA cross-attention drafter, whose
+/// multi-token verify was never wired for a recurrent trunk. A DFlash/DSpark
+/// sidecar is a different mechanism — it reads the trunk's own layer captures
+/// and rolls the conv state back from the verify pass's per-position capture
+/// — so a hybrid target is exactly what LiquidAI ships DSpark FOR. ONE
+/// predicate, because this gate is re-derived on four request surfaces and a
+/// missed site decodes serial with everything else looking healthy.
+pub fn archBlocksAssistantSidecar(has_hybrid_layers: bool, dflash_loaded: bool) bool {
+    return has_hybrid_layers and !dflash_loaded;
+}
+
 fn pickStreamMode(
     enable_pld: bool,
     enable_drafter: bool,
     enable_mtp: bool,
     drafter_loaded: bool,
     mtp_loaded: bool,
-    has_hybrid_layers: bool,
+    arch_blocks_sidecar: bool,
     has_constraint: bool,
     logprobs_n: u32,
 ) StreamMode {
@@ -6802,7 +6835,7 @@ fn pickStreamMode(
     // to the trunk, so no extra arch gates here; the GDN/SSM rollback path
     // it needs is the same one PLD uses.
     if (enable_mtp and mtp_loaded and logprobs_n == 0 and !has_constraint) return .mtp;
-    if (enable_drafter and drafter_loaded and logprobs_n == 0 and !has_constraint and !has_hybrid_layers) return .drafter;
+    if (enable_drafter and drafter_loaded and logprobs_n == 0 and !has_constraint and !arch_blocks_sidecar) return .drafter;
     if (enable_pld and logprobs_n == 0 and !has_constraint) return .pld;
     return .regular;
 }
@@ -6870,7 +6903,7 @@ fn handleStreamingGeneration(
     // which feeds `next` (regular), `nextPld` (1..1+draft_len tokens/step),
     // or `nextDrafter` (1..block_size tokens/step) through the same
     // one-token-at-a-time interface.
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -8546,6 +8579,26 @@ test "every continuation surface consults continuationRejectReason before render
     try std.testing.expectEqual(@as(usize, 2), count);
 }
 
+test "every input_modalities gate that advertises image beside a video-capable model also advertises video" {
+    // Video piggybacks the SAME "does this model take image input?" signal —
+    // Qwen3-VL-family checkpoints declare `video_token_id` alongside
+    // `vision_config`/`vision_encoder` — so a future edit to either the READY
+    // (live config) or STUB (unloaded, config.json-only) input_modalities
+    // builder that touches the image gate but forgets video would silently
+    // under-report every video-capable model to the app forever (the attach
+    // menu's video option reads exactly this field). Two independent checks:
+    // the two sites read DIFFERENT underlying signals (config.video_token_id
+    // vs StubMeta.has_video) and must each carry their own gate.
+    const src = @embedFile("server.zig");
+
+    const ready_anchor = "if (has_vision) try mods.appendSlice(allocator, ";
+    const ready_at = std.mem.indexOf(u8, src, ready_anchor) orelse return error.ReadyImageGateMissing;
+    const ready_window = src[ready_at .. ready_at + 260];
+    try std.testing.expect(std.mem.indexOf(u8, ready_window, "video_token_id") != null);
+
+    try std.testing.expect(std.mem.indexOf(u8, src, "sm.found and sm.has_vision and sm.has_video") != null);
+}
+
 test "routeExists answers endpoint existence without consulting the model" {
     // Whether a path EXISTS has nothing to do with which models are loaded, but
     // model resolution runs ahead of dispatch — so on a headless boot (`--serve
@@ -9381,30 +9434,35 @@ fn processVisionImages(
     vision_enc: *VisionEncoder,
     msgs: []const chat_mod.Message,
     out_n_vision: *usize,
+    out_n_video: *usize,
     out_n_audio: *usize,
 ) !?mlx.mlx_array {
     out_n_vision.* = 0;
+    out_n_video.* = 0;
     out_n_audio.* = 0;
     // Only process media from the LAST user message. Previous turns' images /
-    // audio were already processed in their original request; re-processing
-    // wastes context and causes stale feature confusion.
+    // videos / audio were already processed in their original request;
+    // re-processing wastes context and causes stale feature confusion.
     var last_user_images: ?[]const chat_mod.ImageData = null;
+    var last_user_videos: ?[]const chat_mod.VideoData = null;
     var last_user_audio: ?[]const chat_mod.AudioData = null;
     var i = msgs.len;
     while (i > 0) {
         i -= 1;
         if (std.mem.eql(u8, msgs[i].role, "user")) {
             last_user_images = msgs[i].images;
+            last_user_videos = msgs[i].videos;
             last_user_audio = msgs[i].audio;
             break;
         }
     }
 
     const images: []const chat_mod.ImageData = last_user_images orelse &.{};
+    const videos: []const chat_mod.VideoData = last_user_videos orelse &.{};
     const audio: []const chat_mod.AudioData = last_user_audio orelse &.{};
-    if (images.len == 0 and audio.len == 0) return null;
+    if (images.len == 0 and videos.len == 0 and audio.len == 0) return null;
 
-    log.info("Multimodal: processing {d} image(s), {d} audio clip(s)\n", .{ images.len, audio.len });
+    log.info("Multimodal: processing {d} image(s), {d} video(s), {d} audio clip(s)\n", .{ images.len, videos.len, audio.len });
 
     // Phase A4: route encoding to the scheduler's inference thread when
     // available. Conn thread only decodes pixels/PCM (CPU); the mlx ops
@@ -9423,6 +9481,17 @@ fn processVisionImages(
                 .grid_w = img.grid_w,
             });
         }
+        var vid_list = std.ArrayList(scheduler_mod.VisionVideoPixels).empty;
+        defer vid_list.deinit(allocator);
+        try vid_list.ensureTotalCapacity(allocator, videos.len);
+        for (videos) |vid| {
+            vid_list.appendAssumeCapacity(.{
+                .pixels = vid.pixels,
+                .grid_t = vid.grid_t,
+                .grid_h = vid.grid_h,
+                .grid_w = vid.grid_w,
+            });
+        }
         var aud_list = std.ArrayList([]const u8).empty;
         defer aud_list.deinit(allocator);
         try aud_list.ensureTotalCapacity(allocator, audio.len);
@@ -9430,6 +9499,7 @@ fn processVisionImages(
         var req = scheduler_mod.VisionEncodeRequest{
             .model = lm,
             .images = pix_list.items,
+            .videos = vid_list.items,
             .audio = aud_list.items,
             .allocator = allocator,
         };
@@ -9441,10 +9511,11 @@ fn processVisionImages(
             return err;
         };
         out_n_vision.* = req.n_vision_tokens;
+        out_n_video.* = req.n_video_tokens;
         out_n_audio.* = req.n_audio_tokens;
         const ve_shape = mlx.getShape(arr);
         if (ve_shape.len >= 3) {
-            log.info("  Multimodal: → [{d},{d},{d}] tokens ({d} vision + {d} audio)\n", .{ ve_shape[0], ve_shape[1], ve_shape[2], req.n_vision_tokens, req.n_audio_tokens });
+            log.info("  Multimodal: → [{d},{d},{d}] tokens ({d} vision + {d} video + {d} audio)\n", .{ ve_shape[0], ve_shape[1], ve_shape[2], req.n_vision_tokens, req.n_video_tokens, req.n_audio_tokens });
         }
         return arr;
     }
@@ -9477,6 +9548,18 @@ fn processVisionImages(
         }
         const es = mlx.getShape(emb);
         out_n_vision.* += @intCast(es[1]);
+        try emb_parts.append(allocator, emb);
+    }
+
+    for (videos) |vid| {
+        const n: usize = @as(usize, vid.grid_t) * vid.grid_h * vid.grid_w;
+        const feat: usize = (vid.pixels.len / 4) / n;
+        const shape = [_]c_int{ @intCast(n), @intCast(feat) };
+        const pixel_arr = mlx.mlx_array_new_data(vid.pixels.ptr, &shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(pixel_arr);
+        const emb = try vision_enc.forwardVideoPatches(pixel_arr, vid.grid_t, vid.grid_h, vid.grid_w);
+        const es = mlx.getShape(emb);
+        out_n_video.* += @intCast(es[1]);
         try emb_parts.append(allocator, emb);
     }
 
@@ -9608,22 +9691,29 @@ pub const MropeData = struct {
 /// model isn't Qwen-vision or there are no images. Caller owns `pos`.
 fn computeQwenMrope(allocator: std.mem.Allocator, prompt_ids: []const u32, msgs: []const chat_mod.Message, config: *const model_mod.ModelConfig) !MropeData {
     if (!config.qwen_vision) return .{};
-    // Collect the last user message's image grids (full patch grid per image).
-    var grids = std.ArrayList(mrope_mod.ImageGrid).empty;
-    defer grids.deinit(allocator);
+    // Collect the last user message's image AND video grids (full patch grid
+    // per block, in their own modality's document order — getRopeIndex
+    // interleaves the two lists by whichever marker occurs first in tokens).
+    var image_grids = std.ArrayList(mrope_mod.ImageGrid).empty;
+    defer image_grids.deinit(allocator);
+    var video_grids = std.ArrayList(mrope_mod.ImageGrid).empty;
+    defer video_grids.deinit(allocator);
     var i = msgs.len;
     while (i > 0) {
         i -= 1;
         if (std.mem.eql(u8, msgs[i].role, "user")) {
             if (msgs[i].images) |imgs| for (imgs) |im| {
-                if (im.grid_h > 0) try grids.append(allocator, .{ .t = 1, .h = im.grid_h, .w = im.grid_w });
+                if (im.grid_h > 0) try image_grids.append(allocator, .{ .t = 1, .h = im.grid_h, .w = im.grid_w });
+            };
+            if (msgs[i].videos) |vids| for (vids) |vd| {
+                try video_grids.append(allocator, .{ .t = vd.grid_t, .h = vd.grid_h, .w = vd.grid_w });
             };
             break;
         }
     }
-    if (grids.items.len == 0) return .{};
+    if (image_grids.items.len == 0 and video_grids.items.len == 0) return .{};
 
-    var ri = mrope_mod.getRopeIndex(allocator, prompt_ids, grids.items, config.image_token_id, config.video_token_id, config.vision_start_token_id, config.qv_merge) catch |err| {
+    var ri = mrope_mod.getRopeIndex(allocator, prompt_ids, image_grids.items, video_grids.items, config.image_token_id, config.video_token_id, config.vision_start_token_id, config.qv_merge) catch |err| {
         log.warn("M-RoPE get_rope_index failed ({s}); falling back to scalar RoPE\n", .{@errorName(err)});
         return .{};
     };
@@ -9633,7 +9723,7 @@ fn computeQwenMrope(allocator: std.mem.Allocator, prompt_ids: []const u32, msgs:
     @memcpy(flat[0..total], ri.pos[0]);
     @memcpy(flat[total .. 2 * total], ri.pos[1]);
     @memcpy(flat[2 * total .. 3 * total], ri.pos[2]);
-    log.info("  M-RoPE: {d} images, position ids over {d} tokens, decode delta {d}\n", .{ grids.items.len, total, ri.delta });
+    log.info("  M-RoPE: {d} images, {d} videos, position ids over {d} tokens, decode delta {d}\n", .{ image_grids.items.len, video_grids.items.len, total, ri.delta });
     return .{ .pos = flat, .total = total, .delta = ri.delta };
 }
 
@@ -9706,20 +9796,23 @@ fn insertMultimodalTokens(
     prompt_ids: []const u32,
     image_token_id: u32,
     n_image: usize,
+    video_token_id: u32,
+    n_video: usize,
     audio_token_id: u32,
     n_audio: usize,
     config: *const model_mod.ModelConfig,
     msgs: []const chat_mod.Message,
 ) ![]u32 {
     const want_image = image_token_id != 0 and n_image > 0;
+    const want_video = video_token_id != 0 and n_video > 0;
     const want_audio = audio_token_id != 0 and n_audio > 0;
-    if (!want_image and !want_audio) return try allocator.dupe(u32, prompt_ids);
+    if (!want_image and !want_video and !want_audio) return try allocator.dupe(u32, prompt_ids);
 
     const insert_pos = userTurnInsertPos(prompt_ids, config);
 
-    // Qwen3-VL wraps the image-pad run with <|vision_start|>/<|vision_end|>
-    // (get_rope_index keys on vision_start immediately followed by image tokens);
-    // Gemma uses BOI/EOI.
+    // Qwen3-VL wraps the image-pad run (and, identically, the video-pad run)
+    // with <|vision_start|>/<|vision_end|> (get_rope_index keys on vision_start
+    // immediately followed by an image OR video token); Gemma uses BOI/EOI.
     const boi = if (config.qwen_vision) config.vision_start_token_id else config.boi_token_id;
     const eoi = if (config.qwen_vision) config.vision_end_token_id else config.eoi_token_id;
     const boa = config.boa_token_id;
@@ -9739,6 +9832,11 @@ fn insertMultimodalTokens(
             if (eoi > 0) try seg.append(allocator, eoi);
         }
     }
+    if (want_video) {
+        if (boi > 0) try seg.append(allocator, boi);
+        try seg.appendNTimes(allocator, video_token_id, n_video);
+        if (eoi > 0) try seg.append(allocator, eoi);
+    }
     if (want_audio) {
         if (boa > 0) try seg.append(allocator, boa);
         try seg.appendNTimes(allocator, audio_token_id, n_audio);
@@ -9751,7 +9849,7 @@ fn insertMultimodalTokens(
     @memcpy(result[insert_pos .. insert_pos + seg.items.len], seg.items);
     @memcpy(result[insert_pos + seg.items.len ..], prompt_ids[insert_pos..]);
 
-    log.info("  Inserted {d} image + {d} audio soft tokens at position {d} (prompt: {d} -> {d} tokens)\n", .{ n_image, n_audio, insert_pos, prompt_ids.len, new_len });
+    log.info("  Inserted {d} image + {d} video + {d} audio soft tokens at position {d} (prompt: {d} -> {d} tokens)\n", .{ n_image, n_video, n_audio, insert_pos, prompt_ids.len, new_len });
     return result;
 }
 
@@ -9808,6 +9906,14 @@ fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vision
         .max_pixels = config.qv_max_pixels,
         .max_tokens = config.mv_max_image_tokens,
     };
+}
+
+var vision_pixel_clamp_logged: bool = false;
+/// One-shot: the checkpoint declared more pixels than the ViT can attend.
+fn logVisionPixelClamp(declared: u32) void {
+    if (vision_pixel_clamp_logged) return;
+    vision_pixel_clamp_logged = true;
+    log.info("[vision] image area capped at {d} px (checkpoint declares {d}): the ViT materializes its full attention\n", .{ qwen_vision.ENGINE_MAX_PIXELS, declared });
 }
 
 test "visionPreprocFromConfig threads each tower's processor bounds" {
@@ -10146,11 +10252,10 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
     if (vp.mode != .gemma) {
         const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
         if (factor == 0 or vp.tps == 0) return null;
-        const min_pixels = if (vp.min_pixels > 0) vp.min_pixels else qwen_vision.MIN_PIXELS;
-        const max_pixels = if (vp.max_pixels >= min_pixels)
-            vp.max_pixels
-        else
-            @max(qwen_vision.MAX_PIXELS, min_pixels);
+        const bounds = qwen_vision.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
+        const min_pixels = bounds.min;
+        const max_pixels = bounds.max;
+        if (bounds.clamped and vp.mode == .qwen) logVisionPixelClamp(vp.max_pixels);
         const rs = switch (vp.mode) {
             .muse => muse_vision.smartResize(src_h, src_w, factor, if (vp.max_tokens > 0) vp.max_tokens else model_mod.MUSE_MAX_IMAGE_TOKENS),
             .lfm2 => lfm2_vision.smartResize(src_h, src_w, vp.patch, vp.merge, vp.min_tokens, vp.max_tokens),
@@ -10218,6 +10323,110 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
 
     log.info("  Decoded {d}x{d} image → {d}x{d} float32 CHW\n", .{ src_w, src_h, target, target });
     return .{ .pixels = out_buf, .width = target, .height = target };
+}
+
+/// Decode a `video_url` block's `frames` array — already-decoded-by-the-client
+/// JPEG/PNG data URLs, one per sampled frame; no video codec exists anywhere in
+/// this codebase, so frame extraction is the client's job — into ONE
+/// `chat_mod.VideoData`. All frames share ONE smart-resize target, computed
+/// from the FIRST frame and applied to every frame (a video's whole patch grid
+/// must be identical across frames), then grouped into `vp.tps`-sized temporal-
+/// patch groups — the last group pads by repeating its final frame, matching
+/// HF's video processor. Qwen-only: the only family declaring `video_token_id`.
+fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.VideoData {
+    if (vp.mode != .qwen or frame_urls.len == 0) return null;
+    const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
+    if (factor == 0 or vp.tps == 0 or vp.tps > 8) return null;
+
+    // Decode every frame to RGB8 first — frame 0's natural size decides the
+    // resize target every later frame must also resize to.
+    var decoded = std.ArrayList(DecodedRgb).empty;
+    defer {
+        for (decoded.items) |d| d.deinit(allocator);
+        decoded.deinit(allocator);
+    }
+    for (frame_urls) |url| {
+        const sep = std.mem.indexOf(u8, url, ";base64,") orelse return null;
+        const b64 = url[sep + 8 ..];
+        const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(b64) catch return null;
+        const raw = allocator.alloc(u8, decoded_size) catch return null;
+        defer allocator.free(raw);
+        std.base64.standard.Decoder.decode(raw, b64) catch return null;
+        const rgb = decodeRgbOwned(allocator, raw) orelse return null;
+        decoded.append(allocator, rgb) catch {
+            rgb.deinit(allocator);
+            return null;
+        };
+    }
+
+    const bounds = qwen_vision.effectivePixelBounds(vp.min_pixels, vp.max_pixels);
+    const min_pixels = bounds.min;
+    const max_pixels = bounds.max;
+    if (bounds.clamped) logVisionPixelClamp(vp.max_pixels);
+    const first = decoded.items[0];
+    const rs = qwen_vision.smartResizeImage(first.h, first.w, factor, min_pixels, max_pixels);
+    const rh = rs.h;
+    const rw = rs.w;
+    const C: u32 = 3;
+    const gh = rh / vp.patch;
+    const gw = rw / vp.patch;
+    const n_per_group: usize = @as(usize, gh) * gw;
+    const feat: usize = @as(usize, C) * vp.tps * vp.patch * vp.patch;
+
+    // Resize every frame to the shared (rh, rw) target.
+    var frames_chw = std.ArrayList([]f32).empty;
+    defer {
+        for (frames_chw.items) |f| allocator.free(f);
+        frames_chw.deinit(allocator);
+    }
+    for (decoded.items) |d| {
+        const source_len: usize = @as(usize, d.h) * d.w * C;
+        const chw = allocator.alloc(f32, @as(usize, C) * rh * rw) catch return null;
+        qwen_vision.resizeRgbNormalizedChw(allocator, chw, d.rgb[0..source_len], d.h, d.w, rh, rw, resampleFilterFor(vp)) catch {
+            allocator.free(chw);
+            return null;
+        };
+        frames_chw.append(allocator, chw) catch {
+            allocator.free(chw);
+            return null;
+        };
+    }
+
+    // Group into tps-sized temporal patches, padding the last group by
+    // repeating its final frame.
+    const grid_t: usize = (frames_chw.items.len + vp.tps - 1) / vp.tps;
+    const pv_bytes = allocator.alloc(u8, grid_t * n_per_group * feat * 4) catch return null;
+    const pv_f32 = @as([*]f32, @ptrCast(@alignCast(pv_bytes.ptr)))[0 .. grid_t * n_per_group * feat];
+
+    var group_frames: [8][]const f32 = undefined;
+    var g: usize = 0;
+    while (g < grid_t) : (g += 1) {
+        var k: usize = 0;
+        while (k < vp.tps) : (k += 1) {
+            const idx = @min(g * vp.tps + k, frames_chw.items.len - 1);
+            group_frames[k] = frames_chw.items[idx];
+        }
+        const out_slice = pv_f32[g * n_per_group * feat ..][0 .. n_per_group * feat];
+        qwen_vision.buildPixelValuesVideo(out_slice, group_frames[0..vp.tps], C, rh, rw, vp.patch, vp.merge);
+    }
+
+    log.info("  Decoded {d} frames → qwen video grid_t={d} grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{
+        frame_urls.len, grid_t, gh, gw, grid_t * n_per_group / (@as(usize, vp.merge) * vp.merge), rw, rh,
+    });
+    return .{ .pixels = pv_bytes, .grid_t = @intCast(grid_t), .grid_h = gh, .grid_w = gw };
+}
+
+/// Decode a `video_url` block's `frames` array into `list`, mirroring
+/// `appendImageUrlContent`'s append-or-drop shape.
+pub fn appendVideoUrlContent(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(chat_mod.VideoData),
+    frame_urls: []const []const u8,
+    vp: chat_mod.VisionPreproc,
+) void {
+    if (decodeVideoUrlContent(allocator, frame_urls, vp)) |vid| {
+        list.append(allocator, vid) catch allocator.free(vid.pixels);
+    }
 }
 
 // ── Anthropic Messages API ──
@@ -10818,7 +11027,7 @@ fn handleAnthropicMessages(
     else
         lm_default_enable_drafter;
     if (enable_drafter and lm.drafter == null) enable_drafter = false;
-    if (enable_drafter and config.has_hybrid_layers) enable_drafter = false;
+    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
@@ -10897,13 +11106,14 @@ fn handleAnthropicMessages(
     }
     if (lm.vision_encoder) |ve| {
         var n_vis: usize = 0;
+        var n_vid: usize = 0;
         var n_aud: usize = 0;
-        local_ve = processVisionImages(allocator, lm, ve, messages.items, &n_vis, &n_aud) catch |err| blk: {
+        local_ve = processVisionImages(allocator, lm, ve, messages.items, &n_vis, &n_vid, &n_aud) catch |err| blk: {
             log.warn("Vision encoding failed: {}\n", .{err});
             break :blk null;
         };
         if (local_ve != null) {
-            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.audio_token_id, n_aud, config, messages.items);
+            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, messages.items);
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
@@ -11046,7 +11256,7 @@ fn handleAnthropicNonStreaming(
     // (drafter > PLD; PLD runs on hybrid SSM, the drafter does not).
     const config = lm.config.?;
     const use_mtp = enable_mtp and mtpCapable(lm) and sampling.constraint == null;
-    const use_drafter = !use_mtp and enable_drafter and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !config.has_hybrid_layers;
+    const use_drafter = !use_mtp and enable_drafter and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null);
     const use_pld = !use_mtp and !use_drafter and enable_pld and sampling.constraint == null;
 
     // Anthropic responses never carry logprobs (the API doesn't expose
@@ -11283,7 +11493,7 @@ fn handleAnthropicStreaming(
     // stream adapter below feeds the per-token Anthropic state machine the
     // same way for all three modes.
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, 0);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, 0);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -12468,13 +12678,14 @@ fn handleResponses(
     }
     if (lm.vision_encoder) |ve| {
         var n_vis: usize = 0;
+        var n_vid: usize = 0;
         var n_aud: usize = 0;
-        local_ve = processVisionImages(allocator, lm, ve, pi.messages.items, &n_vis, &n_aud) catch |err| blk: {
+        local_ve = processVisionImages(allocator, lm, ve, pi.messages.items, &n_vis, &n_vid, &n_aud) catch |err| blk: {
             log.warn("Vision encoding failed: {}\n", .{err});
             break :blk null;
         };
         if (local_ve != null) {
-            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.audio_token_id, n_aud, config, pi.messages.items);
+            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.video_token_id, n_vid, config.audio_token_id, n_aud, config, pi.messages.items);
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
@@ -12651,7 +12862,7 @@ fn handleResponses(
     else
         lm_default_enable_drafter_resp;
     if (enable_drafter_resp and lm.drafter == null and lm.dflash == null) enable_drafter_resp = false;
-    if (enable_drafter_resp and config.has_hybrid_layers) enable_drafter_resp = false;
+    if (enable_drafter_resp and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter_resp = false;
     var enable_mtp_resp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
@@ -12681,7 +12892,7 @@ fn handleResponses(
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
-        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null or lm.dflash != null, lm.mtp != null, config.has_hybrid_layers, sampling.constraint != null, 0);
+        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null or lm.dflash != null, lm.mtp != null, archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, 0);
         if (stream_mode == .pld) log.info("  pld=enabled (streaming responses, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
@@ -12986,7 +13197,7 @@ fn handleResponses(
         // Non-streaming Responses: spec-decode dispatch (drafter > PLD) so
         // /v1/responses gets the same speedup as /v1/chat/completions.
         const use_mtp = enable_mtp_resp and lm.mtp != null and sampling.constraint == null;
-        const use_drafter = !use_mtp and enable_drafter_resp and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !config.has_hybrid_layers;
+        const use_drafter = !use_mtp and enable_drafter_resp and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null);
         const use_pld = !use_mtp and !use_drafter and enable_pld_resp and sampling.constraint == null;
         // Transfer vision ownership into the slot.
         const slot_ve_ns: ?mlx.mlx_array = blk: {
@@ -15194,8 +15405,8 @@ test "insertMultimodalTokens lays out image block then audio block at the user t
     config.eoa_token_id = 301; // EOA
 
     const prompt = [_]u32{ 2, 500, 105, 2364, 107, 900, 901 };
-    // image_token=999 ×2, audio_token=888 ×3.
-    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 888, 3, &config, &.{});
+    // image_token=999 ×2, video absent (token=777, n=0), audio_token=888 ×3.
+    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 777, 0, 888, 3, &config, &.{});
     defer testing.allocator.free(out);
 
     // Inserted after marker (position 5): [BOI 999 999 EOI][BOA 888 888 888 EOA].
@@ -15208,7 +15419,34 @@ test "insertMultimodalTokens lays out image block then audio block at the user t
     try testing.expectEqualSlices(u32, &expected, out);
 }
 
-test "insertMultimodalTokens handles audio-only and image-only" {
+test "insertMultimodalTokens lays out image block then video block then audio block" {
+    // Qwen3-VL-style: image and video pad runs both wrap in vision_start/end
+    // (get_rope_index keys on vision_start immediately followed by EITHER
+    // pad token), inserted image-block-first, then video, then audio.
+    var config = model_mod.ModelConfig{};
+    config.qwen_vision = true;
+    config.user_turn_marker_ids[0] = 105;
+    config.user_turn_marker_len = 1;
+    config.vision_start_token_id = 200;
+    config.vision_end_token_id = 201;
+    config.boa_token_id = 300;
+    config.eoa_token_id = 301;
+    const prompt = [_]u32{ 1, 105, 7 };
+
+    // image_token=999 ×2, video_token=777 ×3, audio_token=888 ×1.
+    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 777, 3, 888, 1, &config, &.{});
+    defer testing.allocator.free(out);
+    const expected = [_]u32{
+        1, 105,
+        200, 999, 999, 201, // image block
+        200, 777, 777, 777, 201, // video block
+        300, 888, 301, // audio block
+        7,
+    };
+    try testing.expectEqualSlices(u32, &expected, out);
+}
+
+test "insertMultimodalTokens handles audio-only, image-only, and video-only" {
     var config = model_mod.ModelConfig{};
     config.user_turn_marker_ids[0] = 105;
     config.user_turn_marker_len = 1;
@@ -15218,18 +15456,25 @@ test "insertMultimodalTokens handles audio-only and image-only" {
     config.eoa_token_id = 301;
     const prompt = [_]u32{ 1, 105, 7 };
 
-    // Audio only (n_image=0) → just the audio block.
-    const ao = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 888, 2, &config, &.{});
+    // Audio only (n_image=0, n_video=0) → just the audio block.
+    const ao = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 777, 0, 888, 2, &config, &.{});
     defer testing.allocator.free(ao);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 300, 888, 888, 301, 7 }, ao);
 
-    // Image only (n_audio=0) → just the image block.
-    const io = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 888, 0, &config, &.{});
+    // Image only (n_video=0, n_audio=0) → just the image block.
+    const io = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 777, 0, 888, 0, &config, &.{});
     defer testing.allocator.free(io);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 999, 201, 7 }, io);
 
+    // Video only (n_image=0, n_audio=0) → just the video block, wrapped in the
+    // SAME BOI/EOI as an image block (non-Qwen config here; Qwen's vision_start
+    // is exercised by the interleaved test above).
+    const vo = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 777, 2, 888, 0, &config, &.{});
+    defer testing.allocator.free(vo);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 777, 777, 201, 7 }, vo);
+
     // Neither → unchanged.
-    const none = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 888, 0, &config, &.{});
+    const none = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 777, 0, 888, 0, &config, &.{});
     defer testing.allocator.free(none);
     try testing.expectEqualSlices(u32, &prompt, none);
 }
