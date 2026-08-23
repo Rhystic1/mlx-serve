@@ -97,6 +97,135 @@ pub fn shouldWarnOpenBind(host_explicit: bool, lan_share: bool, host: []const u8
         std.mem.eql(u8, host, "localhost"));
 }
 
+/// The dotted-decimal `--host` value as the four address bytes the listener
+/// binds. `0.0.0.0` (and anything unparseable) is the wildcard — the same
+/// lenient reading the listen path has always used, factored out so the
+/// boot-time port pre-flight probes the address the server will ACTUALLY
+/// bind rather than an address that merely rhymes with it.
+pub fn hostIp4(host: []const u8) [4]u8 {
+    var bytes: [4]u8 = .{ 0, 0, 0, 0 };
+    if (std.mem.eql(u8, host, "0.0.0.0")) return bytes;
+    var parts = std.mem.splitScalar(u8, host, '.');
+    var idx: usize = 0;
+    while (parts.next()) |part| {
+        if (idx >= 4) break;
+        bytes[idx] = std.fmt.parseInt(u8, part, 10) catch 0;
+        idx += 1;
+    }
+    return bytes;
+}
+
+/// Is `host:port` already taken? Answered by BINDING it and closing again —
+/// never by connecting to it.
+///
+/// A connect probe answers a different question and can block for the full TCP
+/// SYN timeout: it asks "does something ANSWER here", so a host that blackholes
+/// the SYN instead of refusing it hangs the pre-flight that exists to fail FAST
+/// (live 2026-08-21, WSL2 mirrored networking: every closed loopback port
+/// swallows the SYN, so boot sat minutes inside a check meant to cost
+/// microseconds, before a single line of serve output — and with `--lan-share`
+/// in the command line it reads as an mDNS hang). A bind probe asks the
+/// question the caller actually has — "can I listen here" — of the local kernel
+/// only, so it cannot wait on a network. It is also strictly more accurate: the
+/// old probe only ever tried loopback, so a listener already holding the
+/// wildcard on another interface read as free.
+///
+/// The probe sets SO_REUSEADDR and NOT SO_REUSEPORT, which is the whole trick
+/// and is why this cannot go through `IpAddress.listen` — its `reuse_address`
+/// sets BOTH on POSIX, and two SO_REUSEPORT sockets bind the same address
+/// happily, so a probe shaped like the real listener reports every live server
+/// as free. REUSEADDR alone is measured (2026-08-21) to answer all three cases
+/// correctly: a live listener holding REUSEPORT → in use; a wildcard listener
+/// probed on loopback → in use; leftover TIME_WAIT children of a just-killed
+/// server → free, which is the false positive that plain no-options bind gets
+/// wrong and `pkill -f mlx-serve; restart` would hit constantly.
+///
+/// Only `AddressInUse` means taken. Every other bind failure (a privileged
+/// port, an address that is not ours) is left to the real `listen`, which
+/// reports it with context this pre-flight does not have.
+pub fn portInUse(io: std.Io, host: []const u8, port: u16) bool {
+    const bytes = hostIp4(host);
+    if (builtin.os.tag == .windows) {
+        // Winsock has no SO_REUSEPORT, and its SO_REUSEADDR is the permissive
+        // kind that would bind straight over a live listener — so the probe
+        // takes no options at all there.
+        const addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = bytes, .port = port } };
+        var probe = addr.listen(io, .{ .reuse_address = false }) catch |err| return err == error.AddressInUse;
+        probe.deinit(io);
+        return false;
+    }
+    const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+    if (fd < 0) return false;
+    defer _ = std.c.close(fd);
+    const one: c_int = 1;
+    _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, &one, @sizeOf(c_int));
+    const sa: std.c.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = @bitCast(bytes),
+    };
+    if (std.c.bind(fd, @ptrCast(&sa), @sizeOf(std.c.sockaddr.in)) == 0) return false;
+    return std.c._errno().* == @intFromEnum(std.c.E.ADDRINUSE);
+}
+
+test "hostIp4: dotted-decimal, wildcard, and the lenient arms" {
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, hostIp4("0.0.0.0"));
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, hostIp4("127.0.0.1"));
+    try std.testing.expectEqual([4]u8{ 192, 168, 0, 150 }, hostIp4("192.168.0.150"));
+}
+
+test "the boot port pre-flight binds the port, never connects to it" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    // Take a port for real, then ask. Binding is the same question the
+    // listener asks, so a held port must read as held — and the listener is
+    // held the way `serve()` holds it (reuse_address, which is REUSEADDR AND
+    // REUSEPORT on POSIX), because a probe that sets REUSEPORT too would bind
+    // right alongside it and call a running server free.
+    var held: ?std.Io.net.Server = null;
+    var held_port: u16 = 0;
+    var candidate: u16 = 47811;
+    while (candidate < 47911) : (candidate += 1) {
+        const addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = candidate } };
+        held = addr.listen(io, .{ .reuse_address = true }) catch continue;
+        held_port = candidate;
+        break;
+    }
+    if (held == null) return error.SkipZigTest; // no free port in the window
+    var listener = held.?;
+    try std.testing.expect(portInUse(io, "127.0.0.1", held_port));
+
+    // Serve one connection and close the SERVER side first, so the port is
+    // left carrying a TIME_WAIT child — the state a `pkill -f mlx-serve` and
+    // immediate restart always produces. That must still read as FREE: the
+    // real listen sets SO_REUSEADDR and would bind straight through it, so a
+    // probe without it turns every quick restart into a bogus
+    // "port already in use" exit.
+    const client_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = held_port } };
+    var client = try client_addr.connect(io, .{ .mode = .stream });
+    var accepted = try listener.accept(io);
+    listener.deinit(io);
+    accepted.close(io); // active close on the local port → TIME_WAIT here
+    client.close(io);
+
+    // Released, it must read as free — and must ANSWER, promptly. A connect
+    // probe never returns here on a host that blackholes closed-port SYNs
+    // (WSL2 mirrored networking), which is the hang this replaced.
+    try std.testing.expect(!portInUse(io, "127.0.0.1", held_port));
+}
+
+test "the boot port pre-flight is a bind, in main.zig too" {
+    // Class guard: the fix is worthless if the serve path grows a second,
+    // connect-shaped probe. main.zig is the executable root and not in the
+    // test pool, so it is scanned from here.
+    const src = @embedFile("main.zig");
+    const call = "server_mod.portInUse(" ++ "io, host, port)";
+    try std.testing.expect(std.mem.indexOf(u8, src, call) != null);
+    // No local re-implementation, and nothing in main.zig dials a port to
+    // decide whether it is free.
+    try std.testing.expect(std.mem.indexOf(u8, src, "fn portIn" ++ "Use(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "Ip4Address.loopback(" ++ "port)") == null);
+}
+
 test "shouldWarnOpenBind: warn only on an UNCHOSEN non-loopback bind" {
     // Default bind (0.0.0.0, nobody asked) → warn: a first-launch user is
     // serving whatever network the laptop joins.
@@ -1303,20 +1432,10 @@ pub fn serve(
     // src/platform.zig.
     platform.installShutdownHandler(&shutdown_requested, port);
 
-    // Parse host address
-    var ip4_bytes: [4]u8 = .{ 0, 0, 0, 0 };
-    if (!std.mem.eql(u8, host, "0.0.0.0")) {
-        // Parse dotted-decimal IP
-        var parts = std.mem.splitScalar(u8, host, '.');
-        var idx: usize = 0;
-        while (parts.next()) |part| {
-            if (idx >= 4) break;
-            ip4_bytes[idx] = std.fmt.parseInt(u8, part, 10) catch 0;
-            idx += 1;
-        }
-    }
-
-    const ip_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = ip4_bytes, .port = port } };
+    // Parse host address. ONE reading of `--host` (`hostIp4`), shared with the
+    // boot-time `portInUse` pre-flight so the probe cannot check an address
+    // this listen does not bind.
+    const ip_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = hostIp4(host), .port = port } };
     var server = try ip_addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 

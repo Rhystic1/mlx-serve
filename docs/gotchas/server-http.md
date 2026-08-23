@@ -1421,3 +1421,79 @@ into `dflash_pass`/`mtp_pass` and nulls the errdefer-guarded locals BEFORE the
 `try`, so on failure exactly one owner (the generator) frees them. Guard:
 `scheduler.zig` test "runPrefill clears restored spec-cache ownership BEFORE
 Generator.initWithOptions (issue #266)" pins the clear-before-call ordering.
+## The boot port pre-flight connected, and a host that blackholes a SYN hung it (2026-08-21)
+
+Live on WSL2 (mirrored networking), Linux build:
+
+```
+./zig-out/bin/mlx-serve --model ~/models/LFM2.5-2.6B-heretic-Q4_K_M.gguf \
+  --serve --host 0.0.0.0 --port 8080 --lan-share all --lan-name wsl-linux
+```
+
+printed the `Logging to …` banner and then nothing at all — no `[args] serve:`,
+no model load, no listener. With `--lan-share` in the command line it reads as
+an mDNS hang, and the LAN files are the newest code on the box, so that is
+where the search starts. It is not there: the process was one thread deep in
+`portInUse`, three hundred lines ABOVE any LAN call.
+
+```
+$ ss -anp | grep mlx
+tcp SYN-SENT 0 1 127.0.0.1:44846 127.0.0.1:8080 users:(("mlx-serve",pid=985,fd=4))
+```
+
+`portInUse` asked "is this port taken" by CONNECTING to it, and took a
+connection refusal as the "free" answer. That is a different question —
+"does something ANSWER here" — and its cost is not bounded by anything local.
+Under WSL2 mirrored networking a loopback connect is forwarded to the Windows
+host, and a closed port there does not answer at all: the SYN is swallowed, so
+`connect()` sits in SYN-SENT for the full TCP retry ladder (minutes) inside a
+check whose entire purpose is to fail FAST instead of wasting a model load.
+`bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080'` hangs identically, on every closed
+port — the host, not the server.
+
+The same host has the opposite failure a few ports over: a connect to a closed
+EPHEMERAL port SUCCEEDS (the mirrored NAT accepts, then resets on first I/O),
+which is what leaves `lan_peers`' "tunnel to a dead peer" test red there. A
+connect refusal is not a portable signal for "nothing is listening".
+
+Fix: probe by BINDING and closing again (`server.portInUse(io, host, port)`),
+which asks the local kernel the question the caller actually has — "can I
+listen here" — and cannot wait on a network. It also answers a strictly better
+question than the old probe, which only ever tried loopback: a listener already
+holding the wildcard on another interface now reads as taken.
+
+The one subtlety is which socket options the probe sets, and it cannot just
+mirror the real listener. Measured on Linux, all three cases:
+
+| probe options | live listener (holds REUSEADDR+REUSEPORT) | wildcard listener, loopback probe | TIME_WAIT children only |
+|---|---|---|---|
+| `reuse_address` (Zig: REUSEADDR **and** REUSEPORT) | binds alongside → **free (wrong)** | free (wrong) | free |
+| none | in use | in use | **in use (wrong)** |
+| REUSEADDR only | in use | in use | free |
+
+Zig's `ListenOptions.reuse_address` sets SO_REUSEPORT too on POSIX
+(`Io/Threaded.zig`), and two REUSEPORT sockets share an address happily — so a
+probe shaped like the real listener calls every running server free. Dropping
+all options swings into the other error: a listener bind without SO_REUSEADDR
+fails while the just-killed server's accepted children are still in TIME_WAIT,
+so the documented `pkill -f mlx-serve` + restart would refuse to boot for 60 s
+with "another mlx-serve instance may be running". REUSEADDR without REUSEPORT
+is the only combination that answers all three correctly, and it is why the
+probe is hand-rolled on `std.c` instead of going through `IpAddress.listen`.
+
+Only `AddressInUse` means taken; every other bind error is left to the real
+`listen`, which reports it with context the pre-flight does not have.
+
+Note what the pre-flight is actually load-bearing for: because the real
+listener sets SO_REUSEPORT, two mlx-serve instances CAN bind one port and
+silently split traffic between them. This check is the only thing that stops
+it — which is the second reason a probe that reports a live server as free was
+worse than the hang it caused.
+
+Guards: `tests/test_port_preflight.sh` (an end-to-end boot on a held port,
+timed — the hang class is a wall-clock property, not an output one), the
+`server.zig` unit test that holds a port the way `serve()` holds it and then
+leaves a TIME_WAIT child on it (red on revert: without REUSEADDR the
+TIME_WAIT arm convicts), and a source scan pinning main.zig's pre-flight to
+`server_mod.portInUse` so the serve path cannot grow a second connect-shaped
+probe.

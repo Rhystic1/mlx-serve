@@ -926,7 +926,7 @@ pub fn main(init: std.process.Init) !void {
     // In serve mode, check if the port is already in use before loading the model
     // (model loading takes seconds — fail fast instead of wasting time)
     if (serve_mode) {
-        if (portInUse(io, port)) {
+        if (server_mod.portInUse(io, host, port)) {
             log.err("Port {d} is already in use — another mlx-serve instance may be running.\n", .{port});
             log.err("Stop it first (pkill -f mlx-serve) or use a different port (--port {d}).\n", .{port + 1});
             std.process.exit(1);
@@ -1433,14 +1433,6 @@ pub fn main(init: std.process.Init) !void {
         const peak_gb = @as(f64, @floatFromInt(peak_mem)) / (1024.0 * 1024.0 * 1024.0);
         try stdout_w.print("Peak memory: {d:.3} GB\n", .{peak_gb});
     }
-}
-
-/// Check if a port is already in use by trying to connect to it.
-fn portInUse(io: std.Io, port: u16) bool {
-    const addr: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(port) };
-    const stream = addr.connect(io, .{ .mode = .stream }) catch return false;
-    stream.close(io);
-    return true;
 }
 
 // GGUF path helpers (`isGgufModelPath` / `resolveGgufFile` /
