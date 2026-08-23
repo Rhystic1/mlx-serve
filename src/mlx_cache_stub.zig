@@ -70,6 +70,10 @@ pub const HotPrefixCache = struct {
         return LookupResult{};
     }
 
+    pub fn commit(_: *HotPrefixCache, _: anytype, _: anytype, _: anytype) anyerror!void {
+        return Error.MlxUnavailable;
+    }
+
     pub fn commitWithState(_: *HotPrefixCache, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) anyerror!void {
         return Error.MlxUnavailable;
     }

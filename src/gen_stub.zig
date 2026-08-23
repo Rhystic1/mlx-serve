@@ -102,7 +102,7 @@ pub fn computeEmbeddingsBatch(_: std.mem.Allocator, _: anytype, _: anytype) anye
 // of its modality, and no engine can load. They refuse rather than being
 // removed so the dispatch chain is unchanged and `ROUTE_PATHS` still matches.
 
-pub fn handleImage(_: std.Io, _: std.mem.Allocator, _: anytype, _: []const u8, _: *ImageEngine) anyerror!void {
+pub fn handleImage(_: std.mem.Allocator, _: anytype, _: []const u8, _: *ImageEngine) anyerror!void {
     return Error.MlxUnavailable;
 }
 pub fn handleAudio(_: std.mem.Allocator, _: anytype, _: []const u8, _: *AudioEngine) anyerror!void {

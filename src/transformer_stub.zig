@@ -35,6 +35,10 @@ pub const Transformer = struct {
     // the alternative is comptime-gating dozens of individual statements, which
     // is exactly the per-site branching build_cfg exists to avoid.
     s: @import("mlx_stub.zig").mlx_stream = .{},
+    round_cost: @import("round_cost.zig").Table = .{},
+    round_cost_key_buf: [64]u8 = undefined,
+    round_cost_key_len: u8 = 0,
+    mtp_depth_free: u32 = 0,
     cache: KVCache = .{},
     /// The real ModelConfig BY VALUE (as in transformer.zig -- the Transformer
     /// holds a copy made at build time, which is why the prefill-chunk pin has
@@ -237,4 +241,9 @@ test "KVCache init returns a zero-layer SHELL, it does not refuse" {
     var cache = try KVCache.initWithConfigAndHeadDim(testing.allocator, 0, KVQuantConfig.dense, 128);
     defer cache.deinit();
     try testing.expectEqual(@as(usize, 0), cache.step);
+}
+
+/// No sysctl off macOS: the round-cost cache key gets an empty OS build.
+pub fn macosProductVersion(_: []u8) ?[]const u8 {
+    return null;
 }

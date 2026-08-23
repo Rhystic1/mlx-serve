@@ -43,6 +43,10 @@ pub const VisionEncoder = struct {
         return Error.MlxUnavailable;
     }
 
+    pub fn forwardVideoPatches(_: *VisionEncoder, _: anytype, _: u32, _: u32, _: u32) anyerror!mlx.mlx_array {
+        return Error.MlxUnavailable;
+    }
+
     pub fn forwardAudio(_: *VisionEncoder, _: anytype) anyerror!mlx.mlx_array {
         return Error.MlxUnavailable;
     }

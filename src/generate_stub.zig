@@ -212,7 +212,16 @@ pub const Generator = struct {
     /// cheaper relative to the drafter, so a block pays for itself sooner.
     pub const DFLASH_MOE_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.8;
 
+    /// Resolved MTP depth cap; no MTP head ever loads here, so the configured
+    /// value (or 0) is echoed back — only a scheduler field reads it.
+    pub fn mtpDepthCapFree(configured: u32) u32 {
+        return configured;
+    }
+
+    pub fn persistRoundCost(_: *Generator) void {}
+
     // Fields the scheduler and the HTTP layer read directly off a live
+    spec_cost_solo: bool = true,
     // generator. Inert: `init` never returns one. Named and typed to match
     // generate.zig so the shared decode-loop plumbing compiles unchanged.
     done: bool = true,
