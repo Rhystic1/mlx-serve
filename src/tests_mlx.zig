@@ -31,6 +31,7 @@ test {
     _ = @import("kokoro.zig");
     _ = @import("kokoro_g2p.zig");
     _ = @import("prefix_cache.zig");
+    _ = @import("remote_prefill_mlx.zig");
     _ = @import("kv_disk_cache.zig");
     _ = @import("tts.zig");
     _ = @import("flux.zig");
