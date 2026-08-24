@@ -59,6 +59,7 @@ test {
     _ = @import("lan.zig");
     _ = @import("remote_prefill_client.zig");
     _ = @import("rpc_offload.zig");
+    _ = @import("cluster.zig");
     _ = @import("model_registry.zig");
     _ = @import("scheduler.zig");
     _ = @import("server.zig");

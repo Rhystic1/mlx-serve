@@ -186,3 +186,34 @@ test "serveEndpoint: bare port binds all interfaces; host:port passes through; j
     try testing.expectError(ParseError.BadEndpoint, serveEndpoint(&buf, "host:"));
     try testing.expectError(ParseError.Empty, serveEndpoint(&buf, ""));
 }
+
+/// One `load_tensors: layer  N assigned to device X, is_swa = S` line from
+/// llama.cpp's own load log — the ONE authority on where a layer landed.
+pub const LayerAssign = struct { layer: u32, device: []const u8 };
+
+pub fn parseLayerAssign(line: []const u8) ?LayerAssign {
+    const key = "layer";
+    const k = std.mem.indexOf(u8, line, key) orelse return null;
+    var rest = std.mem.trimStart(u8, line[k + key.len ..], " ");
+    const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse return null;
+    const n = std.fmt.parseInt(u32, rest[0..sp], 10) catch return null;
+    rest = rest[sp..];
+    const tag = " assigned to device ";
+    const d = std.mem.indexOf(u8, rest, tag) orelse return null;
+    var dev = rest[d + tag.len ..];
+    if (std.mem.indexOfScalar(u8, dev, ',')) |c| dev = dev[0..c];
+    dev = std.mem.trim(u8, dev, " \r\n");
+    if (dev.len == 0) return null;
+    return .{ .layer = n, .device = dev };
+}
+
+test "parseLayerAssign reads llama.cpp's own assignment line and nothing else" {
+    const a = parseLayerAssign("load_tensors: layer  16 assigned to device RPC0, is_swa = 0\n").?;
+    try testing.expectEqual(@as(u32, 16), a.layer);
+    try testing.expectEqualStrings("RPC0", a.device);
+    const b = parseLayerAssign("load_tensors: layer   0 assigned to device CUDA0, is_swa = 1").?;
+    try testing.expectEqual(@as(u32, 0), b.layer);
+    try testing.expectEqualStrings("CUDA0", b.device);
+    try testing.expect(parseLayerAssign("load_tensors: loading model tensors, this can take a while...") == null);
+    try testing.expect(parseLayerAssign("llama_prepare_model_devices: using device RPC0 (127.0.0.1:50052)") == null);
+}

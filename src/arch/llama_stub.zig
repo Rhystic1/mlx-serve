@@ -88,6 +88,12 @@ pub const LlamaEngine = struct {
         _ = opts;
         return Error.EngineOpenFailed;
     }
+    pub fn layerLineCount(_: *LlamaEngine) usize {
+        return 0;
+    }
+    pub fn layerLine(_: *LlamaEngine, _: usize) ?[]const u8 {
+        return null;
+    }
     pub fn close(self: *LlamaEngine) void {
         _ = self;
         @panic(unavailable);

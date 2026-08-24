@@ -121,6 +121,29 @@ pub const Table = struct {
 
     /// Append every discovered remote model's entry JSON to a /v1/models
     /// `data` array under construction (comma-managed by buffer length).
+    /// `[{"name","ip","port","models":[ids]},...]` for `GET /v1/cluster`.
+    pub fn appendPeersJson(tbl: *Table, alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
+        const chat = @import("chat.zig");
+        tbl.lock();
+        defer tbl.unlock();
+        try buf.append(alloc, '[');
+        var it = tbl.map.valueIterator();
+        var first = true;
+        while (it.next()) |p| {
+            if (!first) try buf.append(alloc, ',');
+            first = false;
+            try buf.appendSlice(alloc, "{\"name\":");
+            try chat.appendJsonString(alloc, buf, p.display);
+            try buf.print(alloc, ",\"ip\":\"{d}.{d}.{d}.{d}\",\"port\":{d},\"models\":[", .{ p.ip4[0], p.ip4[1], p.ip4[2], p.ip4[3], p.port });
+            for (p.models, 0..) |m, i| {
+                if (i > 0) try buf.append(alloc, ',');
+                try chat.appendJsonString(alloc, buf, m.id);
+            }
+            try buf.appendSlice(alloc, "]}");
+        }
+        try buf.append(alloc, ']');
+    }
+
     pub fn appendRemoteEntries(tbl: *Table, alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
         tbl.lock();
         defer tbl.unlock();

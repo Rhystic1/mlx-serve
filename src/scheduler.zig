@@ -74,6 +74,7 @@ const round_cost_mod = @import("round_cost.zig");
 const remote_prefill = @import("remote_prefill.zig");
 const rpc = @import("remote_prefill_client.zig");
 const rpc_offload = @import("rpc_offload.zig");
+const cluster = @import("cluster.zig");
 const DflashModel = dflash_mod.DflashModel;
 const VisionEncoder = vision_mod.VisionEncoder;
 const Weights = model_mod.Weights;
@@ -2542,6 +2543,7 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     //    quotes both sides. Local GGUF loads have no preflight today (llama.cpp
     //    mmaps and fails on its own); a split load gets one because a model
     //    half-resident on a dead peer is the failure this feature must not have.
+    cluster.g_rpc.reset();
     var ep_buf: [rpc_offload.MAX_ENDPOINTS][]const u8 = undefined;
     var endpoints: []const []const u8 = &.{};
     var split_buf: [rpc_offload.MAX_ENDPOINTS + 16]f32 = undefined;
@@ -2559,6 +2561,11 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             };
             log.info("[rpc] worker {s}: {d:.2} GB free / {d:.2} GB total\n", .{ ep, @as(f64, @floatFromInt(m.free)) / (1024.0 * 1024.0 * 1024.0), @as(f64, @floatFromInt(m.total)) / (1024.0 * 1024.0 * 1024.0) });
             remote_free += m.free;
+            if (cluster.g_rpc.n_workers < cluster.g_rpc.workers.len) {
+                // `ep` borrows argv (rpc_offload.g_endpoints) — process lifetime.
+                cluster.g_rpc.workers[cluster.g_rpc.n_workers] = .{ .endpoint = ep, .free_bytes = m.free, .total_bytes = m.total, .reachable = true };
+                cluster.g_rpc.n_workers += 1;
+            }
         }
         if (!skip_mem_preflight) {
             const weights: u64 = if (params.entry.bytes_on_disk) |b| b else 0;
@@ -2595,6 +2602,10 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     });
     errdefer engine.close();
     log.info("[llama] engine ready (EOS={d}, n_vocab={d})\n", .{ engine.eosToken(), engine.nVocab() });
+    // /v1/cluster snapshot: llama.cpp's own per-layer device assignment.
+    cluster.g_rpc.model = params.entry.id;
+    var li: usize = 0;
+    while (li < engine.layerLineCount()) : (li += 1) if (engine.layerLine(li)) |line| cluster.g_rpc.observe(line);
 
     // Make sure the stub config's EOS set includes the engine's EOS so the
     // streaming/non-streaming stop checks fire.
@@ -4783,6 +4794,8 @@ pub fn loopTrimEnabled() bool {
 }
 
 fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
+    if (slot.decode_ns > 0 and slot.completion_tokens > 0)
+        cluster.g_last_decode_tok_s = @as(f64, @floatFromInt(slot.completion_tokens)) * 1e9 / @as(f64, @floatFromInt(slot.decode_ns));
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
     // finalize here instead.
@@ -4920,6 +4933,7 @@ fn maybeRemotePrefill(
             // SPEED — it is a failure, with its own faster backoff ladder.
             slot.model.remote_prefill_cal.observeFailure();
             log.info("[remote-prefill] fell back: {s}\n", .{why});
+            cluster.recordPrefill(false, 0, 0, why);
             return false;
         },
         .blob => |blob| {
@@ -4929,6 +4943,7 @@ fn maybeRemotePrefill(
                 // valid state for sync — it simply cold-prefills. Never fatal.
                 slot.model.remote_prefill_cal.observeFailure();
                 log.info("[remote-prefill] fell back: {s}\n", .{rpc.FallbackReason.restore_failed.text()});
+                cluster.recordPrefill(false, 0, 0, rpc.FallbackReason.restore_failed.text());
                 return false;
             };
             // A COMPLETED exchange is the only evidence about remote speed. The
@@ -4939,6 +4954,7 @@ fn maybeRemotePrefill(
             slot.model.remote_prefill_cal.observeRemote(rt_ms, i32_prompt.len);
             slot.remote_prefill_tokens = @intCast(i32_prompt.len);
             log.info("[remote-prefill] engaged {d} tokens in {d:.0} ms (cached_n is 0 by design)\n", .{ i32_prompt.len, rt_ms });
+            cluster.recordPrefill(true, @intCast(i32_prompt.len), rt_ms, null);
             return true;
         },
     }
@@ -5519,8 +5535,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                     prefill_tokens = slot.full_prompt[n..];
                     slot.remote_prefilled = true;
                     slot.remote_prefill_tokens = @intCast(n);
+                    cluster.recordPrefill(true, @intCast(n), rt_ms, null);
                 } else {
                     slot.model.remote_prefill_cal.observeFailure();
+                    cluster.recordPrefill(false, 0, 0, "mlx import failed");
                 }
             }
         }

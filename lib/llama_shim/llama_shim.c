@@ -21,10 +21,41 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define MLX_LLAMA_MAX_LAYER_LINES 1024
+#define MLX_LLAMA_LAYER_LINE_CAP 96
+
 struct mlx_llama_engine {
     struct llama_model *model;
     const struct llama_vocab *vocab;
+    // llama.cpp's own `load_tensors: layer N assigned to device X` lines,
+    // captured through llama_log_set while THIS model loaded. The one
+    // authority on where a layer landed (rpc-offload-plan.md Part 3).
+    char layer_lines[MLX_LLAMA_MAX_LAYER_LINES][MLX_LLAMA_LAYER_LINE_CAP];
+    int32_t n_layer_lines;
 };
+
+// Load-time log capture. llama's log sink is process-global, so capture is
+// serialized by g_load_mu and the default (stderr) sink is restored after.
+static pthread_mutex_t g_load_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct mlx_llama_engine *g_capture_target = NULL;
+
+static void capture_log_cb(enum ggml_log_level level, const char *text, void *user) {
+    (void)level; (void)user;
+    fputs(text, stderr);
+    struct mlx_llama_engine *e = g_capture_target;
+    if (!e || !text) return;
+    if (strstr(text, " assigned to device ") == NULL) return;
+    if (e->n_layer_lines >= MLX_LLAMA_MAX_LAYER_LINES) return;
+    strncpy(e->layer_lines[e->n_layer_lines], text, MLX_LLAMA_LAYER_LINE_CAP - 1);
+    e->layer_lines[e->n_layer_lines][MLX_LLAMA_LAYER_LINE_CAP - 1] = '\0';
+    e->n_layer_lines++;
+}
+
+int32_t mlx_llama_layer_line_count(mlx_llama_engine *e) { return e ? e->n_layer_lines : 0; }
+const char *mlx_llama_layer_line(mlx_llama_engine *e, int32_t i) {
+    if (!e || i < 0 || i >= e->n_layer_lines) return NULL;
+    return e->layer_lines[i];
+}
 
 struct mlx_llama_session {
     struct llama_context *ctx;
@@ -202,16 +233,22 @@ mlx_llama_engine *mlx_llama_open_ex(const char *gguf_path, int32_t n_gpu_layers,
         mp.split_mode = LLAMA_SPLIT_MODE_LAYER;
     }
 
-    struct llama_model *model = llama_model_load_from_file(gguf_path, mp);
-    if (!model) {
-        copy_err(err, errlen, "llama_model_load_from_file failed");
+    mlx_llama_engine *e = (mlx_llama_engine *)calloc(1, sizeof(*e));
+    if (!e) {
+        copy_err(err, errlen, "out of memory allocating engine");
         return NULL;
     }
 
-    mlx_llama_engine *e = (mlx_llama_engine *)calloc(1, sizeof(*e));
-    if (!e) {
-        llama_model_free(model);
-        copy_err(err, errlen, "out of memory allocating engine");
+    pthread_mutex_lock(&g_load_mu);
+    g_capture_target = e;
+    llama_log_set(capture_log_cb, NULL);
+    struct llama_model *model = llama_model_load_from_file(gguf_path, mp);
+    llama_log_set(NULL, NULL); // back to llama's default stderr sink
+    g_capture_target = NULL;
+    pthread_mutex_unlock(&g_load_mu);
+    if (!model) {
+        free(e);
+        copy_err(err, errlen, "llama_model_load_from_file failed");
         return NULL;
     }
     e->model = model;

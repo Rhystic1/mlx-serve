@@ -107,3 +107,12 @@ LFM2.5-2.6B Q4, one boundary, loopback): decode 170 → ~125 tok/s, prefill
 Open, needs the Mac: step 5 (a model that fits neither box; the Mac must have
 RPC in its XCFramework — `zig build test -Dtest-filter="RPC backend is
 LOADED"` answers that) and the cross-machine numbers.
+
+## Part 3 status (2026-08-24, windows-x64 / m4max split)
+
+Data half shipped: `GET /v1/cluster` (schema agreed with m4max, who owns the
+console tab). Layer assignment is llama.cpp's own truth, captured at load via
+`llama_log_set`; per-hop timing is `hops:null` until ggml exposes it.
+Blocked for the Mac-as-consumer split: the macOS llama asset in
+fetch-llama.sh has no ggml-rpc backend (nm-confirmed) — needs an
+RPC-enabled macOS build (windows-x64 owns that next).

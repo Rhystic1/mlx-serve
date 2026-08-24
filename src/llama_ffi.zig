@@ -116,3 +116,5 @@ pub extern fn mlx_llama_rpc_device_memory(endpoint: [*:0]const u8, free_out: ?*u
 pub extern fn mlx_llama_rpc_local_device(name_buf: ?[*]u8, cap: usize, free_out: ?*u64, total_out: ?*u64) i32;
 pub extern fn mlx_llama_rpc_serve(endpoint: [*:0]const u8, cache_dir: ?[*:0]const u8, n_threads: i32, err: ?[*]u8, errlen: usize) bool;
 pub extern fn mlx_llama_local_gpu_count() i32;
+pub extern fn mlx_llama_layer_line_count(e: *Engine) i32;
+pub extern fn mlx_llama_layer_line(e: *Engine, i: i32) ?[*:0]const u8;

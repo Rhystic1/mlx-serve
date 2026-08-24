@@ -223,3 +223,6 @@ int32_t mlx_llama_rpc_local_device(char *name_buf, size_t cap, uint64_t *free_ou
 bool mlx_llama_rpc_serve(const char *endpoint, const char *cache_dir, int32_t n_threads, char *err, size_t errlen);
 // Local GPU-class devices (what precedes the RPC devices in the split order).
 int32_t mlx_llama_local_gpu_count(void);
+// llama.cpp's own "layer N assigned to device X" load lines for this engine.
+int32_t mlx_llama_layer_line_count(mlx_llama_engine *e);
+const char *mlx_llama_layer_line(mlx_llama_engine *e, int32_t i);

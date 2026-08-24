@@ -164,7 +164,7 @@ pub fn portInUse(io: std.Io, host: []const u8, port: u16) bool {
         .addr = @bitCast(bytes),
     };
     if (std.c.bind(fd, @ptrCast(&sa), @sizeOf(std.c.sockaddr.in)) == 0) return false;
-    return std.c._errno().* == @intFromEnum(std.c.E.ADDRINUSE);
+    return std.c._errno().* == @backingInt(std.c.E.ADDRINUSE);
 }
 
 test "hostIp4: dotted-decimal, wildcard, and the lenient arms" {
@@ -244,6 +244,9 @@ const io_util = @import("io_util.zig");
 const lan_mod = @import("lan.zig");
 const multipart = @import("multipart.zig");
 const remote_prefill = @import("remote_prefill.zig");
+const cluster = @import("cluster.zig");
+const build_cfg = @import("build_cfg.zig");
+const rpc_offload = @import("rpc_offload.zig");
 const ws_mod = @import("ws.zig");
 const ollama_mod = @import("ollama.zig");
 const cli_mod = @import("cli.zig");
@@ -763,6 +766,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/metrics",
     "/metrics.json",
     "/props",
+    "/v1/cluster",
     "/tokenize",
     "/v1/3d/generations",
     "/v1/audio/music-generations",
@@ -1505,6 +1509,8 @@ pub fn serve(
         log.info("MTP: forced ON for MoE targets (--mtp; default for new requests)\n", .{});
     }
     log.info("\nServer listening on http://{s}:{d}\n", .{ host, port });
+    g_bound_host = host;
+    g_bound_port = port;
     if (g_api_key != null) {
         log.info("API key auth: ENABLED for non-loopback requests (localhost is trusted; /health stays open)\n", .{});
     }
@@ -1783,6 +1789,13 @@ fn handleConnection(
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
         log.debug("GET  /health -> 200\n", .{});
         try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
+        return;
+    }
+    // The mesh in one object (rpc-offload-plan.md Part 3). Above resolution:
+    // it must render on an empty server, and it reads only snapshots.
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/cluster")) {
+        log.debug("GET  /v1/cluster -> 200\n", .{});
+        try handleCluster(allocator, stream, registry);
         return;
     }
     // The console. It belongs here, above resolution, for the same reason
@@ -4335,6 +4348,82 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
 /// media-gen serving). Same `memory` object shape as `renderPropsBody` —
 /// `MemoryInfo.parse` client-side reads only that key — with the model
 /// fields omitted (there is no model config to describe).
+pub var g_bound_host: []const u8 = "";
+pub var g_bound_port: u16 = 0;
+
+fn handleCluster(allocator: std.mem.Allocator, stream: *Conn, registry: *ModelRegistry) !void {
+    // self.models
+    var models: std.ArrayList(u8) = .empty;
+    defer models.deinit(allocator);
+    {
+        const snap = try registry.snapshot(allocator);
+        defer allocator.free(snap);
+        try models.append(allocator, '[');
+        for (snap, 0..) |m, i| {
+            if (i > 0) try models.append(allocator, ',');
+            try chat_mod.appendJsonString(allocator, &models, m.id);
+        }
+        try models.append(allocator, ']');
+    }
+    // lan.peers
+    var peers: std.ArrayList(u8) = .empty;
+    defer peers.deinit(allocator);
+    if (g_lan) |l| try l.table.appendPeersJson(allocator, &peers);
+    // rpc.serve
+    var dev_name_buf: [128]u8 = undefined;
+    var rpc_serve: ?cluster.Serve = null;
+    var serve_ep_buf: [64]u8 = undefined;
+    if (rpc_offload.g_rpc_serve.len > 0) {
+        if (arch_llama.localRpcDevice(&dev_name_buf)) |d| {
+            const ep = rpc_offload.serveEndpoint(&serve_ep_buf, rpc_offload.g_rpc_serve) catch rpc_offload.g_rpc_serve;
+            rpc_serve = .{ .endpoint = ep, .device = d.name, .is_gpu = d.is_gpu, .free_bytes = d.mem.free, .total_bytes = d.mem.total };
+        }
+    }
+    // prefill
+    const url = @import("remote_prefill_client.zig").g_remote_prefill_url;
+    const is_worker = build_cfg.llama_enabled; // /v1/prefill is served by every llama build
+    const mode: []const u8 = if (url != null) "consumer" else if (is_worker) "worker" else "none";
+    const consumer_engine: ?[]const u8 = if (url == null) null else if (comptime build_cfg.mlx_enabled) "mlx" else "llama";
+    var local_rate: f64 = 0;
+    var remote_rate: f64 = 0;
+    var prefill_model: ?[]const u8 = null;
+    if (registry.default_id.len > 0) if (registry.entries.get(registry.default_id)) |lm| {
+        const cal = &lm.remote_prefill_cal;
+        if (cal.local.ms_per_token > 0) local_rate = 1000.0 / cal.local.ms_per_token;
+        if (cal.remote.ms_per_token > 0) remote_rate = 1000.0 / cal.remote.ms_per_token;
+        prefill_model = lm.id;
+    };
+    var host_buf: [256]u8 = undefined;
+    var inflight: u32 = 0;
+    if (global_scheduler) |sch| inflight = if (sch.inflight_prefill_tokens.load(.monotonic) > 0 or sch.inflight_generated_tokens.load(.monotonic) > 0) 1 else 0;
+    const body = try cluster.render(allocator, .{
+        .name = g_lan_name orelse (platform.hostName(&host_buf) orelse "mlx-serve"),
+        .host = g_bound_host,
+        .port = g_bound_port,
+        .platform = @tagName(builtin.os.tag),
+        .engine = if (comptime build_cfg.mlx_enabled) "mlx" else "llama.cpp",
+        .version = build_options.version,
+        .models_json = models.items,
+        .lan_enabled = g_lan != null,
+        .lan_peers_json = peers.items,
+        .rpc_serve = rpc_serve,
+        .rpc = &cluster.g_rpc,
+        .tensor_split = rpc_offload.g_tensor_split,
+        .prefill_mode = mode,
+        .prefill_consumer_engine = consumer_engine,
+        .prefill_url = url,
+        .prefill_model = prefill_model,
+        .prefill_kv_type = arch_llama.kvTypeName(llama_kv_quant.ggmlType()),
+        .prefill_last = cluster.g_prefill_last,
+        .prefill_local_tok_s = local_rate,
+        .prefill_remote_tok_s = remote_rate,
+        .decode_tok_s = cluster.g_last_decode_tok_s,
+        .requests_inflight = inflight,
+    });
+    defer allocator.free(body);
+    try sendResponse(stream, "200 OK", "application/json", body);
+}
+
 fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     var active_mem: usize = 0;
     var peak_mem: usize = 0;
