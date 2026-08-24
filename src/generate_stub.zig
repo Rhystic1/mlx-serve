@@ -62,6 +62,7 @@ pub const GenerationResult = struct {
     /// reports its persistent-session prefix reuse through this same field, so
     /// it stays meaningful in a GGUF-only build.
     cached_tokens: u32 = 0,
+    remote_prefill_tokens: u32 = 0,
     logprobs: ?[]LogprobResult = null,
     finish_details: ?[]const u8 = null,
 };

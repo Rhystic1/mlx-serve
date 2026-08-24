@@ -441,6 +441,11 @@ pub const Slot = struct {
     /// skip these — billing a round trip as local prefill would teach the
     /// consumer it is slower than it is and refuse remote prefill thereafter.
     remote_prefilled: bool = false,
+    /// Tokens restored from a remote worker, surfaced as
+    /// `timings.remote_prefill_tokens`. `cached_n` is deliberately 0 on these
+    /// requests (see cachedTokensAfterPrefill), which left a client no way to
+    /// see that remote prefill engaged at all; this is that proof.
+    remote_prefill_tokens: u32 = 0,
     /// Wall-clock nanoseconds of interleaved decode ticks hosted INSIDE this
     /// slot's prefill (chunk-boundary yields). Charged to the decoding slots
     /// that received the tokens; subtracted from this slot's `prefill_ns` so
@@ -3985,7 +3990,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 // Cached tokens were reused rather than computed, so the sample
                 // counts only what this box actually ran.
                 if (!slot.remote_prefilled and slot.prompt_tokens > slot.cached_tokens) {
-                    slot.model.local_prefill_rate.observe(
+                    slot.model.remote_prefill_cal.observeLocal(
                         @as(f64, @floatFromInt(slot.prefill_ns)) / 1_000_000.0,
                         @intCast(slot.prompt_tokens - slot.cached_tokens),
                     );
@@ -4825,6 +4830,11 @@ fn maybeRemotePrefill(
         if (why != .disabled) log.info("[remote-prefill] fell back: {s}\n", .{why.text()});
         return false;
     }
+    // Calibration gate: skip while the LEARNED remote rate is losing to the
+    // learned local one, or while a failure ladder is backing off. Unmeasured
+    // means attempt — the rates cannot be learned any other way.
+    if (!slot.model.remote_prefill_cal.shouldTry()) return false;
+
     const url = rpc.g_remote_prefill_url.?;
 
     const model_bytes = modelFileBytes(sch.io, slot.model.path) orelse {
@@ -4832,6 +4842,7 @@ fn maybeRemotePrefill(
         return false;
     };
 
+    const rt_start = std.Io.Timestamp.now(sch.io, .boot);
     const outcome = rpc.fetchBlob(slot.allocator, url, slot.model.id, i32_prompt, .{
         .model = slot.model.id,
         .n_tokens = i32_prompt.len,
@@ -4846,6 +4857,9 @@ fn maybeRemotePrefill(
 
     switch (outcome) {
         .fell_back => |why| {
+            // Never reached a restore, so this says nothing about remote
+            // SPEED — it is a failure, with its own faster backoff ladder.
+            slot.model.remote_prefill_cal.observeFailure();
             log.info("[remote-prefill] fell back: {s}\n", .{why});
             return false;
         },
@@ -4854,10 +4868,18 @@ fn maybeRemotePrefill(
             sess.importState(blob, remote_prefill.prefillSpan(i32_prompt)) catch {
                 // importState leaves the sequence EMPTY on failure, which is a
                 // valid state for sync — it simply cold-prefills. Never fatal.
+                slot.model.remote_prefill_cal.observeFailure();
                 log.info("[remote-prefill] fell back: {s}\n", .{rpc.FallbackReason.restore_failed.text()});
                 return false;
             };
-            log.info("[remote-prefill] engaged {d} tokens\n", .{i32_prompt.len});
+            // A COMPLETED exchange is the only evidence about remote speed. The
+            // sample is the WHOLE round trip — worker prefill, transfer and
+            // latency together — which is what the local rate is compared
+            // against, and needs no wire rate assumed anywhere.
+            const rt_ms = @as(f64, @floatFromInt(rt_start.untilNow(sch.io, .boot).nanoseconds)) / 1_000_000.0;
+            slot.model.remote_prefill_cal.observeRemote(rt_ms, i32_prompt.len);
+            slot.remote_prefill_tokens = @intCast(i32_prompt.len);
+            log.info("[remote-prefill] engaged {d} tokens in {d:.0} ms (cached_n is 0 by design)\n", .{ i32_prompt.len, rt_ms });
             return true;
         },
     }

@@ -514,6 +514,12 @@ pub const GenerationResult = struct {
     /// is what was actually run through the model this turn, so `prefill_tps`
     /// reflects real compute rather than an inflated full-prompt rate.
     cached_tokens: u32 = 0,
+    /// Prompt tokens restored from a REMOTE prefill worker. Deliberately not
+    /// folded into `cached_tokens`: those were reused for free from local KV,
+    /// these cost a round trip that is billed into `prefill_ns`, and mixing
+    /// them makes `prefill_tps` meaningless. Surfaced as
+    /// `timings.remote_prefill_tokens` so a client can see engagement at all.
+    remote_prefill_tokens: u32 = 0,
     logprobs: ?[]LogprobResult = null, // per-token logprobs (caller must free)
     /// Non-null only when the degenerate-tail guard cut this generation:
     /// the `finish_details.type` value emitted beside `finish_reason`

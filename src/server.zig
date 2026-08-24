@@ -6460,6 +6460,7 @@ fn nonStreamingViaScheduler(
         .prefill_ns = slot.prefill_ns,
         .decode_ns = slot.decode_ns,
         .cached_tokens = slot.cached_tokens,
+        .remote_prefill_tokens = slot.remote_prefill_tokens,
         .logprobs = logprobs_slice,
         .finish_details = slot.finish_details,
     };
@@ -6642,7 +6643,7 @@ fn handleNonStreamingGeneration(
             }
             defer if (tc_reasoning_allocated) allocator.free(tc_reasoning_json);
 
-            const tc_timings = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
+            const tc_timings = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.remote_prefill_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
             defer allocator.free(tc_timings);
             const tc_timings_field = if (tc_timings.len > 0)
                 try std.fmt.allocPrint(allocator, ",\"timings\":{s}", .{tc_timings})
@@ -6729,7 +6730,7 @@ fn handleNonStreamingGeneration(
     defer if (reasoning_allocated) allocator.free(reasoning_json);
     defer if (usage_details_allocated) allocator.free(usage_details_json);
 
-    const timings_obj = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
+    const timings_obj = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.remote_prefill_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
     defer allocator.free(timings_obj);
     const timings_field = if (timings_obj.len > 0)
         try std.fmt.allocPrint(allocator, ",\"timings\":{s}", .{timings_obj})
@@ -6799,6 +6800,7 @@ const StreamingTokenStream = struct {
     /// these instead of touching the underlying gen/slot directly so the same
     /// post-generation code works for both legacy and scheduler paths.
     prompt_tokens: u32 = 0,
+    remote_prefill_tokens: u32 = 0,
     cached_tokens: u32 = 0,
     completion_tokens: u32 = 0,
     finish_reason: []const u8 = "stop",
@@ -6846,6 +6848,7 @@ const StreamingTokenStream = struct {
         if (self.slot) |s| {
             self.prompt_tokens = s.prompt_tokens;
             self.cached_tokens = s.cached_tokens;
+            self.remote_prefill_tokens = s.remote_prefill_tokens;
             self.completion_tokens = s.completion_tokens;
             self.finish_reason = s.finish_reason;
             self.finish_details = s.finish_details;
@@ -7876,7 +7879,7 @@ fn handleStreamingGeneration(
         if (include_usage) {
             const usage_json = try formatChatUsage(allocator, total_prompt, ts.completion_tokens, ts.cached_tokens, "");
             defer allocator.free(usage_json);
-            const timings_obj = try formatTimingsObject(allocator, total_prompt, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns, tokenize_ns);
+            const timings_obj = try formatTimingsObject(allocator, total_prompt, ts.cached_tokens, ts.remote_prefill_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns, tokenize_ns);
             defer allocator.free(timings_obj);
             const timings_opt: ?[]const u8 = if (timings_obj.len > 0) timings_obj else null;
             try sendSSEUsageChunk(allocator, stream, chat_id, model_name, usage_json, timings_opt);
@@ -9272,6 +9275,7 @@ fn formatTimingsObject(
     allocator: std.mem.Allocator,
     prompt_tokens: u32,
     cached_tokens: u32,
+    remote_prefill_tokens: u32,
     completion_tokens: u32,
     prefill_ns: u64,
     decode_ns: u64,
@@ -9291,9 +9295,9 @@ fn formatTimingsObject(
     // being present — they can branch on the value, not on presence/absence.
     return try std.fmt.allocPrint(
         allocator,
-        \\{{"prompt_n":{d},"cached_n":{d},"prompt_ms":{d:.3},"prompt_per_second":{d:.3},"predicted_n":{d},"predicted_ms":{d:.3},"predicted_per_second":{d:.3},"tokenize_ms":{d:.3}}}
+        \\{{"prompt_n":{d},"cached_n":{d},"remote_prefill_tokens":{d},"prompt_ms":{d:.3},"prompt_per_second":{d:.3},"predicted_n":{d},"predicted_ms":{d:.3},"predicted_per_second":{d:.3},"tokenize_ms":{d:.3}}}
     ,
-        .{ prompt_tokens, cached_tokens, p_ms, p_tps, completion_tokens, d_ms, d_tps, t_ms },
+        .{ prompt_tokens, cached_tokens, remote_prefill_tokens, p_ms, p_tps, completion_tokens, d_ms, d_tps, t_ms },
     );
 }
 
@@ -11644,7 +11648,7 @@ fn handleAnthropicNonStreaming(
     // an extension (mirrors what /v1/chat/completions already does) so bench
     // tooling can read tokenize_ms / prompt_ms / predicted_ms from either
     // surface without re-implementing the SSE accumulator.
-    const timings_obj = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
+    const timings_obj = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.remote_prefill_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
     defer allocator.free(timings_obj);
     const timings_field = if (timings_obj.len > 0)
         try std.fmt.allocPrint(allocator, ",\"timings\":{s}", .{timings_obj})
@@ -14332,7 +14336,10 @@ fn buildResponsesEnvelope(
     // Iteration 1 timings extension. Reuses the chat-completions
     // formatter so any future field added there appears on Responses too
     // without a second touch point.
-    const timings_obj = try formatTimingsObject(allocator, input_tokens, cached_input_tokens, completion_tokens_for_timings, prefill_ns, decode_ns, tokenize_ns);
+    // 0 remote-prefilled: /v1/responses does not carry the slot's count here,
+    // and reporting an unknown as anything but zero would be a lie a client
+    // could not detect.
+    const timings_obj = try formatTimingsObject(allocator, input_tokens, cached_input_tokens, 0, completion_tokens_for_timings, prefill_ns, decode_ns, tokenize_ns);
     defer allocator.free(timings_obj);
     if (timings_obj.len > 0) {
         try buf.appendSlice(allocator, ",\"timings\":");

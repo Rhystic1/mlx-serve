@@ -224,7 +224,7 @@ pub const LoadedModel = struct {
     /// local prefills (see remote_prefill_client.LocalRateEma). Lives on the
     /// entry because it is per MODEL and per machine, and because a hot model
     /// switch must not carry another model's rate.
-    local_prefill_rate: @import("remote_prefill_client.zig").LocalRateEma = .{},
+    remote_prefill_cal: @import("remote_prefill_client.zig").Calibration = .{},
     llama_kv_type_k: i32 = 0,
     llama_kv_type_v: i32 = 0,
     /// Lazily created embedding session for a GGUF model (`/v1/embeddings`).

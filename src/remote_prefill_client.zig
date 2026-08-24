@@ -175,6 +175,88 @@ pub const LocalRateEma = struct {
     }
 };
 
+/// Per-model, per-machine calibration: two learned rates plus the backoffs
+/// that stop a bad config paying forever and let a fixed one be rediscovered.
+///
+/// The client cannot know the worker's speed or the wire rate, and assuming
+/// either is wrong the moment someone changes the network. So the REMOTE side
+/// is learned exactly like the local side: round trip / tokens, EMA. That one
+/// number already contains worker prefill + transfer + latency, self-corrects
+/// when any of them changes, and needs no headers.
+///
+/// Bootstrapping costs one slow request per model per boot, accepted
+/// deliberately: unmeasured means attempt, or a consumer could only discover
+/// remote prefill was worth it after doing the local work it exists to avoid.
+pub const Calibration = struct {
+    local: LocalRateEma = .{},
+    remote: LocalRateEma = .{},
+
+    /// Re-probe cadence while remote is LOSING. Not "never again": the worker
+    /// may be fixed, the network may improve, the consumer may heat up.
+    probe_interval: u32 = FIRST_PROBE_INTERVAL,
+    probe_countdown: u32 = 0,
+
+    /// Separate ladder for exchanges that never reached a restore. A refused
+    /// or unreachable worker says nothing about SPEED, so it must not enter
+    /// the rate — but it must still back off, and faster than the losing case.
+    fail_interval: u32 = 1,
+    fail_countdown: u32 = 0,
+
+    pub const FIRST_PROBE_INTERVAL: u32 = 16;
+    pub const MAX_INTERVAL: u32 = 256;
+
+    /// Consume one eligible request. True = attempt remote this time.
+    pub fn shouldTry(self: *Calibration) bool {
+        if (self.fail_countdown > 0) {
+            self.fail_countdown -= 1;
+            return false;
+        }
+        // Unmeasured on either side ⇒ attempt, and learn.
+        if (!self.local.known() or !self.remote.known()) return true;
+        if (self.remote.ms_per_token < self.local.ms_per_token) return true;
+        // Remote is losing. The countdown was armed when we MEASURED it
+        // losing, so we skip first and re-probe when it expires — probing
+        // immediately after observing a loss would waste a round trip on
+        // information we just obtained.
+        if (self.probe_countdown > 0) {
+            self.probe_countdown -= 1;
+            return false;
+        }
+        return true;
+    }
+
+    pub fn observeLocal(self: *Calibration, prefill_ms: f64, tokens: usize) void {
+        self.local.observe(prefill_ms, tokens);
+    }
+
+    /// A COMPLETED exchange: the blob came back and restored. Only this is
+    /// evidence about remote speed.
+    pub fn observeRemote(self: *Calibration, round_trip_ms: f64, tokens: usize) void {
+        self.remote.observe(round_trip_ms, tokens);
+        self.fail_interval = 1;
+        self.fail_countdown = 0;
+        if (!self.local.known()) return;
+        if (self.remote.ms_per_token < self.local.ms_per_token) {
+            // A win resets the ladder, so a config that recovers is not
+            // punished by however long it was previously bad.
+            self.probe_interval = FIRST_PROBE_INTERVAL;
+            self.probe_countdown = 0;
+        } else {
+            // A loss arms the next skip window and widens it, so a config that
+            // stays bad costs steadily fewer round trips.
+            self.probe_countdown = self.probe_interval;
+            self.probe_interval = @min(self.probe_interval * 2, MAX_INTERVAL);
+        }
+    }
+
+    /// An exchange that never reached restore — unreachable, timed out,
+    /// refused, mismatched. Not a rate sample.
+    pub fn observeFailure(self: *Calibration) void {
+        self.fail_countdown = self.fail_interval;
+        self.fail_interval = @min(self.fail_interval * 2, MAX_INTERVAL);
+    }
+};
+
 /// Solve `fixed + slope*n` from two replies at different lengths.
 ///
 /// One reply cannot separate the two terms, and treating a single
@@ -226,6 +308,7 @@ pub const FallbackReason = enum {
     connect_failed,
     timed_out,
     http_error,
+    read_failed,
     truncated_response,
     oversize_blob,
     restore_failed,
@@ -241,6 +324,7 @@ pub const FallbackReason = enum {
             .connect_failed => "remote unreachable",
             .timed_out => "remote timed out",
             .http_error => "remote returned an error status",
+            .read_failed => "connection broke while reading the reply",
             .truncated_response => "response ended mid-message",
             .oversize_blob => "declared blob exceeds the client cap",
             .restore_failed => "state restore refused the blob",
@@ -459,7 +543,16 @@ pub fn fetchBlob(
     var declared: ?usize = null;
     while (true) {
         if (!net.waitReadable(s, timeout_ms)) return .{ .fell_back = FallbackReason.timed_out.text() };
-        const n = net.read(s, &chunk) catch break;
+        // A read ERROR and a short body both used to surface as
+        // "response ended mid-message", which m4mini hit once and could not
+        // diagnose without a packet capture: an error on the FIRST read leaves
+        // the buffer empty and produces the identical message. Distinguish
+        // them — a broken connection and a truncated body have different
+        // causes and different fixes.
+        const n = net.read(s, &chunk) catch {
+            if (resp.items.len == 0) return .{ .fell_back = FallbackReason.read_failed.text() };
+            break;
+        };
         if (n == 0) break;
         resp.appendSlice(allocator, chunk[0..n]) catch
             return .{ .fell_back = FallbackReason.oversize_blob.text() };
@@ -807,6 +900,78 @@ test "a learned local rate drives viability without any configuration" {
     // viable range, which is what m4max measured: remote won by ~0.8 s where
     // f16 had lost by ~2 s.
     try testing.expect(e.viable(3329));
+}
+
+test "Calibration attempts while uncalibrated, then follows the measured rates" {
+    var c = Calibration{};
+    // Nothing known ⇒ attempt, or the consumer could only learn remote was
+    // worth it after doing the local work remote prefill exists to avoid.
+    try testing.expect(c.shouldTry());
+    c.observeLocal(23_820.0, 3525); // 6.76 ms/token
+    try testing.expect(c.shouldTry()); // remote still unknown
+    c.observeRemote(11_800.0, 3525); // 3.35 ms/token — remote wins
+    try testing.expect(c.shouldTry());
+    try testing.expect(c.shouldTry()); // and keeps winning, no backoff
+}
+
+test "a LOSING remote backs off on a doubling ladder instead of never retrying" {
+    var c = Calibration{};
+    c.observeLocal(7_020.0, 3329); // 2.11 ms/token, fast consumer
+    c.observeRemote(30_000.0, 3329); // 9.01 ms/token — remote loses badly
+
+    // Next eligible request is skipped, and the ladder starts.
+    try testing.expect(!c.shouldTry());
+    var skipped: u32 = 1;
+    while (!c.shouldTry()) : (skipped += 1) {
+        if (skipped > 1000) return error.NeverReprobed; // the bug this pins
+    }
+    // It DID re-probe rather than giving up forever.
+    try testing.expect(skipped >= Calibration.FIRST_PROBE_INTERVAL);
+    // And the interval grew, so a permanently bad config costs less over time.
+    try testing.expect(c.probe_interval > Calibration.FIRST_PROBE_INTERVAL);
+    try testing.expect(c.probe_interval <= Calibration.MAX_INTERVAL);
+}
+
+test "a recovered remote is not punished for how bad it used to be" {
+    var c = Calibration{};
+    c.observeLocal(7_020.0, 3329);
+    c.observeRemote(30_000.0, 3329); // losing
+    _ = c.shouldTry();
+    _ = c.shouldTry();
+    try testing.expect(c.probe_interval >= Calibration.FIRST_PROBE_INTERVAL);
+
+    // The network is fixed / the worker is upgraded: several fast exchanges
+    // pull the EMA under local, and the ladder resets.
+    var i: usize = 0;
+    while (i < 20) : (i += 1) c.observeRemote(3_000.0, 3329);
+    try testing.expect(c.remote.ms_per_token < c.local.ms_per_token);
+    try testing.expectEqual(Calibration.FIRST_PROBE_INTERVAL, c.probe_interval);
+    try testing.expect(c.shouldTry());
+}
+
+test "a failed exchange is a FAILURE count, never a speed sample" {
+    // An unreachable or mismatched worker says nothing about how fast it is.
+    // Folding those into the rate would poison it with a number that is not a
+    // measurement of anything.
+    var c = Calibration{};
+    c.observeLocal(23_820.0, 3525);
+    const before = c.remote;
+    c.observeFailure();
+    try testing.expectEqual(before.ms_per_token, c.remote.ms_per_token);
+    try testing.expect(!c.remote.known());
+
+    // It backs off, and faster than the losing ladder — a broken config should
+    // stop costing round trips almost immediately.
+    try testing.expect(!c.shouldTry());
+    c.observeFailure();
+    c.observeFailure();
+    try testing.expect(c.fail_interval > 1);
+
+    // A success clears the failure ladder entirely.
+    c.observeRemote(11_800.0, 3525);
+    try testing.expectEqual(@as(u32, 1), c.fail_interval);
+    try testing.expectEqual(@as(u32, 0), c.fail_countdown);
+    try testing.expect(c.shouldTry());
 }
 
 test "solveBlobShape separates the window payload from the per-token slope" {
