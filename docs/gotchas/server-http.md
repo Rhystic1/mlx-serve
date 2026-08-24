@@ -1497,3 +1497,68 @@ leaves a TIME_WAIT child on it (red on revert: without REUSEADDR the
 TIME_WAIT arm convicts), and a source scan pinning main.zig's pre-flight to
 `server_mod.portInUse` so the serve path cannot grow a second connect-shaped
 probe.
+
+## `POST /v1/prefill`: a remote-prefill worker, and why its blob stops one token short (2026-08-23)
+
+The NVIDIA remote-prefill PoC (`nvidia-prefill-plan.md`): a Linux/WSL box with
+a CUDA llama.cpp prefills, a Mac with Metal llama.cpp decodes, and the KV
+travels as llama.cpp's own sequence-state blob (`llama_state_seq_get_data` /
+`set_data`) — upstream's backend-neutral serialization, so nothing is
+translated. The server half is `POST /v1/prefill`
+(`{"model","tokens"}` → `application/octet-stream`), a `scheduler.PrefillRequest`
+run on the inference thread against a DEDICATED `llama_prefill_session` that is
+reset before the sync and after the export, so `pos == tokens.len` by
+construction and the blob never carries anything older. The shared wire
+contract — header names, request parser, reply validator, `prefillSpan` — is
+`src/remote_prefill.zig`, one pure file both sides compile.
+
+**The shim's position counter is not llama's.** `mlx_llama_session.pos` is the
+shim's own count of tokens decoded; `llama_state_seq_set_data` restores the KV
+and knows nothing about it. A restore that left `pos` behind would make the
+next decode write at the wrong position — coherent-looking output from a
+corrupt cache, no error anywhere. `mlx_llama_session_state_set` takes
+`n_tokens` and sets it itself; failure leaves the sequence EMPTY, never
+half-restored. The Zig `importState` also sets the `resident` token mirror so
+the ordinary `sync` sees the prompt resident.
+
+**The blob describes N-1 tokens, measured not guessed.** The first round-trip
+test exported all N tokens; the consumer's `sync(prompt)` then found the whole
+prompt resident, backed off one position to get logits, and did that by
+TRIMMING — which LFM2.5's recurrent memory refuses (`trimClearedSession`), so
+the session cleared and the consumer cold-prefilled: `reused = 0`. Any Mamba /
+GatedDeltaNet checkpoint is in the class. The worker now prefills
+`prefillSpan(tokens)` = all but the last; the consumer imports that span and
+`sync`s the full prompt, which decodes exactly one token on every arch (and the
+blob carries no logits, so one decode was owed regardless). `X-Prefill-Tokens`
+still echoes N. Pinned by `llama: sequence state round-trips between sessions`
+(reused == N-1, zero trim refusals, argmax equal to a single-session reference)
+and `tests/test_prefill_endpoint.sh` (headers, byte-identical repeat, named
+400s, chat still served afterwards).
+
+**Identity is checked structurally, not by name.** Model id is a string each
+side resolved on its own; the same name can be a different quant. The reply
+carries `X-Prefill-Vocab` and `X-Prefill-Model-Bytes` (the GGUF's size) beside
+version / model / token count / blob length; `validateResponse` names whichever
+one mismatches and the consumer falls back. Same llama.cpp build (b10472
+vendored) on both sides is a pin, not a header.
+
+**CUDA on WSL2 — the build and the host cap.** `scripts/build-llama-cuda.sh`
+produces a real CUDA backend (`ggml_cuda_init: found 1 CUDA devices`; 2040
+tokens in 177 ms = 11.5k tok/s on an RTX 5060 Ti, VRAM +1.7 GB at load, 72%
+util during the call), but only after two fixes. The box had no nvcc and no
+g++ and sudo needs a password, so the toolchain is sudo-free: CUDA 13.0 runfile
+`--toolkit --toolkitpath=$HOME/cuda-13.0`, gcc/g++ 14 and a `libxml2=2.13`
+(the installer's own dependency, old soname) via micromamba in `~/tc`. And
+`libggml-cuda.so` links libcudart / libcublas / libcublasLt from the TOOLKIT
+while its RUNPATH is `$ORIGIN`, so a stage without them dlopens the backend and
+then fails its deps — ggml continues on the CPU and nothing says so. The script
+now stages the three runtime libraries beside the backend and refuses by name
+when it cannot find them. Then the 7 GB gemma-4-12b load died in `cudaMalloc`
+with `nvidia-smi` showing 593 MiB used of 16 GB: a probe showed the WHOLE
+process capped at 4 GiB cumulative (later 2 GiB), `dmesg` said
+`dxgkio_create_allocation: Ioctl failed: -75`, and the Windows host was at
+81–91 GB of a 95 GB commit limit with ~70 GB held outside any process. WSL
+GPU-PV backs every VRAM allocation with host commit, and killed WSL processes
+appear to leave theirs behind. The cap is the HOST's and the recovery
+(`wsl --shutdown` or a reboot) is the user's — the endpoint was proven on
+LFM2.5 (1.6 GB), which fits under it.

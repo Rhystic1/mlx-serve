@@ -156,6 +156,30 @@ find "$TMP/build" \( -name 'libllama.so*' -o -name 'libggml*.so*' -o -name 'libm
   exit 1
 }
 
+# The CUDA RUNTIME beside the backend. libggml-cuda.so links libcudart /
+# libcublas / libcublasLt from the TOOLKIT, and its RUNPATH is $ORIGIN (see
+# above) -- so on a box where the toolkit lives in a home directory or is not
+# on the loader path at all, the backend dlopens fine at ggml init and then
+# fails to load its own deps, and ggml silently continues on the CPU. Staging
+# the three runtime libraries next to it is what makes the stage self-contained
+# (the driver, libcuda.so.1, is the one thing that must come from the host).
+# Measured 2026-08-23 on WSL2 with a ~/cuda-13.0 runfile install: without
+# these, `ldd libggml-cuda.so` reports all three "not found".
+if [ "${LLAMA_CPU_ONLY:-0}" != "1" ]; then
+  CUDA_HOME="${CUDA_HOME:-$(cd "$(dirname "$(command -v nvcc)")/.." && pwd)}"
+  for libdir in "$CUDA_HOME/lib64" "$CUDA_HOME/targets/x86_64-linux/lib"; do
+    [ -d "$libdir" ] || continue
+    find "$libdir" -maxdepth 1 \( -name 'libcudart.so*' -o -name 'libcublas.so*' -o -name 'libcublasLt.so*' \) \
+      -exec cp -P {} "$DEST_LIB/" \;
+  done
+  for need in libcudart libcublas libcublasLt; do
+    ls "$DEST_LIB"/$need.so* >/dev/null 2>&1 || {
+      echo "[build-llama-cuda] ERROR: $need.so not found under $CUDA_HOME -- the staged backend would fail to load at runtime." >&2
+      exit 1
+    }
+  done
+fi
+
 cp "$SRC/include"/*.h "$DEST_INC/"
 cp "$SRC/ggml/include"/*.h "$DEST_INC/"
 # mtmd (multimodal) lives under tools/, not include/ -- same as fetch-llama.sh.

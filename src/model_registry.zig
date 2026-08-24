@@ -231,6 +231,12 @@ pub const LoadedModel = struct {
     /// same paths as the generation sessions -- it holds a context bound to
     /// the engine's model and must go before the engine does.
     llama_embed_session: ?*arch_llama.LlamaSession = null,
+    /// Lazily created DEDICATED session for `POST /v1/prefill` (remote
+    /// prefill worker). Never one of the `llama_sessions` cache entries: a
+    /// state blob must describe exactly the tokens the request carried and
+    /// nothing older, so this session is reset before and after every job.
+    /// Same lifetime rules as `llama_embed_session`.
+    llama_prefill_session: ?*arch_llama.LlamaSession = null,
 
     // ── Bookkeeping. Updated under `ModelRegistry.mutex`. ──
 
@@ -290,6 +296,10 @@ pub const LoadedModel = struct {
         if (self.llama_embed_session) |es| {
             es.free();
             self.llama_embed_session = null;
+        }
+        if (self.llama_prefill_session) |ps| {
+            ps.free();
+            self.llama_prefill_session = null;
         }
         self.llama_session_busy = false;
         if (self.ds4_engine) |engine| {

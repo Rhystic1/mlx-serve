@@ -243,6 +243,7 @@ test "shouldWarnOpenBind: warn only on an UNCHOSEN non-loopback bind" {
 const io_util = @import("io_util.zig");
 const lan_mod = @import("lan.zig");
 const multipart = @import("multipart.zig");
+const remote_prefill = @import("remote_prefill.zig");
 const ws_mod = @import("ws.zig");
 const ollama_mod = @import("ollama.zig");
 const cli_mod = @import("cli.zig");
@@ -769,6 +770,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/embeddings",
+    "/v1/prefill",
     "/v1/images/edits",
     "/v1/images/generations",
     "/v1/load-model",
@@ -2084,6 +2086,10 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleEmbeddings(allocator, stream, body, lm);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/prefill")) {
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handlePrefill(allocator, stream, body, lm);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/messages")) {
         if (text_gen_reject) |reason| {
             try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
@@ -4741,6 +4747,87 @@ fn handleTokenize(
 
     log.debug("POST /tokenize -> {d} tokens\n", .{ids.len});
     try sendResponse(stream, "200 OK", "application/json", result.items);
+}
+
+/// `POST /v1/prefill` -- the remote-prefill WORKER (nvidia-prefill-plan.md,
+/// wire contract in `remote_prefill.zig`). Embedded llama engine only: the
+/// reply is llama.cpp's own sequence-state blob, which only another llama.cpp
+/// of the same build on the same GGUF can restore. The model was resolved by
+/// dispatch from the body's `model`; the worker prefills all but the last
+/// token (`prefillSpan`) on the inference thread and answers binary, headers
+/// carrying every identity the consumer checks before restoring.
+fn handlePrefill(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    body: []const u8,
+    lm: *LoadedModel,
+) !void {
+    const engine = lm.llama_engine orelse {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "/v1/prefill serves embedded GGUF (llama.cpp) models only; this model is not one", 400);
+        return;
+    };
+    var req = remote_prefill.parseRequest(allocator, body) catch |err| {
+        const msg = switch (err) {
+            error.InvalidJson => "Invalid JSON",
+            error.NotAnObject => "Request body must be a JSON object",
+            error.MissingModel => "'model' (non-empty string) is required",
+            error.MissingTokens => "'tokens' (array of integers) is required",
+            error.TooFewTokens => "'tokens' needs at least 2 ids (one to prefill, one for the consumer to decode)",
+            error.TooManyTokens => "'tokens' exceeds the per-request cap",
+            error.BadToken => "'tokens' must be non-negative integers",
+            error.OutOfMemory => return err,
+        };
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+        return;
+    };
+    defer req.deinit(allocator);
+
+    const effective_ctx = getEffectiveContextLength(lm.config.?);
+    if (req.tokens.len > effective_ctx) {
+        var ovf_buf: [160]u8 = undefined;
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, req.tokens.len, effective_ctx), 400);
+        return;
+    }
+    const sch = global_scheduler orelse {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", "no scheduler (offline mode)", 503);
+        return;
+    };
+
+    const span = remote_prefill.prefillSpan(req.tokens);
+    var job = scheduler_mod.PrefillRequest{ .model = lm, .tokens = span, .allocator = allocator };
+    const blob = sch.computePrefill(&job) catch {
+        const why = job.error_name orelse "PrefillFailed";
+        defer if (job.error_name) |e| allocator.free(e);
+        log.err("POST /v1/prefill -> 500 ({s})\n", .{why});
+        const msg = try std.fmt.allocPrint(allocator, "prefill failed: {s}", .{why});
+        defer allocator.free(msg);
+        try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", msg, 500);
+        return;
+    };
+    defer allocator.free(blob);
+
+    const model_bytes: u64 = modelFileSize(stream.io, lm.path);
+    var extra_buf: [512]u8 = undefined;
+    const extra = try remote_prefill.formatHeaders(&extra_buf, req.model, req.tokens.len, blob.len, @intCast(engine.nVocab()), model_bytes);
+    log.info("POST /v1/prefill -> 200 ({d} tokens, {d} bytes)\n", .{ req.tokens.len, blob.len });
+    try sendBinaryResponse(stream, remote_prefill.CONTENT_TYPE, extra, blob);
+}
+
+/// Size of the GGUF the engine loaded (the consumer compares it to its own
+/// file). 0 when it cannot be stat'ed -- the consumer then refuses, which is
+/// the right answer for a worker that cannot prove what it serves.
+fn modelFileSize(io: std.Io, path: []const u8) u64 {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return 0;
+    if (st.kind != .file) return 0;
+    return @intCast(st.size);
+}
+
+/// 200 with a binary body and caller-supplied extra header lines (CRLF-terminated).
+fn sendBinaryResponse(stream: *Conn, content_type: []const u8, extra_headers: []const u8, body: []const u8) !void {
+    var hdr_buf: [1024]u8 = undefined;
+    const hdr = try std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\n{s}Connection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n", .{ content_type, body.len, extra_headers });
+    try stream.writeAllNoFlush(hdr);
+    try stream.writeAll(body);
 }
 
 fn handleDetokenize(

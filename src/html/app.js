@@ -330,6 +330,7 @@
     'POST /v1/audio/speech — model, input, optional ref_audio (base64 WAV) to clone a voice, stream; returns audio/wav bytes.',
     'POST /v1/audio/music-generations — model, prompt (style/genre/mood, required), lyrics, duration_seconds (10-600), vocal_language, bpm, seed, stream; returns audio/wav bytes.',
     'POST /v1/embeddings — model, input (string or array), optional dimensions.',
+    'POST /v1/prefill — model, tokens (ids); answers a binary llama.cpp state blob for a remote decoder (GGUF only).',
     'POST /v1/load-model and /v1/unload-model — model (a discovered id, or an absolute path to register one).',
     'Media endpoints with stream:true emit SSE {"type":"progress"|"complete"|"error"} instead of a JSON body.',
   ].join('\n');

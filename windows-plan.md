@@ -12,7 +12,7 @@ Status at a glance:
 |---|---|
 | §3.1 HTTP surface | **done** on Windows AND Linux — 3 bugs found and fixed |
 | §3.2 shell suite | **triaged** on both hosts, host shims added |
-| §3.3 Linux | **builds, tests and serves** — 4 more bugs found; CUDA compile still unverified |
+| §3.3 Linux | **builds, tests and serves on CUDA** — 4 more bugs found; CUDA build verified 2026-08-23 (11.5k tok/s prefill), WSL2 host commit cap noted |
 | §3.4 embeddings | **done**, verified on both hosts; vision + spec-decode not started |
 | §3.5 LAN / Bonjour | **works on Linux** (23/23 integration) — hand-rolled mDNS; Mac interop + Windows untested |
 | §3.7 CI | windows + linux jobs added, **neither run on a runner** |
@@ -215,7 +215,31 @@ which is a design change, not a triage fix. Worth knowing that BOTH chat GGUFs
 in reach are recurrent (LFM2.5, and Qwen3.5/3.8 are GatedDeltaNet), so this was
 not checked against a plain-transformer GGUF on either host.
 
-### 3.3 Linux — BUILDS, TESTS AND SERVES; the CUDA compile is still unproven
+### 3.3 Linux — BUILDS, TESTS AND SERVES, now on CUDA
+
+**CUDA verified 2026-08-23.** `scripts/build-llama-cuda.sh` (b10472, sm_120)
+produces a backend that engages: `ggml_cuda_init: found 1 CUDA devices`, a
+2040-token prefill in 177 ms (11.5k tok/s) on the RTX 5060 Ti, VRAM +1.7 GB at
+load, 72% util during the call. Two fixes were needed and one host limit was
+found; the full story is in `docs/gotchas/server-http.md` ("`POST /v1/prefill`").
+Short form: the box has no system nvcc/g++ and no passwordless sudo, so the
+toolchain is sudo-free (CUDA 13.0 runfile toolkit-only in `~/cuda-13.0`, gcc 14
++ libxml2 2.13 via micromamba in `~/tc`); the script now stages
+libcudart/libcublas/libcublasLt beside `libggml-cuda.so` (RUNPATH is `$ORIGIN`,
+so without them the backend fails its deps and ggml silently runs on the CPU);
+and WSL2 GPU-PV backs VRAM with Windows COMMIT — with the host at ~90 of 95 GB
+commit, a WSL process gets 2–4 GiB of VRAM total (`dxgkio_create_allocation:
+Ioctl failed: -75`), so the 7 GB gemma-4-12b would not load until the host is
+restarted. Build for this box:
+
+```
+export PATH=$HOME/cuda-13.0/bin:$HOME/tc/gcc14/bin:$PATH \
+       CC=$HOME/tc/gcc14/bin/gcc CXX=$HOME/tc/gcc14/bin/g++ \
+       CUDAHOSTCXX=$HOME/tc/gcc14/bin/g++ CMAKE_CUDA_ARCHITECTURES=120 \
+       LD_LIBRARY_PATH=$HOME/tc/gcc14/lib
+FORCE=1 ./scripts/build-llama-cuda.sh
+```
+
 
 Done 2026-08-21 under WSL2 Ubuntu 26.04 (kernel 6.18, 16 GB, RTX 5060 Ti
 visible via `nvidia-smi`). `zig build -Doptimize=ReleaseFast` links, the binary

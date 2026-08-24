@@ -917,6 +917,25 @@ pub const EmbedRequest = struct {
     done_cond: std.Io.Condition = .init,
 };
 
+/// Remote-prefill work item (`POST /v1/prefill`, embedded llama engine only):
+/// prefill `tokens` into the model's DEDICATED prefill session from empty,
+/// serialize the sequence state, clear the session. Runs on the inference
+/// thread like every other engine call; the conn thread blocks on `done`.
+pub const PrefillRequest = struct {
+    model: *model_registry_mod.LoadedModel,
+    /// Tokens to prefill (already the N-1 span -- the handler applies
+    /// `remote_prefill.prefillSpan`). Borrowed; must outlive the call.
+    tokens: []const i32,
+    /// Output: the llama.cpp sequence-state blob. Owned by `allocator`.
+    blob: ?[]u8 = null,
+    /// Output: error name on failure. Owned by `allocator`; caller frees.
+    error_name: ?[]const u8 = null,
+    done: bool = false,
+    allocator: std.mem.Allocator,
+    done_mu: std.Io.Mutex = .init,
+    done_cond: std.Io.Condition = .init,
+};
+
 /// Plan 05 Phase D: cold-load work item. Posted by `Scheduler.ensureLoaded`
 /// when a request targets an `.unloaded` (or freshly-evicted) entry; the
 /// inference thread drains the queue between ticks. The conn thread parses
@@ -1172,6 +1191,8 @@ pub const Scheduler = struct {
     /// Pending embedding requests (encoder-only models). Same shape as
     /// vision_queue; serviced inline between decode ticks.
     embed_queue: std.ArrayList(*EmbedRequest),
+    /// Remote-prefill jobs, drained one per tick beside the embed batch.
+    prefill_queue: std.ArrayList(*PrefillRequest),
     /// Phase D: pending cold-load requests. Conn threads post here via
     /// `scheduler.ensureLoaded`; the inference thread drains between ticks
     /// (load runs after cleanup + vision/embed, before prefill). Multiple
@@ -1321,6 +1342,7 @@ pub const Scheduler = struct {
             .decoding = std.ArrayList(*Slot).empty,
             .vision_queue = std.ArrayList(*VisionEncodeRequest).empty,
             .embed_queue = std.ArrayList(*EmbedRequest).empty,
+            .prefill_queue = std.ArrayList(*PrefillRequest).empty,
             .load_queue = std.ArrayList(*LoadRequest).empty,
             .gen_queue = std.ArrayList(*GenRequest).empty,
             .unload_queue = std.ArrayList(*UnloadRequest).empty,
@@ -1403,6 +1425,14 @@ pub const Scheduler = struct {
             req.done_mu.unlock(self.io);
         }
         self.embed_queue.deinit(self.allocator);
+        for (self.prefill_queue.items) |req| {
+            req.done_mu.lockUncancelable(self.io);
+            req.error_name = self.allocator.dupe(u8, "Shutdown") catch null;
+            req.done = true;
+            req.done_cond.broadcast(self.io);
+            req.done_mu.unlock(self.io);
+        }
+        self.prefill_queue.deinit(self.allocator);
         // Phase D: signal any pending cold-load requesters that the
         // server is shutting down. They roll back their entry state and
         // free pre-loaded CPU resources.
@@ -1910,6 +1940,27 @@ pub const Scheduler = struct {
     /// batched encoder forward pass on the inference thread. Same lifecycle
     /// as `encodeVision`: post + block + return results. Caller frees the
     /// returned rows + outer slice (allocated with `req.allocator`).
+    /// Remote prefill: post a `PrefillRequest` to the inference thread and block
+    /// until it holds the state blob (ownership passes to the caller) or an
+    /// error name.
+    pub fn computePrefill(self: *Scheduler, req: *PrefillRequest) ![]u8 {
+        self.queue_mu.lockUncancelable(self.io);
+        self.prefill_queue.append(self.allocator, req) catch |err| {
+            self.queue_mu.unlock(self.io);
+            return err;
+        };
+        self.queue_cond.broadcast(self.io);
+        self.queue_mu.unlock(self.io);
+
+        req.done_mu.lockUncancelable(self.io);
+        defer req.done_mu.unlock(self.io);
+        while (!req.done) {
+            req.done_cond.waitUncancelable(self.io, &req.done_mu);
+        }
+        if (req.error_name) |_| return error.PrefillFailed;
+        return req.blob orelse error.PrefillFailed;
+    }
+
     pub fn computeEmbeddings(self: *Scheduler, req: *EmbedRequest) ![][]f32 {
         self.queue_mu.lockUncancelable(self.io);
         self.embed_queue.append(self.allocator, req) catch |err| {
@@ -3767,6 +3818,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         var vision_batch: [4]*VisionEncodeRequest = undefined;
         var vision_n: usize = 0;
         var embed_batch: [4]*EmbedRequest = undefined;
+        var prefill_req: ?*PrefillRequest = null;
         var embed_n: usize = 0;
         // Phase D: cold-load drain. Process ONE load per tick — loading a
         // model is heavy (~seconds; weight read + JIT compile + warmup)
@@ -3792,6 +3844,9 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             while (embed_n < embed_batch.len and sch.embed_queue.items.len > 0) {
                 embed_batch[embed_n] = sch.embed_queue.orderedRemove(0);
                 embed_n += 1;
+            }
+            if (sch.prefill_queue.items.len > 0) {
+                prefill_req = sch.prefill_queue.orderedRemove(0);
             }
             if (sch.load_queue.items.len > 0) {
                 load_req = sch.load_queue.orderedRemove(0);
@@ -3827,6 +3882,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
             for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
         }
+        if (prefill_req) |req| runPrefillRequest(sch, req);
         if (load_req) |req| runLoadRequest(sch, req);
         if (unload_req) |req| runUnloadRequest(sch, req);
         if (gen_req) |req| runGenRequest(sch, req);
@@ -3838,7 +3894,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
-            while (sch.pending.items.len == 0 and sch.decoding.items.len == 0 and sch.vision_queue.items.len == 0 and sch.embed_queue.items.len == 0 and sch.cleanup_queue.items.len == 0 and sch.load_queue.items.len == 0 and sch.gen_queue.items.len == 0 and sch.unload_queue.items.len == 0 and !sch.shutdown.load(.acquire)) {
+            while (sch.pending.items.len == 0 and sch.decoding.items.len == 0 and sch.vision_queue.items.len == 0 and sch.embed_queue.items.len == 0 and sch.prefill_queue.items.len == 0 and sch.cleanup_queue.items.len == 0 and sch.load_queue.items.len == 0 and sch.gen_queue.items.len == 0 and sch.unload_queue.items.len == 0 and !sch.shutdown.load(.acquire)) {
                 sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
             }
             if (sch.shutdown.load(.acquire)) break;
@@ -4215,6 +4271,67 @@ fn runEmbedRequest(sch: *Scheduler, req: *EmbedRequest) void {
     req.done_mu.lockUncancelable(sch.io);
     defer req.done_mu.unlock(sch.io);
     req.results = results;
+    req.done = true;
+    req.done_cond.broadcast(sch.io);
+}
+
+/// Remote-prefill job on the inference thread. The dedicated session is reset
+/// BEFORE the sync (the blob must describe these tokens and nothing older --
+/// pos == tokens.len by construction) and AFTER the export (a worker holds no
+/// state between requests; the next job starts empty either way).
+fn runPrefillRequest(sch: *Scheduler, req: *PrefillRequest) void {
+    const engine = req.model.llama_engine orelse {
+        finishPrefillRequest(sch, req, "NotAnEmbeddedLlamaModel");
+        return;
+    };
+    if (req.model.llama_prefill_session == null) {
+        const ctx_size: i32 = if (req.model.config) |c| @intCast(c.max_position_embeddings) else 0;
+        const type_k = req.model.llama_kv_type_k;
+        const type_v = req.model.llama_kv_type_v;
+        req.model.llama_prefill_session = (if (type_k != 0 or type_v != 0)
+            engine.createSessionWithKvQuant(ctx_size, type_k, type_v)
+        else
+            engine.createSession(ctx_size)) catch |err| {
+            finishPrefillRequest(sch, req, @errorName(err));
+            return;
+        };
+        log.info("[prefill] created dedicated session (ctx={d})\n", .{ctx_size});
+    }
+    const sess = req.model.llama_prefill_session.?;
+    sess.reset();
+    defer sess.reset();
+
+    const t0 = std.Io.Timestamp.now(sch.io, .boot).nanoseconds;
+    _ = sess.sync(req.tokens) catch |err| {
+        finishPrefillRequest(sch, req, @errorName(err));
+        return;
+    };
+    const t1 = std.Io.Timestamp.now(sch.io, .boot).nanoseconds;
+    if (sess.pos() != @as(i32, @intCast(req.tokens.len))) {
+        finishPrefillRequest(sch, req, "PrefillPositionMismatch");
+        return;
+    }
+    const blob = sess.exportState(req.allocator) catch |err| {
+        finishPrefillRequest(sch, req, @errorName(err));
+        return;
+    };
+    const t2 = std.Io.Timestamp.now(sch.io, .boot).nanoseconds;
+    const prefill_ms = @as(f64, @floatFromInt(t1 - t0)) / 1e6;
+    const tps = if (prefill_ms > 0) @as(f64, @floatFromInt(req.tokens.len)) / (prefill_ms / 1000.0) else 0;
+    log.info("[prefill] {d} tokens in {d:.0} ms ({d:.0} tok/s), state {d} bytes exported in {d:.0} ms\n", .{ req.tokens.len, prefill_ms, tps, blob.len, @as(f64, @floatFromInt(t2 - t1)) / 1e6 });
+
+    req.done_mu.lockUncancelable(sch.io);
+    defer req.done_mu.unlock(sch.io);
+    req.blob = blob;
+    req.done = true;
+    req.done_cond.broadcast(sch.io);
+}
+
+fn finishPrefillRequest(sch: *Scheduler, req: *PrefillRequest, err_name: []const u8) void {
+    req.done_mu.lockUncancelable(sch.io);
+    defer req.done_mu.unlock(sch.io);
+    if (req.error_name) |old| req.allocator.free(old);
+    req.error_name = req.allocator.dupe(u8, err_name) catch null;
     req.done = true;
     req.done_cond.broadcast(sch.io);
 }
