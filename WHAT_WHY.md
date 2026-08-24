@@ -152,8 +152,13 @@ runs.
 
 - Windows and Linux builds serve GGUF models with CUDA today, full test suite
   green on both.
-- Remote prefill works end to end (Mac consumer, Windows CUDA worker) and is
-  measured, not just demoed.
+- Remote prefill is feature complete for the PoC: Mac consumer, Windows CUDA
+  worker, v2 wire contract (KV type + SWA mode checked, mismatch falls back),
+  and a gate driven by two learned per-model rates (local prefill vs remote
+  round trip), so it only fires when it pays on YOUR machine. Engagement is
+  reported in `timings.remote_prefill_tokens`. Measured on two Macs, not demoed.
+- Everything measured is gemma-4-12b on one gigabit LAN at 3k to 3.5k tokens.
+  Other models, lengths and networks are extrapolated, not tested.
 - Blob shrink round (q8_0 + windowed KV export) landed and measured: M4 Max
   went from a loss to a win at 3.3k tokens.
 - Layer offload is a design, not code.
