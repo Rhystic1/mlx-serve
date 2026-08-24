@@ -57,6 +57,7 @@ test {
     _ = @import("cli.zig");
     _ = @import("launch.zig");
     _ = @import("lan.zig");
+    _ = @import("remote_prefill_client.zig");
     _ = @import("model_registry.zig");
     _ = @import("scheduler.zig");
     _ = @import("server.zig");
