@@ -4823,6 +4823,10 @@ fn maybeRemotePrefill(
         .vocab = @intCast(engine.nVocab()),
         .model_bytes = model_bytes,
         .body_len = 0, // filled in from the actual body before validation
+        // The CONSUMER's own cache type. Without it validateResponse refuses
+        // every reply ("consumer KV cache type unknown") — deliberately, since
+        // a q8_0 blob restored into an f16 cache is garbage, not an error.
+        .kv_type = arch_llama.kvTypeName(slot.model.llama_kv_type_k),
     }, rpc.DEFAULT_TIMEOUT_MS);
 
     switch (outcome) {

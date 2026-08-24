@@ -47,6 +47,12 @@ pub const H_MODEL_BYTES = "X-Prefill-Model-Bytes";
 pub const H_KV_TYPE = "X-Prefill-Kv-Type";
 pub const H_SWA = "X-Prefill-Swa";
 
+/// Mirrors arch_llama.SWA_FULL_NAME / SWA_WINDOWED_NAME. Duplicated rather
+/// than imported so this pure wire module stays free of the engine; the two
+/// spellings are a WIRE contract, so they may not drift silently.
+pub const SWA_FULL_NAME = "full";
+pub const SWA_WINDOWED_NAME = "windowed";
+
 pub const CONTENT_TYPE = "application/octet-stream";
 
 /// The worker prefills ALL BUT THE LAST token, and the consumer decodes that
@@ -127,6 +133,8 @@ pub const ResponseHeaders = struct {
     bytes: ?[]const u8 = null,
     vocab: ?[]const u8 = null,
     model_bytes: ?[]const u8 = null,
+    kv_type: ?[]const u8 = null,
+    swa: ?[]const u8 = null,
 };
 
 pub const Expected = struct {
@@ -135,6 +143,8 @@ pub const Expected = struct {
     vocab: u32,
     model_bytes: u64,
     body_len: usize,
+    /// The CONSUMER's own cache type, as `arch_llama.kvTypeName` spells it.
+    kv_type: []const u8 = "",
 };
 
 /// Null when the reply is safe to restore; otherwise the reason to log beside
@@ -152,6 +162,28 @@ pub fn validateResponse(h: ResponseHeaders, e: Expected) ?[]const u8 {
     if (parseU64(vocab) != e.vocab) return "vocab size mismatch";
     const mb = h.model_bytes orelse return "missing " ++ H_MODEL_BYTES;
     if (parseU64(mb) != e.model_bytes) return "model file size mismatch";
+
+    // KV cache type: EQUALITY. llama.cpp refuses a cross-type restore itself
+    // ("mismatched key type") and leaves the session EMPTY, so this is belt
+    // over braces — but it turns a silent empty session into a named fallback
+    // the operator can read. "unknown" is never acceptable: it means one side
+    // could not name its own cache type, and guessing is how a q8_0 blob gets
+    // read as f16.
+    const kv = h.kv_type orelse return "missing " ++ H_KV_TYPE;
+    if (std.mem.eql(u8, kv, "unknown")) return "worker reported an unknown KV cache type";
+    if (e.kv_type.len == 0) return "consumer KV cache type unknown";
+    if (std.mem.eql(u8, e.kv_type, "unknown")) return "consumer KV cache type unknown";
+    if (!std.mem.eql(u8, kv, e.kv_type)) return "KV cache type mismatch";
+
+    // Sliding-window mode: COMPATIBILITY, deliberately not equality. The
+    // consumer's session is always full (persistent sessions must be), and
+    // linux-x64 verified on a real model that a windowed blob restores into a
+    // full cache and decodes correctly. Requiring equality would refuse every
+    // reply from a worker that windows its session to save VRAM — which is
+    // what the worker now always does.
+    const swa = h.swa orelse return "missing " ++ H_SWA;
+    const swa_known = std.mem.eql(u8, swa, SWA_FULL_NAME) or std.mem.eql(u8, swa, SWA_WINDOWED_NAME);
+    if (!swa_known) return "unrecognized sliding-window mode";
     if (e.body_len == 0) return "empty blob";
     return null;
 }
@@ -188,8 +220,8 @@ test "remote_prefill: parseRequest accepts the v1 body and refuses each malforme
 }
 
 test "remote_prefill: validateResponse passes a matching reply and names every mismatch" {
-    const e = Expected{ .model = "gemma-4-12b", .n_tokens = 3, .vocab = 262144, .model_bytes = 7_000_000, .body_len = 4096 };
-    const ok = ResponseHeaders{ .version = "2", .model = "gemma-4-12b", .tokens = "3", .bytes = "4096", .vocab = "262144", .model_bytes = "7000000" };
+    const e = Expected{ .model = "gemma-4-12b", .n_tokens = 3, .vocab = 262144, .model_bytes = 7_000_000, .body_len = 4096, .kv_type = "q8_0" };
+    const ok = ResponseHeaders{ .version = "2", .model = "gemma-4-12b", .tokens = "3", .bytes = "4096", .vocab = "262144", .model_bytes = "7000000", .kv_type = "q8_0", .swa = SWA_WINDOWED_NAME };
     try std.testing.expect(validateResponse(ok, e) == null);
 
     var h = ok;
@@ -216,6 +248,40 @@ test "remote_prefill: validateResponse passes a matching reply and names every m
     h = ok;
     h.vocab = "abc";
     try std.testing.expectEqualStrings("vocab size mismatch", validateResponse(h, e).?);
+
+    // ── v2: KV cache type is EQUALITY ────────────────────────────────────
+    h = ok;
+    h.kv_type = null;
+    try std.testing.expectEqualStrings("missing " ++ H_KV_TYPE, validateResponse(h, e).?);
+    h = ok;
+    h.kv_type = "f16";
+    try std.testing.expectEqualStrings("KV cache type mismatch", validateResponse(h, e).?);
+    // "unknown" means a side could not name its own cache type. Guessing is
+    // how a q8_0 blob gets read as f16, so it is never acceptable — from
+    // EITHER side.
+    h = ok;
+    h.kv_type = "unknown";
+    try std.testing.expectEqualStrings("worker reported an unknown KV cache type", validateResponse(h, e).?);
+    var e_unknown = e;
+    e_unknown.kv_type = "unknown";
+    try std.testing.expectEqualStrings("consumer KV cache type unknown", validateResponse(ok, e_unknown).?);
+    var e_blank = e;
+    e_blank.kv_type = "";
+    try std.testing.expectEqualStrings("consumer KV cache type unknown", validateResponse(ok, e_blank).?);
+
+    // ── v2: sliding-window mode is COMPATIBILITY, not equality ───────────
+    // The consumer is always full and a windowed blob restores into it, so a
+    // windowed worker (which is what the worker now always is) must pass.
+    h = ok;
+    h.swa = SWA_FULL_NAME;
+    try std.testing.expect(validateResponse(h, e) == null);
+    h.swa = SWA_WINDOWED_NAME;
+    try std.testing.expect(validateResponse(h, e) == null);
+    h.swa = null;
+    try std.testing.expectEqualStrings("missing " ++ H_SWA, validateResponse(h, e).?);
+    h = ok;
+    h.swa = "partial";
+    try std.testing.expectEqualStrings("unrecognized sliding-window mode", validateResponse(h, e).?);
 
     // A 200 with no bytes is not a state.
     var e0 = e;

@@ -337,6 +337,8 @@ const L_TOKENS = "x-prefill-tokens";
 const L_BYTES = "x-prefill-bytes";
 const L_VOCAB = "x-prefill-vocab";
 const L_MODEL_BYTES = "x-prefill-model-bytes";
+const L_KV_TYPE = "x-prefill-kv-type";
+const L_SWA = "x-prefill-swa";
 
 comptime {
     // If the shared module renames a header, these must move with it or the
@@ -347,6 +349,8 @@ comptime {
     assertLowerOf(proto.H_BYTES, L_BYTES);
     assertLowerOf(proto.H_VOCAB, L_VOCAB);
     assertLowerOf(proto.H_MODEL_BYTES, L_MODEL_BYTES);
+    assertLowerOf(proto.H_KV_TYPE, L_KV_TYPE);
+    assertLowerOf(proto.H_SWA, L_SWA);
 }
 
 fn assertLowerOf(comptime name: []const u8, comptime want: []const u8) void {
@@ -365,6 +369,8 @@ pub fn readHeaders(head: []const u8) proto.ResponseHeaders {
         .bytes = peers.headerValueCI(head, L_BYTES),
         .vocab = peers.headerValueCI(head, L_VOCAB),
         .model_bytes = peers.headerValueCI(head, L_MODEL_BYTES),
+        .kv_type = peers.headerValueCI(head, L_KV_TYPE),
+        .swa = peers.headerValueCI(head, L_SWA),
     };
 }
 
@@ -584,10 +590,10 @@ test "splitResponse needs a complete head and reports the real status" {
     try testing.expectEqualStrings("ab\r\n\r\ncd", splitResponse("HTTP/1.1 200 OK\r\n\r\nab\r\n\r\ncd").?.body);
 }
 
-test "readHeaders finds the six reply headers case-insensitively" {
+test "readHeaders finds all eight reply headers case-insensitively" {
     const head = "HTTP/1.1 200 OK\r\nx-prefill-version: 2\r\nX-PREFILL-MODEL: m\r\n" ++
         "X-Prefill-Tokens: 7\r\nx-Prefill-Bytes: 99\r\nX-Prefill-Vocab: 256000\r\n" ++
-        "X-Prefill-Model-Bytes: 1234";
+        "X-Prefill-Model-Bytes: 1234\r\nx-PREFILL-kv-type: q8_0\r\nX-Prefill-Swa: windowed";
     const h = readHeaders(head);
     try testing.expectEqualStrings("2", h.version.?);
     try testing.expectEqualStrings("m", h.model.?);
@@ -595,11 +601,13 @@ test "readHeaders finds the six reply headers case-insensitively" {
     try testing.expectEqualStrings("99", h.bytes.?);
     try testing.expectEqualStrings("256000", h.vocab.?);
     try testing.expectEqualStrings("1234", h.model_bytes.?);
+    try testing.expectEqualStrings("q8_0", h.kv_type.?);
+    try testing.expectEqualStrings("windowed", h.swa.?);
 
     // A well-formed reply validates; the same reply missing a header does not.
     // Proves our reader and their validator compose, which neither side's own
     // unit tests can show.
-    const exp = proto.Expected{ .model = "m", .n_tokens = 7, .vocab = 256000, .model_bytes = 1234, .body_len = 99 };
+    const exp = proto.Expected{ .model = "m", .n_tokens = 7, .vocab = 256000, .model_bytes = 1234, .body_len = 99, .kv_type = "q8_0" };
     try testing.expect(proto.validateResponse(h, exp) == null);
     try testing.expect(proto.validateResponse(readHeaders("HTTP/1.1 200 OK\r\nX-Prefill-Version: 1\r\n"), exp) != null);
 }
