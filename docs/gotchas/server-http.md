@@ -1668,3 +1668,27 @@ Guards: `src/rpc_offload.zig` (parsing, capacity, refusal text),
 refusal by name, layers on RPC0, coherent decode with tok/s). Windows note for
 the shell test: `command -v python3` finds the Microsoft Store alias stub, so
 prefer `python` first.
+
+## LAN capability advert + `auto` peers; and a GGUF that would not refuse (2026-08-24)
+
+rpc-offload-plan.md Part 2. Capabilities ride two channels: the mDNS/Bonjour
+TXT record gets `rpc=<port>` and `pf=1` (cheap, visible at discovery, built
+from `lan_policy.g_local_caps` so both transports' one-line `txtBuild` call
+sites are untouched), and the full picture — prefill KV type, which decides
+whether a worker's blob can restore at all — comes from the peer's own
+`GET /v1/cluster` right after its models are installed
+(`lan_peers.fetchPeerCaps`, shared by both transports, never fails the
+install; an older peer 404s and simply has no caps). `--rpc auto` resolves at
+load from `Table.rpcWorkers`; `--remote-prefill auto` resolves PER REQUEST from
+`Table.prefillPeerFor(model_id, kv_type)` — same id AND same kv type, because
+a type mismatch is a llama.cpp restore error. Neither `auto` can fail a
+request: no qualifying peer means the local path plus one log line, exactly
+the explicit-URL contract.
+
+The "refuses alone" arm of the plan's step 5 does not hold on Windows: loading
+Qwen3.8-27B-UD-Q5_K_M (18.4 GB) on a 16 GB 5060 Ti reported
+`CUDA0 model buffer size = 17828 MiB` and reached `engine ready` — WDDM's
+sysmem fallback spills VRAM into shared system RAM instead of failing the
+allocation. The local GGUF path has no memory preflight (only the split path
+bills weights against local + remote), so on Windows a too-big GGUF is a slow
+model, not a refusal; Metal on the Mac is where the refusal is real.

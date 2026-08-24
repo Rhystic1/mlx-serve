@@ -116,3 +116,11 @@ console tab). Layer assignment is llama.cpp's own truth, captured at load via
 Blocked for the Mac-as-consumer split: the macOS llama asset in
 fetch-llama.sh has no ggml-rpc backend (nm-confirmed) — needs an
 RPC-enabled macOS build (windows-x64 owns that next).
+
+## Part 2 status (2026-08-24, windows-x64)
+
+Shipped: TXT `rpc=<port>`/`pf=1` + caps from the peer's /v1/cluster;
+`--rpc auto`, `--remote-prefill auto` (same model, same kv type); peers in
+/v1/cluster carry `caps`. Open: the LAN shell-suite case (needs a Linux/Mac
+runner), and the box-alone "refuses" arm is a Mac property only — Windows
+spills to system RAM (see docs/gotchas/server-http.md).
