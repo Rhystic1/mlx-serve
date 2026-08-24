@@ -4796,7 +4796,7 @@ fn maybeRemotePrefill(
     engine: *arch_llama.LlamaEngine,
     sess: *arch_llama.LlamaSession,
     i32_prompt: []const i32,
-) void {
+) bool {
     // What this session would still decode locally. Remote prefill replaces the
     // whole sequence, so reuse it already holds is what remote has to BEAT, not
     // something it adds to.
@@ -4808,13 +4808,13 @@ fn maybeRemotePrefill(
         // request; the rest are worth one line because they are configuration
         // or sizing answers the operator wants to see.
         if (why != .disabled) log.info("[remote-prefill] fell back: {s}\n", .{why.text()});
-        return;
+        return false;
     }
     const url = rpc.g_remote_prefill_url.?;
 
     const model_bytes = modelFileBytes(sch.io, slot.model.path) orelse {
         log.info("[remote-prefill] fell back: could not size the local model file\n", .{});
-        return;
+        return false;
     };
 
     const outcome = rpc.fetchBlob(slot.allocator, url, slot.model.id, i32_prompt, .{
@@ -4826,16 +4826,20 @@ fn maybeRemotePrefill(
     }, rpc.DEFAULT_TIMEOUT_MS);
 
     switch (outcome) {
-        .fell_back => |why| log.info("[remote-prefill] fell back: {s}\n", .{why}),
+        .fell_back => |why| {
+            log.info("[remote-prefill] fell back: {s}\n", .{why});
+            return false;
+        },
         .blob => |blob| {
             defer slot.allocator.free(blob);
             sess.importState(blob, remote_prefill.prefillSpan(i32_prompt)) catch {
                 // importState leaves the sequence EMPTY on failure, which is a
                 // valid state for sync — it simply cold-prefills. Never fatal.
                 log.info("[remote-prefill] fell back: {s}\n", .{rpc.FallbackReason.restore_failed.text()});
-                return;
+                return false;
             };
             log.info("[remote-prefill] engaged {d} tokens\n", .{i32_prompt.len});
+            return true;
         },
     }
 }
@@ -4947,7 +4951,7 @@ fn runPrefillLlama(sch: *Scheduler, slot: *Slot, engine: *arch_llama.LlamaEngine
     // discarded, so the gate must weigh what remote actually saves (the tokens
     // this session would still have to decode) rather than the whole prompt.
     // Every failure is a log line and a local prefill, never a failed request.
-    maybeRemotePrefill(sch, slot, engine, sess, i32_prompt);
+    const remote_engaged = maybeRemotePrefill(sch, slot, engine, sess, i32_prompt);
 
     // `syncWithFallback` does the prefix-trim + suffix decode and, on any
     // libllama transient (the "failed to find a memory slot" class — see
@@ -4963,7 +4967,10 @@ fn runPrefillLlama(sch: *Scheduler, slot: *Slot, engine: *arch_llama.LlamaEngine
 
     slot.llama_session = sess;
     slot.prompt_tokens = @intCast(slot.full_prompt.len);
-    slot.cached_tokens = @intCast(cached);
+    // Remotely-restored tokens are NOT cache hits: they cost the round trip,
+    // which is billed into prefill_ns, so counting them as cached would divide
+    // one token by the whole exchange and report a rate ~3000x too low.
+    slot.cached_tokens = @intCast(rpc.cachedTokensAfterPrefill(remote_engaged, @intCast(cached)));
     slot.state = .decoding;
 }
 

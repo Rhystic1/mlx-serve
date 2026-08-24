@@ -117,6 +117,25 @@ pub fn observedBytesPerToken(blob_bytes: u64, n_tokens: usize) ?u64 {
     return blob_bytes / @as(u64, @intCast(n_tokens));
 }
 
+/// What to report as `cached_n` after a prefill.
+///
+/// `cached_n` means "reused for FREE from local KV", and prefill throughput is
+/// computed as (prompt - cached) / prefill_ms. A remote restore leaves the
+/// session holding N-1 tokens, so reporting them as cached divides ONE token by
+/// the entire round trip and reports a rate ~3000x too low — m4mini measured
+/// 0.093 tok/s on a path whose real effective rate was ~300 (2026-08-23), which
+/// is exactly the kind of broken instrument that gets a working feature
+/// diagnosed as a catastrophic regression.
+///
+/// Remotely-prefilled tokens were not free: they cost the exchange, and that
+/// time IS billed into prefill_ns. So the honest report is zero cache hits and
+/// a prefill that paid for the whole prompt, which makes prompt_per_second the
+/// effective end-to-end rate of the remote path — the number worth comparing
+/// against local prefill.
+pub fn cachedTokensAfterPrefill(remote_engaged: bool, local_reuse: usize) usize {
+    return if (remote_engaged) 0 else local_reuse;
+}
+
 /// Why a request did not use remote prefill. Every arm is a log phrase, not an
 /// error: the request proceeds locally in all of them.
 pub const FallbackReason = enum {
@@ -629,6 +648,20 @@ test "viability degrades gracefully when a term is unknown" {
     c.bytes_per_token = 167 * 1024;
     c.wire_bytes_per_sec = 0;
     try testing.expect(!c.viable());
+}
+
+test "remotely-prefilled tokens are NOT reported as cache hits" {
+    // `cached_n` means "reused for free from local KV", and prefill throughput
+    // is (prompt - cached) / prefill_ms. A remote restore leaves the session
+    // holding N-1 tokens, so reporting those as cached divides ONE token by the
+    // whole round trip: m4mini measured 0.093 tok/s on a path whose real
+    // effective rate was ~300 (2026-08-23). Those tokens were not free — they
+    // cost the remote exchange, which is billed in prefill_ns — so the honest
+    // report is that nothing was cached and the prefill paid for all of them.
+    try testing.expectEqual(@as(usize, 0), cachedTokensAfterPrefill(true, 3524));
+    // Without remote prefill the local reuse count is the truth, untouched.
+    try testing.expectEqual(@as(usize, 3524), cachedTokensAfterPrefill(false, 3524));
+    try testing.expectEqual(@as(usize, 0), cachedTokensAfterPrefill(false, 0));
 }
 
 test "observedBytesPerToken reads the rate straight off a reply" {
