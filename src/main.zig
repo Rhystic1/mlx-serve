@@ -116,10 +116,11 @@ fn printUsage(io: std.Io) void {
         \\                      that keeps generating never times out, however long it runs.
         \\  --reasoning-budget <n>  Max thinking tokens per request (default: unlimited)
         \\  --no-vision         Disable vision encoder (saves memory)
-        \\  --rpc <host:port[,...]>  Split a GGUF model's layers across ggml RPC
+        \\  --rpc <host:port[,...]|auto>  Split a GGUF model's layers across ggml RPC
         \\                      workers (other machines running --rpc-serve). Remote
         \\                      device memory counts toward the load preflight; an
-        \\                      unreachable worker FAILS the load by name.
+        \\                      unreachable worker FAILS the load by name. `auto` = every
+        \\                      worker LAN discovery found (--lan-discover).
         \\  --tensor-split <w,w,...>  Layer split weights, one per device in
         \\                      [local GPUs..., --rpc workers...] order (default: by free memory)
         \\  --rpc-serve <[host:]port>  Also serve this machine's best device (CUDA/Metal)
@@ -628,8 +629,8 @@ pub fn main(init: std.process.Init) !void {
             // Validated NOW: a typo here is a config error, not a runtime
             // fallback — this feature has no silent fallback by design.
             var ep_buf: [rpc_offload.MAX_ENDPOINTS][]const u8 = undefined;
-            _ = rpc_offload.parseEndpoints(args[i], &ep_buf) catch |err| {
-                log.err("--rpc: expected host:port[,host:port...], got '{s}' ({s})\n", .{ args[i], @errorName(err) });
+            if (!rpc_offload.isAuto(args[i])) _ = rpc_offload.parseEndpoints(args[i], &ep_buf) catch |err| {
+                log.err("--rpc: expected host:port[,host:port...] or auto, got '{s}' ({s})\n", .{ args[i], @errorName(err) });
                 std.process.exit(1);
             };
             rpc_offload.g_endpoints = args[i];
@@ -999,6 +1000,10 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         const ep_owned = try allocator.dupe(u8, ep);
+        // Advertise it (Part 2): the LAN TXT record + /v1/cluster carry the port.
+        if (std.mem.lastIndexOfScalar(u8, ep_owned, ':')) |c| {
+            @import("lan_policy.zig").g_local_caps.rpc_port = std.fmt.parseInt(u16, ep_owned[c + 1 ..], 10) catch null;
+        }
         log.info("[rpc-serve] exporting {s} ({s}, {d:.2} GB free / {d:.2} GB) on {s}\n", .{
             dev.name,
             if (dev.is_gpu) "GPU" else "CPU",

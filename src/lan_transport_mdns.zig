@@ -173,6 +173,7 @@ pub const Lan = struct {
         const changed = l.table.modelCountDiffers(display, models.len);
         const count = models.len;
         l.table.install(display, ip4, svc.port, models);
+        l.table.setCaps(display, peers_mod.fetchPeerCaps(l.alloc, ip4, svc.port));
         l.noteKnown(display);
         l.resetFailures(display);
         if (changed)

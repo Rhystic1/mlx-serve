@@ -24,6 +24,12 @@ pub var g_rpc_serve: []const u8 = "";
 
 pub const MAX_ENDPOINTS = 16; // GGML_RPC_MAX_SERVERS
 
+/// `--rpc auto` / `--remote-prefill auto`: resolve from LAN discovery at use
+/// time. Explicit values win by never being spelled "auto".
+pub fn isAuto(spec: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, spec, " \t"), "auto");
+}
+
 /// `--rpc-serve` value → the `host:port` ggml's server binds. A bare port
 /// binds every interface: a worker exists to be reached from another machine.
 pub fn serveEndpoint(buf: []u8, spec: []const u8) ParseError![]const u8 {
@@ -216,4 +222,12 @@ test "parseLayerAssign reads llama.cpp's own assignment line and nothing else" {
     try testing.expectEqualStrings("CUDA0", b.device);
     try testing.expect(parseLayerAssign("load_tensors: loading model tensors, this can take a while...") == null);
     try testing.expect(parseLayerAssign("llama_prepare_model_devices: using device RPC0 (127.0.0.1:50052)") == null);
+}
+
+test "isAuto: the literal auto (any case, trimmed), nothing else" {
+    try testing.expect(isAuto("auto"));
+    try testing.expect(isAuto(" AUTO "));
+    try testing.expect(!isAuto("autom"));
+    try testing.expect(!isAuto("192.168.0.150:50052"));
+    try testing.expect(!isAuto(""));
 }

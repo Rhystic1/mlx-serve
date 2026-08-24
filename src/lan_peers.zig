@@ -23,11 +23,14 @@ const splitRemoteId = policy.splitRemoteId;
 
 pub const Remote = struct { ip4: [4]u8, port: u16 };
 
+pub const PeerCaps = policy.PeerCaps;
+
 pub const Peer = struct {
     display: []u8, // sanitized instance name — also the hash key
     ip4: [4]u8,
     port: u16,
     models: []PeerModel,
+    caps: PeerCaps = .{},
 
     pub fn deinit(p: *Peer, alloc: std.mem.Allocator) void {
         freePeerModels(alloc, p.models);
@@ -139,9 +142,58 @@ pub const Table = struct {
                 if (i > 0) try buf.append(alloc, ',');
                 try chat.appendJsonString(alloc, buf, m.id);
             }
-            try buf.appendSlice(alloc, "]}");
+            try buf.appendSlice(alloc, "],\"caps\":{\"prefill\":");
+            try buf.appendSlice(alloc, if (p.caps.prefill) "true" else "false");
+            try buf.appendSlice(alloc, ",\"prefill_kv\":");
+            if (p.caps.prefill) try chat.appendJsonString(alloc, buf, p.caps.kv()) else try buf.appendSlice(alloc, "null");
+            try buf.appendSlice(alloc, ",\"rpc\":");
+            if (p.caps.rpc_port) |port| try buf.print(alloc, "{d}", .{port}) else try buf.appendSlice(alloc, "null");
+            try buf.appendSlice(alloc, "}}");
         }
         try buf.append(alloc, ']');
+    }
+
+    /// Record what a peer can do (fetched from its /v1/cluster after install).
+    pub fn setCaps(tbl: *Table, display: []const u8, caps: PeerCaps) void {
+        tbl.lock();
+        defer tbl.unlock();
+        if (tbl.map.getPtr(display)) |p| p.caps = caps;
+    }
+
+    /// `--rpc auto`: every discovered ggml RPC worker as `ip:port`, written
+    /// into `store` (one row per worker). Table order — discovery order.
+    pub fn rpcWorkers(tbl: *Table, store: *[16][24]u8, out: *[16][]const u8) []const []const u8 {
+        tbl.lock();
+        defer tbl.unlock();
+        var n: usize = 0;
+        var it = tbl.map.valueIterator();
+        while (it.next()) |p| {
+            const port = p.caps.rpc_port orelse continue;
+            if (n == out.len) break;
+            out[n] = std.fmt.bufPrint(&store[n], "{d}.{d}.{d}.{d}:{d}", .{ p.ip4[0], p.ip4[1], p.ip4[2], p.ip4[3], port }) catch continue;
+            n += 1;
+        }
+        return out[0..n];
+    }
+
+    /// `--remote-prefill auto`: the first peer that serves `model_id` (the
+    /// byte-identical file is checked on the wire by the prefill client),
+    /// answers /v1/prefill, and runs the SAME KV type. `http://ip:port` in `buf`.
+    pub fn prefillPeerFor(tbl: *Table, buf: []u8, model_id: []const u8, kv_type: []const u8) ?[]const u8 {
+        tbl.lock();
+        defer tbl.unlock();
+        var it = tbl.map.valueIterator();
+        while (it.next()) |p| {
+            if (!p.caps.prefill) continue;
+            if (!std.mem.eql(u8, p.caps.kv(), kv_type)) continue;
+            var serves = false;
+            for (p.models) |m| if (std.mem.eql(u8, m.id, model_id)) {
+                serves = true;
+            };
+            if (!serves) continue;
+            return std.fmt.bufPrint(buf, "http://{d}.{d}.{d}.{d}:{d}", .{ p.ip4[0], p.ip4[1], p.ip4[2], p.ip4[3], p.port }) catch return null;
+        }
+        return null;
     }
 
     pub fn appendRemoteEntries(tbl: *Table, alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
@@ -225,6 +277,36 @@ pub fn headerValueCI(head: []const u8, name_lower: []const u8) ?[]const u8 {
 /// resolves back to this very server, and the loopback-first fetch would
 /// happily install our own models as a "peer" (live test_lan_share self-mirror
 /// after the peer-restart section, 2026-07-21).
+/// One tunneled GET against a peer; the raw response (status line + headers +
+/// body). Shared by the models fetch and the caps fetch.
+fn fetchPeerRaw(alloc: std.mem.Allocator, ip4: [4]u8, port: u16, request: []const u8) !std.ArrayList(u8) {
+    const s = try net.connectTimeout(ip4, port, 3000);
+    defer net.close(s);
+    try net.writeAll(s, request);
+    var resp: std.ArrayList(u8) = .empty;
+    errdefer resp.deinit(alloc);
+    var chunk: [16 * 1024]u8 = undefined;
+    while (resp.items.len < 8 * 1024 * 1024) {
+        if (!net.waitReadable(s, 5000)) break;
+        const n = net.read(s, &chunk) catch break;
+        if (n == 0) break;
+        try resp.appendSlice(alloc, chunk[0..n]);
+    }
+    return resp;
+}
+
+/// A peer's capabilities from ITS `GET /v1/cluster`. Never fails the install:
+/// an older peer 404s and simply has no caps.
+pub fn fetchPeerCaps(alloc: std.mem.Allocator, ip4: [4]u8, port: u16) PeerCaps {
+    var resp = fetchPeerRaw(alloc, ip4, port, "GET /v1/cluster HTTP/1.1\r\nHost: mlx-serve\r\nConnection: close\r\nX-MLX-LAN: 1\r\n\r\n") catch return .{};
+    defer resp.deinit(alloc);
+    const raw = resp.items;
+    const line_end = std.mem.indexOf(u8, raw, "\r\n") orelse return .{};
+    if (std.mem.indexOf(u8, raw[0..line_end], " 200") == null) return .{};
+    const header_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return .{};
+    return policy.parsePeerCaps(alloc, raw[header_end + 4 ..]);
+}
+
 pub fn fetchPeerModels(alloc: std.mem.Allocator, ip4: [4]u8, port: u16, peer_display: []const u8, own_token: []const u8) ![]PeerModel {
     const s = try net.connectTimeout(ip4, port, 3000);
     defer net.close(s);
@@ -427,4 +509,37 @@ test "lan: tunnel to a dead peer fails before writing anything to the client" {
     defer sink.buf.deinit(a);
     try t.expectError(error.PeerUnreachable, tunnel(.{ .ip4 = .{ 127, 0, 0, 1 }, .port = port }, "POST", "/v1/messages", "{}", &sink));
     try t.expectEqual(@as(usize, 0), sink.buf.items.len);
+}
+
+test "lan: caps drive --rpc auto and --remote-prefill auto off the peer table" {
+    const a = t.allocator;
+    var l = Table.init(a);
+    defer l.deinit();
+    const m1 = try a.alloc(PeerModel, 1);
+    m1[0] = .{ .id = try a.dupe(u8, "gemma-4-12b"), .entry_json = try a.dupe(u8, "{}") };
+    l.install("box", .{ 192, 168, 0, 150 }, 8080, m1);
+    const m2 = try a.alloc(PeerModel, 1);
+    m2[0] = .{ .id = try a.dupe(u8, "gemma-4-12b"), .entry_json = try a.dupe(u8, "{}") };
+    l.install("mini", .{ 192, 168, 0, 20 }, 8080, m2);
+
+    // Nothing advertised yet: no workers, no prefill peer.
+    var store: [16][24]u8 = undefined;
+    var out: [16][]const u8 = undefined;
+    try t.expectEqual(@as(usize, 0), l.rpcWorkers(&store, &out).len);
+    var ubuf: [64]u8 = undefined;
+    try t.expect(l.prefillPeerFor(&ubuf, "gemma-4-12b", "f16") == null);
+
+    var c: PeerCaps = .{ .rpc_port = 50052, .prefill = true };
+    c.setKv("q8_0");
+    l.setCaps("box", c);
+    const w = l.rpcWorkers(&store, &out);
+    try t.expectEqual(@as(usize, 1), w.len);
+    try t.expectEqualStrings("192.168.0.150:50052", w[0]);
+    // KV type must MATCH (a mismatch is a llama.cpp restore error, never garbage).
+    try t.expect(l.prefillPeerFor(&ubuf, "gemma-4-12b", "f16") == null);
+    try t.expectEqualStrings("http://192.168.0.150:8080", l.prefillPeerFor(&ubuf, "gemma-4-12b", "q8_0").?);
+    // And the model must be served by that peer.
+    try t.expect(l.prefillPeerFor(&ubuf, "other-model", "q8_0") == null);
+    // setCaps on an unknown peer is a no-op, never a crash.
+    l.setCaps("ghost", c);
 }

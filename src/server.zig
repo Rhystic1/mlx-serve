@@ -1449,6 +1449,10 @@ pub fn serve(
     //    every serve path (model/headless/gen/ds4/llama) flows through — so the
     //    advertised port is always the bound port. Bonjour being unavailable
     //    degrades to a warning; it must never kill the server.
+    // Part 2 capability advert: every llama.cpp build answers POST /v1/prefill
+    // at the launch KV type; the RPC port was set by main when --rpc-serve ran.
+    @import("lan_policy.zig").g_local_caps.prefill = build_cfg.llama_enabled;
+    @import("lan_policy.zig").g_local_caps.setKv(arch_llama.kvTypeName(llama_kv_quant.ggmlType()));
     if (g_lan_share_spec != null or g_lan_discover) {
         g_lan = lan_mod.Lan.start(allocator, .{
             .port = port,
@@ -4383,11 +4387,15 @@ fn handleCluster(allocator: std.mem.Allocator, stream: *Conn, registry: *ModelRe
     const url = @import("remote_prefill_client.zig").g_remote_prefill_url;
     const is_worker = build_cfg.llama_enabled; // /v1/prefill is served by every llama build
     const mode: []const u8 = if (url != null) "consumer" else if (is_worker) "worker" else "none";
-    const consumer_engine: ?[]const u8 = if (url == null) null else if (comptime build_cfg.mlx_enabled) "mlx" else "llama";
     var local_rate: f64 = 0;
     var remote_rate: f64 = 0;
     var prefill_model: ?[]const u8 = null;
+    // The ENGINE is a property of the loaded model, not the platform: a GGUF
+    // on a Mac runs on llama.cpp and takes the v1 state-restore consumer path;
+    // only an MLX pack reaches the MLX KV importer (m4max, live 2026-08-24).
+    var default_is_llama = false;
     if (registry.default_id.len > 0) if (registry.entries.get(registry.default_id)) |lm| {
+        default_is_llama = lm.llama_engine != null or std.mem.endsWith(u8, lm.path, ".gguf");
         const cal = &lm.remote_prefill_cal;
         if (cal.local.ms_per_token > 0) local_rate = 1000.0 / cal.local.ms_per_token;
         if (cal.remote.ms_per_token > 0) remote_rate = 1000.0 / cal.remote.ms_per_token;
@@ -4401,7 +4409,7 @@ fn handleCluster(allocator: std.mem.Allocator, stream: *Conn, registry: *ModelRe
         .host = g_bound_host,
         .port = g_bound_port,
         .platform = @tagName(builtin.os.tag),
-        .engine = if (comptime build_cfg.mlx_enabled) "mlx" else "llama.cpp",
+        .engine = if (default_is_llama or !build_cfg.mlx_enabled) "llama.cpp" else "mlx",
         .version = build_options.version,
         .models_json = models.items,
         .lan_enabled = g_lan != null,
@@ -4410,7 +4418,7 @@ fn handleCluster(allocator: std.mem.Allocator, stream: *Conn, registry: *ModelRe
         .rpc = &cluster.g_rpc,
         .tensor_split = rpc_offload.g_tensor_split,
         .prefill_mode = mode,
-        .prefill_consumer_engine = consumer_engine,
+        .prefill_consumer_engine = if (url == null) null else if (default_is_llama or !build_cfg.mlx_enabled) "llama" else "mlx",
         .prefill_url = url,
         .prefill_model = prefill_model,
         .prefill_kv_type = arch_llama.kvTypeName(llama_kv_quant.ggmlType()),

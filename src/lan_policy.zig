@@ -174,7 +174,44 @@ pub fn unescapeJsonSlashes(buf: []u8, s: []const u8) []const u8 {
     return buf[0..n];
 }
 
-/// TXT record wire format: length-prefixed `key=value` strings.
+/// What a peer can do for us beyond serving chat (rpc-offload-plan.md Part 2).
+/// Advertised two ways: cheaply in the TXT record (`rpc=<port>`, `pf=1`) and in
+/// full from the peer's own `GET /v1/cluster` at install time (kv type, model).
+pub const PeerCaps = struct {
+    /// ggml RPC worker port (`--rpc-serve`), null when not a worker.
+    rpc_port: ?u16 = null,
+    /// Serves `POST /v1/prefill` (every llama.cpp build does).
+    prefill: bool = false,
+    /// The prefill worker's KV type name ("f16" / "q8_0"); a consumer only
+    /// picks a worker whose type matches its own (a mismatch is a restore ERROR).
+    prefill_kv: [8]u8 = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 },
+    prefill_kv_len: u8 = 0,
+
+    pub fn kv(self: *const PeerCaps) []const u8 {
+        return self.prefill_kv[0..self.prefill_kv_len];
+    }
+    pub fn setKv(self: *PeerCaps, name: []const u8) void {
+        const n: u8 = @intCast(@min(name.len, self.prefill_kv.len));
+        @memcpy(self.prefill_kv[0..n], name[0..n]);
+        self.prefill_kv_len = n;
+    }
+};
+
+/// THIS server's capabilities, set once at boot (main/server) and folded into
+/// every advertisement by `txtBuild`. A plain var so the builder keeps its
+/// one-argument shape at both transports' call sites.
+pub var g_local_caps: PeerCaps = .{};
+
+fn txtAppend(buf: []u8, at: usize, entry: []const u8) usize {
+    if (at + 1 + entry.len > buf.len or entry.len > 255) return at;
+    buf[at] = @intCast(entry.len);
+    @memcpy(buf[at + 1 ..][0..entry.len], entry);
+    return at + 1 + entry.len;
+}
+
+/// TXT record wire format: length-prefixed `key=value` strings. `v=1` and
+/// the process token first (every reader keys on those), then the optional
+/// capability keys — a reader that does not know them skips them.
 pub fn txtBuild(buf: []u8, token: []const u8) []const u8 {
     std.debug.assert(buf.len >= 5 + 2 + token.len and token.len <= 253);
     buf[0] = 3;
@@ -182,7 +219,38 @@ pub fn txtBuild(buf: []u8, token: []const u8) []const u8 {
     buf[4] = @intCast(2 + token.len);
     @memcpy(buf[5..7], "t=");
     @memcpy(buf[7..][0..token.len], token);
-    return buf[0 .. 7 + token.len];
+    var n: usize = 7 + token.len;
+    if (g_local_caps.rpc_port) |port| {
+        var tmp: [16]u8 = undefined;
+        const e = std.fmt.bufPrint(&tmp, "rpc={d}", .{port}) catch unreachable;
+        n = txtAppend(buf, n, e);
+    }
+    if (g_local_caps.prefill) n = txtAppend(buf, n, "pf=1");
+    return buf[0..n];
+}
+
+/// Caps out of a peer's `GET /v1/cluster` body. Anything unreadable is
+/// simply "no capability" — a peer on an older build answers 404 here.
+pub fn parsePeerCaps(alloc: std.mem.Allocator, body: []const u8) PeerCaps {
+    var caps: PeerCaps = .{};
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return caps;
+    defer parsed.deinit();
+    if (parsed.value != .object) return caps;
+    const root = parsed.value.object;
+    if (root.get("rpc")) |rpc| if (rpc == .object) if (rpc.object.get("serve")) |serve| if (serve == .object) {
+        if (serve.object.get("endpoint")) |ep| if (ep == .string) {
+            if (std.mem.lastIndexOfScalar(u8, ep.string, ':')) |c| {
+                caps.rpc_port = std.fmt.parseInt(u16, ep.string[c + 1 ..], 10) catch null;
+            }
+        };
+    };
+    if (root.get("prefill")) |pf| if (pf == .object) {
+        if (pf.object.get("mode")) |m| if (m == .string) {
+            caps.prefill = std.mem.eql(u8, m.string, "worker");
+        };
+        if (pf.object.get("kv_type")) |k| if (k == .string) caps.setKv(k.string);
+    };
+    return caps;
 }
 
 pub fn txtFind(txt: []const u8, key_eq: []const u8) ?[]const u8 {
@@ -372,6 +440,35 @@ test "lan: TXT record round-trips the instance token" {
     // Truncated/hostile TXT never panics.
     try t.expect(txtFind(&[_]u8{200}, "t=") == null);
     try t.expect(txtFind(&[_]u8{}, "t=") == null);
+}
+
+test "lan: TXT record advertises rpc port + prefill only when this server has them" {
+    var buf: [96]u8 = undefined;
+    const saved = g_local_caps;
+    defer g_local_caps = saved;
+    g_local_caps = .{};
+    var txt = txtBuild(&buf, "deadbeefcafef00d");
+    try t.expect(txtFind(txt, "rpc=") == null);
+    try t.expect(txtFind(txt, "pf=") == null);
+    g_local_caps = .{ .rpc_port = 50052, .prefill = true };
+    txt = txtBuild(&buf, "deadbeefcafef00d");
+    try t.expectEqualStrings("50052", txtFind(txt, "rpc=").?);
+    try t.expectEqualStrings("1", txtFind(txt, "pf=").?);
+    try t.expectEqualStrings("deadbeefcafef00d", txtFind(txt, "t=").?); // token still first
+}
+
+test "lan: parsePeerCaps reads a /v1/cluster body; garbage and old peers mean no caps" {
+    const body =
+        \\{"self":{},"rpc":{"role":"worker","serve":{"endpoint":"0.0.0.0:50052","device":"CUDA0"}},"prefill":{"mode":"worker","kv_type":"q8_0"}}
+    ;
+    const c = parsePeerCaps(t.allocator, body);
+    try t.expectEqual(@as(?u16, 50052), c.rpc_port);
+    try t.expect(c.prefill);
+    try t.expectEqualStrings("q8_0", c.kv());
+    const none = parsePeerCaps(t.allocator, "{\"rpc\":{\"serve\":null},\"prefill\":{\"mode\":\"consumer\"}}");
+    try t.expect(none.rpc_port == null and !none.prefill);
+    const junk = parsePeerCaps(t.allocator, "<html>404</html>");
+    try t.expect(junk.rpc_port == null and !junk.prefill);
 }
 
 test "lan: parsePeerModels rewrites ids, adds lan_peer, keeps meta" {

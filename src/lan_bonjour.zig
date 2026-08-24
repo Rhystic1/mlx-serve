@@ -230,6 +230,7 @@ pub const Lan = struct {
 
     fn installPeer(l: *Lan, display: []const u8, ip4: [4]u8, port: u16, models: []PeerModel) void {
         l.table.install(display, ip4, port, models);
+        l.table.setCaps(display, peers_mod.fetchPeerCaps(l.alloc, ip4, port));
     }
 
     const Attempt = enum { installed, self_ad, failed };

@@ -2548,8 +2548,23 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     var endpoints: []const []const u8 = &.{};
     var split_buf: [rpc_offload.MAX_ENDPOINTS + 16]f32 = undefined;
     var split: []const f32 = &.{};
-    if (rpc_offload.g_endpoints.len > 0) {
-        endpoints = rpc_offload.parseEndpoints(rpc_offload.g_endpoints, &ep_buf) catch |err| {
+    var auto_store: [16][24]u8 = undefined;
+    var auto_out: [16][]const u8 = undefined;
+    var endpoint_spec: []const u8 = rpc_offload.g_endpoints;
+    if (rpc_offload.isAuto(endpoint_spec)) {
+        // `--rpc auto`: whatever LAN discovery has found. No worker = a plain
+        // local load, said out loud — the flag asked for discovery, not a peer.
+        const found = if (@import("server.zig").g_lan) |l| l.table.rpcWorkers(&auto_store, &auto_out) else &[_][]const u8{};
+        if (found.len == 0) {
+            log.warn("[rpc] --rpc auto: no RPC worker discovered on the LAN yet — loading locally\n", .{});
+            endpoint_spec = "";
+        } else {
+            endpoints = found;
+            log.info("[rpc] --rpc auto: {d} worker(s) discovered\n", .{found.len});
+        }
+    }
+    if (endpoint_spec.len > 0) {
+        if (endpoints.len == 0) endpoints = rpc_offload.parseEndpoints(endpoint_spec, &ep_buf) catch |err| {
             log.err("[rpc] --rpc '{s}' is not a host:port list ({s})\n", .{ rpc_offload.g_endpoints, @errorName(err) });
             return error.RpcConfigInvalid;
         };
@@ -2593,7 +2608,7 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 return error.RpcConfigInvalid;
             };
         }
-        log.info("[rpc] offloading layers across {d} worker(s): {s}{s}\n", .{ endpoints.len, rpc_offload.g_endpoints, if (split.len > 0) " (explicit --tensor-split)" else " (split by free memory)" });
+        log.info("[rpc] offloading layers across {d} worker(s): {s}{s}\n", .{ endpoints.len, if (rpc_offload.isAuto(rpc_offload.g_endpoints)) "auto (LAN discovery)" else rpc_offload.g_endpoints, if (split.len > 0) " (explicit --tensor-split)" else " (split by free memory)" });
     }
 
     const engine = try arch_llama.LlamaEngine.open(sch.allocator, params.llama_path, .{
@@ -4895,7 +4910,22 @@ fn maybeRemotePrefill(
     const local_reuse = arch_llama.commonPrefixLen(sess.resident.items, i32_prompt);
     const would_decode = i32_prompt.len - local_reuse;
 
-    if (rpc.shouldAttempt(rpc.g_remote_prefill_url, true, would_decode)) |why| {
+    // `--remote-prefill auto` (Part 2): the first LAN peer serving THIS model
+    // that answers /v1/prefill at OUR KV type. No such peer = local prefill,
+    // one log line, never a failed request — same contract as an explicit URL.
+    var auto_url_buf: [64]u8 = undefined;
+    var configured_url: ?[]const u8 = rpc.g_remote_prefill_url;
+    if (configured_url != null and rpc_offload.isAuto(configured_url.?)) {
+        configured_url = if (@import("server.zig").g_lan) |l|
+            l.table.prefillPeerFor(&auto_url_buf, slot.model.id, arch_llama.kvTypeName(slot.model.llama_kv_type_k))
+        else
+            null;
+        if (configured_url == null) {
+            log.info("[remote-prefill] fell back: auto found no LAN peer serving {s} at kv {s}\n", .{ slot.model.id, arch_llama.kvTypeName(slot.model.llama_kv_type_k) });
+            return false;
+        }
+    }
+    if (rpc.shouldAttempt(configured_url, true, would_decode)) |why| {
         // `disabled` is the overwhelmingly common case and must not log per
         // request; the rest are worth one line because they are configuration
         // or sizing answers the operator wants to see.
@@ -4907,7 +4937,7 @@ fn maybeRemotePrefill(
     // means attempt — the rates cannot be learned any other way.
     if (!slot.model.remote_prefill_cal.shouldTry()) return false;
 
-    const url = rpc.g_remote_prefill_url.?;
+    const url = configured_url.?;
 
     const model_bytes = modelFileBytes(sch.io, slot.model.path) orelse {
         log.info("[remote-prefill] fell back: could not size the local model file\n", .{});
