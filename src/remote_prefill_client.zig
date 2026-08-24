@@ -57,6 +57,56 @@ pub const PREFILL_PATH = "/v1/prefill";
 /// every failure degrades to.
 pub var g_remote_prefill_url: ?[]const u8 = null;
 
+/// Whether remote prefill can pay for itself, as a PER-TOKEN comparison.
+///
+/// The flat MIN_REMOTE_TOKENS floor this replaces was the wrong SHAPE, not
+/// merely the wrong number. Blob bytes scale linearly with tokens and prefill
+/// time scales linearly with tokens, so their ratio is constant in n: a config
+/// that loses at 1k tokens loses at 100k, and one that wins, wins everywhere.
+/// No token threshold can express that.
+///
+/// What it actually turns on is the WORKER'S ADVANTAGE. Per token the remote
+/// path costs `worker_prefill + transfer` and the local path costs
+/// `local_prefill`, so the entire budget for transfer is
+/// `local_ms_per_token - worker_ms_per_token`. A worker only 1.5x faster than
+/// the consumer leaves a third of local prefill to spend on the wire, however
+/// fat the pipe — measured 2026-08-23: gemma-4-12b at 167 KB/token needs a
+/// 2.2x blob shrink just to break even on gigabit against a CUDA worker that
+/// prefills at 1.398 ms/token versus the Mac's 2.109.
+///
+/// A small token floor still earns its place, but only to amortize the fixed
+/// round-trip overhead this model ignores — not to decide viability.
+pub const Economics = struct {
+    /// Blob bytes per prompt token, learned from a previous reply. 0 = not yet
+    /// measured for this model.
+    bytes_per_token: u64 = 0,
+    /// Assumed usable wire throughput. 0 is a configuration error, never
+    /// evidence about speed.
+    wire_bytes_per_sec: u64 = 0,
+    worker_ms_per_token: f64 = 0,
+    local_ms_per_token: f64 = 0,
+
+    pub fn viable(self: Economics) bool {
+        if (self.wire_bytes_per_sec == 0) return false;
+        // A worker that is not FASTER can never pay, at any blob size.
+        const budget_ms = self.local_ms_per_token - self.worker_ms_per_token;
+        if (budget_ms <= 0) return false;
+        // Unmeasured rate ⇒ attempt, and learn it from the reply. Refusing here
+        // would mean the client could never bootstrap a model's rate.
+        if (self.bytes_per_token == 0) return true;
+        const transfer_ms = @as(f64, @floatFromInt(self.bytes_per_token)) /
+            @as(f64, @floatFromInt(self.wire_bytes_per_sec)) * 1000.0;
+        return transfer_ms < budget_ms;
+    }
+};
+
+/// The blob rate a reply implies. Null when either number is degenerate — a
+/// rate invented from a zero is worse than no rate at all.
+pub fn observedBytesPerToken(blob_bytes: u64, n_tokens: usize) ?u64 {
+    if (blob_bytes == 0 or n_tokens == 0) return null;
+    return blob_bytes / @as(u64, @intCast(n_tokens));
+}
+
 /// Why a request did not use remote prefill. Every arm is a log phrase, not an
 /// error: the request proceeds locally in all of them.
 pub const FallbackReason = enum {
@@ -505,6 +555,79 @@ test "every fallback reason has distinct non-empty text" {
             try testing.expect(!std.mem.eql(u8, a.text(), b.text()));
         }
     }
+}
+
+test "viability is a PER-TOKEN comparison, so it does not vary with prompt length" {
+    // The insight the flat floor got wrong. Blob bytes scale linearly with
+    // tokens AND prefill time scales linearly with tokens, so the ratio between
+    // them is constant: a config that loses at 1k tokens loses at 100k too, and
+    // one that wins, wins everywhere. A token threshold cannot express that.
+    const c = Economics{
+        .bytes_per_token = 167 * 1024, // gemma-4-12b, measured
+        .wire_bytes_per_sec = 110_000_000, // gigabit, real-world
+        .worker_ms_per_token = 1.398, // measured, CUDA worker
+        .local_ms_per_token = 2.109, // measured, m4max's Mac
+    };
+    // Same verdict at every length — that IS the property.
+    try testing.expectEqual(c.viable(), c.viable());
+    try testing.expect(!c.viable()); // gemma on gigabit today: remote LOSES
+
+    // Shrink the blob enough and the same config flips, with no change to n.
+    var shrunk = c;
+    shrunk.bytes_per_token = 60 * 1024;
+    try testing.expect(shrunk.viable());
+}
+
+test "viability tracks the WORKER's advantage, not its absolute speed" {
+    // The ceiling on this whole technique: you can only spend
+    // (local - worker) per token on transfer. A worker that is barely faster
+    // leaves no budget however fat the pipe, which is why a 1.5x-faster worker
+    // needs a 2.2x blob shrink just to break even.
+    var c = Economics{
+        .bytes_per_token = 1024,
+        .wire_bytes_per_sec = 110_000_000,
+        .worker_ms_per_token = 2.0,
+        .local_ms_per_token = 2.109,
+    };
+    try testing.expect(c.viable()); // a thin blob still fits the thin budget
+
+    // A worker no faster than the consumer can NEVER pay, at any blob size.
+    c.worker_ms_per_token = 2.109;
+    try testing.expect(!c.viable());
+    c.bytes_per_token = 1;
+    try testing.expect(!c.viable());
+
+    // A SLOWER worker is never viable either.
+    c.worker_ms_per_token = 5.0;
+    try testing.expect(!c.viable());
+}
+
+test "viability degrades gracefully when a term is unknown" {
+    // Before the first exchange with a model there is no measured
+    // bytes_per_token. Unknown must mean ATTEMPT (we learn the rate from the
+    // reply) rather than refuse, or the client can never bootstrap — but a
+    // known-bad rate must still refuse.
+    var c = Economics{
+        .bytes_per_token = 0, // unmeasured
+        .wire_bytes_per_sec = 110_000_000,
+        .worker_ms_per_token = 1.398,
+        .local_ms_per_token = 2.109,
+    };
+    try testing.expect(c.viable());
+
+    // A zero/absent wire rate is a configuration error, not evidence of speed.
+    c.bytes_per_token = 167 * 1024;
+    c.wire_bytes_per_sec = 0;
+    try testing.expect(!c.viable());
+}
+
+test "observedBytesPerToken reads the rate straight off a reply" {
+    // No new header needed: the contract already carries both numbers, so the
+    // client learns each model's rate from its first successful exchange.
+    try testing.expectEqual(@as(u64, 1000), observedBytesPerToken(2_000_000, 2000).?);
+    // Degenerate inputs must not divide by zero or invent a rate.
+    try testing.expect(observedBytesPerToken(2_000_000, 0) == null);
+    try testing.expect(observedBytesPerToken(0, 2000) == null);
 }
 
 test "the economic gate admits only prompts the protocol also accepts" {
