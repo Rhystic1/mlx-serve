@@ -36,6 +36,16 @@ struct mlx_llama_engine {
     // authority on where a layer landed (rpc-offload-plan.md Part 3).
     char layer_lines[MLX_LLAMA_MAX_LAYER_LINES][MLX_LLAMA_LAYER_LINE_CAP];
     int32_t n_layer_lines;
+    // True when this engine split layers over ggml RPC AND the process has
+    // the Metal backend registered (i.e. our macOS RPC build, local Metal +
+    // remote RPC device(s)). Known upstream bug (ggml-org/llama.cpp#16657,
+    // root-caused in the #16276 review): ggml-rpc sizes cross-device tensor
+    // transfers with ggml_nbytes(), but Metal's flash-attention path
+    // allocates extra "fleeting" scratch the RPC side never accounts for --
+    // AUTO reliably turns FA on for SWA archs (gemma), corrupting tensors at
+    // the local-Metal/remote-RPC boundary into degenerate decode. Confirmed
+    // fix upstream: `-fa off`. See mlx_llama_session_create_ex.
+    bool rpc_with_metal;
 };
 
 // Load-time log capture. llama's log sink is process-global, so capture is
@@ -271,6 +281,7 @@ mlx_llama_engine *mlx_llama_open_ex(const char *gguf_path, int32_t n_gpu_layers,
     }
     e->model = model;
     e->vocab = llama_model_get_vocab(model);
+    e->rpc_with_metal = (n_rpc > 0) && (ggml_backend_reg_by_name("Metal") != NULL);
     return e;
 }
 
@@ -371,8 +382,16 @@ mlx_llama_session *mlx_llama_session_create_ex(mlx_llama_engine *e,
     // AUTO rather than forcing ENABLED (which would drop the fallback safety).
     // Quantized K/V is the one case that *requires* FA — the plain SDPA path is
     // F16/F32 only — so force it on whenever a non-default KV type is requested.
+    // A Metal+RPC split can't have both: forcing FA on to get quantized KV is
+    // exactly the combination that hits the fleeting-buffer corruption above.
     if (type_k != 0 || type_v != 0) {
+        if (e->rpc_with_metal) {
+            copy_err(err, errlen, "quantized KV is incompatible with a Metal+RPC split (ggml-rpc/Metal flash-attention bug, ggml-org/llama.cpp#16657): pass --kv-quant off or drop --rpc");
+            return NULL;
+        }
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    } else if (e->rpc_with_metal) {
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
     if (type_k != 0) cp.type_k = (enum ggml_type)type_k;
     if (type_v != 0) cp.type_v = (enum ggml_type)type_v;

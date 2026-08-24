@@ -106,6 +106,16 @@ find "$TMP/build" \( -name 'libllama*.dylib' -o -name 'libggml*.dylib' -o -name 
   -exec cp -P {} "$DEST_LIB/" \;
 [ -f "$DEST_LIB/libllama.dylib" ] || { echo "[build-llama-macos] ERROR: no libllama.dylib staged." >&2; exit 1; }
 
+# Headers first, BEFORE the signing loop below: they don't depend on signing
+# and a signing hiccup on any one dylib (set -e + pipefail; the -change loop
+# runs in a subshell whose failure kills the whole script) must not leave
+# lib/llama/include empty while lib/llama/lib already has real dylibs staged
+# and .version unwritten -- that half-staged state silently looks buildable.
+cp "$SRC/include"/*.h "$DEST_INC/"
+cp "$SRC/ggml/include"/*.h "$DEST_INC/"
+[ -f "$SRC/tools/mtmd/mtmd.h" ] && cp "$SRC/tools/mtmd/mtmd.h" "$DEST_INC/"
+[ -f "$SRC/tools/mtmd/mtmd-helper.h" ] && cp "$SRC/tools/mtmd/mtmd-helper.h" "$DEST_INC/"
+
 # Normalise install names to @rpath/<name> (CMake honours INSTALL_NAME_DIR for
 # most targets; belt and braces for any that kept an absolute path) and re-sign
 # ad-hoc, exactly as fetch-llama.sh does for the XCFramework dylib.
@@ -120,11 +130,6 @@ for f in "$DEST_LIB"/*.dylib; do
   codesign --remove-signature "$f" 2>/dev/null || true
   codesign --force --sign - "$f"
 done
-
-cp "$SRC/include"/*.h "$DEST_INC/"
-cp "$SRC/ggml/include"/*.h "$DEST_INC/"
-[ -f "$SRC/tools/mtmd/mtmd.h" ] && cp "$SRC/tools/mtmd/mtmd.h" "$DEST_INC/"
-[ -f "$SRC/tools/mtmd/mtmd-helper.h" ] && cp "$SRC/tools/mtmd/mtmd-helper.h" "$DEST_INC/"
 
 echo "$WANT" > "$STAMP"
 echo "[build-llama-macos] staged ($WANT):"

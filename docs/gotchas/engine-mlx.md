@@ -4023,3 +4023,65 @@ Worth noting what the symptom looked like from outside: nothing. The server
 booted, answered correctly, and logged one line about a disabled sidecar in the
 middle of a normal startup. A benchmark reading "26.8.9 and 26.8.10 are the
 same speed" would have been the only other evidence.
+
+## Metal-local + RPC-remote split: flash-attention AUTO silently corrupts the boundary (2026-08-24)
+
+The macOS RPC build (`scripts/build-llama-macos.sh`, Metal + ggml-rpc) split a
+Gemma-4 checkpoint across local Metal (44 layers) + one remote CUDA RPC worker
+(5 layers, the model's SWA tail + output). Loading, the preflight, and
+`/v1/cluster`'s layer-range reporting all worked. Decode did not: coherent for
+a few tokens, then degenerate repeats ("The [[[[[[..." at a fraction of the
+Metal-only rate). The SAME binary, SAME model, SAME build without `--rpc`
+decoded cleanly — so the bug was neither the build nor the checkpoint, only
+the split.
+
+This is not our bug. It is a known, still-open class in upstream llama.cpp:
+ggml-org/llama.cpp#16657 ("Incorrect outputs when running inference in
+multiple nodes (Mac)") reproduces the identical symptom — degenerate token
+repeats, Mac + RPC, multiple models including an SWA arch (gpt-oss). ggerganov
+confirmed the workaround is `-fa off` and pointed at the root cause surfaced
+during #16276's review: llama.cpp's ggml-rpc backend sizes cross-device tensor
+copies with `ggml_nbytes()`, but Metal's flash-attention path allocates extra
+"fleeting" scratch space that `ggml_nbytes()` doesn't know about — a tensor
+that crosses the local-Metal/remote-RPC boundary during an FA-enabled forward
+is copied at the WRONG size, corrupting whatever lands past the boundary.
+llama.cpp's `--flash-attn` default is AUTO, and AUTO reliably turns FA on for
+SWA architectures (gemma, gpt-oss) because it is a real speed win locally —
+exactly the condition that trips the RPC-side undersizing. A follow-up PR
+(#17143, "make the FA extra sizes consistent") touched the same "extra size"
+mechanism for a different bug (batched-bench warmup sizing) and does not
+appear to close the RPC-specific gap — the symptom reproduced again against
+our current pin (b10472), well past #17143's merge.
+
+Our fix (`lib/llama_shim/llama_shim.c`): the shim already forces FA to
+`ENABLED` whenever quantized KV is requested (the plain SDPA path is F16/F32
+only) and otherwise leaves it at libllama's `AUTO`. It now also detects, at
+`mlx_llama_open_ex`, whether this engine attached any RPC devices AND the
+process has the Metal backend registered (`ggml_backend_reg_by_name("Metal")`
+— true only on our macOS RPC build, never on a Linux/CUDA-only build) and
+records `e->rpc_with_metal`. `mlx_llama_session_create_ex` then:
+
+- forces `flash_attn_type = DISABLED` instead of `AUTO` when `rpc_with_metal`
+  is true and no KV quant was requested — the AUTO path is exactly what
+  silently re-enables the corrupting combination;
+- returns a NAMED failure instead of forcing FA `ENABLED` when
+  `rpc_with_metal` is true AND quantized KV was requested, since that
+  combination cannot be made safe without FA and would otherwise silently
+  ship corrupted decode.
+
+A Metal-only load or an RPC-only load (no local Metal device, e.g. a pure
+Linux/CUDA consumer splitting across two CUDA RPC workers) is untouched — AUTO
+still governs, matching the measured Gemma E4B win noted in the surrounding
+comment (auto≈on≈86 tok/s vs off≈75). The gate is deliberately narrow: it is a
+workaround for a specific, cited upstream bug, not a general "RPC is scary"
+posture — CUDA-worker-only splits (no local Metal) don't hit Metal's fleeting
+allocator at all and keep full FA benefit.
+
+Class guard: `mlx_llama_backend_present("Metal")` is process-global, so
+`rpc_with_metal` is set once per engine at open time and read at every session
+create — never re-derived per session. If upstream ever fixes the RPC-side
+sizing (tracked at #16657, still open as of this writing), the fix is to
+delete the `rpc_with_metal` gate, not to weaken it — a silently-reintroduced
+regression there reads identically to this one and would not be caught by any
+existing test (this bug is Metal+RPC-hardware-dependent and has no coverage on
+CI, which is CUDA-only).
