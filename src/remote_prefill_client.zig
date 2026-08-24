@@ -50,6 +50,13 @@ pub const MAX_BLOB_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 pub const PREFILL_PATH = "/v1/prefill";
 
+/// `--remote-prefill <base-url>`, borrowed from argv like `--api-key`. It lives
+/// HERE rather than in server.zig because the consumer is scheduler.zig, which
+/// deliberately does not import server.zig (server imports scheduler — the
+/// other direction would be a cycle). Null/empty = off, which is also what
+/// every failure degrades to.
+pub var g_remote_prefill_url: ?[]const u8 = null;
+
 /// Why a request did not use remote prefill. Every arm is a log phrase, not an
 /// error: the request proceeds locally in all of them.
 pub const FallbackReason = enum {
@@ -324,16 +331,17 @@ pub fn fetchBlob(
     return .{ .blob = owned };
 }
 
-/// Resolve a host to one IPv4 address. A dotted quad is taken as-is, so the
-/// common PoC case (an IP on the LAN) never touches the resolver.
+/// Resolve a host to one IPv4 address.
+///
+/// LIMITATION, deliberate for v1: only a dotted quad resolves. This Zig's std
+/// has no `std.net` address-list API here, and the one resolver in the tree
+/// (lan_net's getaddrinfo) is Windows-only, so a portable name lookup would be
+/// its own piece of work. A NAME therefore falls back with `unresolved_host`
+/// rather than silently connecting somewhere unintended — and `localhost` is
+/// spelled 127.0.0.1, which is what the WSL<->Windows loop uses anyway.
 fn resolveIp4(allocator: std.mem.Allocator, host: []const u8) ?[4]u8 {
-    if (parseDottedQuad(host)) |ip| return ip;
-    const list = std.net.getAddressList(allocator, host, 0) catch return null;
-    defer list.deinit();
-    for (list.addrs) |a| {
-        if (a.any.family == std.posix.AF.INET) return @bitCast(a.in.sa.addr);
-    }
-    return null;
+    _ = allocator;
+    return parseDottedQuad(host);
 }
 
 pub fn parseDottedQuad(s: []const u8) ?[4]u8 {

@@ -13,6 +13,7 @@ const mtp_mod = if (@import("build_cfg.zig").mlx_enabled) @import("mtp.zig") els
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
+const remote_prefill_client = @import("remote_prefill_client.zig");
 const vision_mod = if (@import("build_cfg.zig").mlx_enabled) @import("vision.zig") else @import("vision_stub.zig");
 const build_cfg = @import("build_cfg.zig");
 const platform = @import("platform.zig");
@@ -598,6 +599,12 @@ pub fn main(init: std.process.Init) !void {
             // Borrowed from argv, like --api-key. serve() starts the LAN
             // subsystem (src/lan.zig) once the listener is bound.
             if (args[i].len > 0) server_mod.g_lan_share_spec = args[i];
+        } else if (std.mem.eql(u8, args[i], "--remote-prefill") and i + 1 < args.len) {
+            i += 1;
+            // Borrowed from argv, like --api-key. An unusable value is not an
+            // error: the client refuses it at request time and prefills
+            // locally, so a typo costs a log line, never a failed request.
+            if (args[i].len > 0) remote_prefill_client.g_remote_prefill_url = args[i];
         } else if (std.mem.eql(u8, args[i], "--lan-name") and i + 1 < args.len) {
             i += 1;
             if (args[i].len > 0) server_mod.g_lan_name = args[i];

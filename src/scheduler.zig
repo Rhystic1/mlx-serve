@@ -70,6 +70,8 @@ const SamplingParams = generate_mod.SamplingParams;
 const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = if (@import("build_cfg.zig").mlx_enabled) @import("dflash.zig") else @import("spec_stub.zig");
 const round_cost_mod = @import("round_cost.zig");
+const remote_prefill = @import("remote_prefill.zig");
+const rpc = @import("remote_prefill_client.zig");
 const DflashModel = dflash_mod.DflashModel;
 const VisionEncoder = vision_mod.VisionEncoder;
 const Weights = model_mod.Weights;
@@ -4772,6 +4774,74 @@ fn runPrefillDs4(sch: *Scheduler, slot: *Slot, engine: *arch_ds4.Ds4Engine) !voi
     slot.state = .decoding;
 }
 
+/// Try remote prefill for this request; on ANY problem log why and return, so
+/// the caller's ordinary local prefill runs untouched.
+///
+/// The token accounting is the shared contract's: POST the FULL prompt, restore
+/// a blob describing `prefillSpan` of it (all but the last token), then let the
+/// caller's `sync(full prompt)` decode exactly that last token. A blob covering
+/// all N would make sync back off one position, which a recurrent checkpoint
+/// refuses — clearing the session and cold-prefilling all N.
+fn maybeRemotePrefill(
+    sch: *Scheduler,
+    slot: *Slot,
+    engine: *arch_llama.LlamaEngine,
+    sess: *arch_llama.LlamaSession,
+    i32_prompt: []const i32,
+) void {
+    // What this session would still decode locally. Remote prefill replaces the
+    // whole sequence, so reuse it already holds is what remote has to BEAT, not
+    // something it adds to.
+    const local_reuse = arch_llama.commonPrefixLen(sess.resident.items, i32_prompt);
+    const would_decode = i32_prompt.len - local_reuse;
+
+    if (rpc.shouldAttempt(rpc.g_remote_prefill_url, true, would_decode)) |why| {
+        // `disabled` is the overwhelmingly common case and must not log per
+        // request; the rest are worth one line because they are configuration
+        // or sizing answers the operator wants to see.
+        if (why != .disabled) log.info("[remote-prefill] fell back: {s}\n", .{why.text()});
+        return;
+    }
+    const url = rpc.g_remote_prefill_url.?;
+
+    const model_bytes = modelFileBytes(sch.io, slot.model.path) orelse {
+        log.info("[remote-prefill] fell back: could not size the local model file\n", .{});
+        return;
+    };
+
+    const outcome = rpc.fetchBlob(slot.allocator, url, slot.model.id, i32_prompt, .{
+        .model = slot.model.id,
+        .n_tokens = i32_prompt.len,
+        .vocab = @intCast(engine.nVocab()),
+        .model_bytes = model_bytes,
+        .body_len = 0, // filled in from the actual body before validation
+    }, rpc.DEFAULT_TIMEOUT_MS);
+
+    switch (outcome) {
+        .fell_back => |why| log.info("[remote-prefill] fell back: {s}\n", .{why}),
+        .blob => |blob| {
+            defer slot.allocator.free(blob);
+            sess.importState(blob, remote_prefill.prefillSpan(i32_prompt)) catch {
+                // importState leaves the sequence EMPTY on failure, which is a
+                // valid state for sync — it simply cold-prefills. Never fatal.
+                log.info("[remote-prefill] fell back: {s}\n", .{rpc.FallbackReason.restore_failed.text()});
+                return;
+            };
+            log.info("[remote-prefill] engaged {d} tokens\n", .{i32_prompt.len});
+        },
+    }
+}
+
+/// Size of the GGUF file backing this entry — half of the wire fingerprint
+/// (n_vocab is the other half). Both sides must have loaded the SAME file, and
+/// a matching model-id STRING does not prove that: two quants of one repo share
+/// the name. Null when the path is not a plain file, which simply declines the
+/// remote rather than sending an unverifiable request.
+fn modelFileBytes(io: std.Io, path: []const u8) ?u64 {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
+    return if (st.kind == .file) @intCast(st.size) else null;
+}
+
 /// llama.cpp prefill: drive a persistent per-model session, reusing the KV from
 /// the previous request's shared prompt prefix (LM-Studio-style prompt caching).
 /// `submit` guarantees a single slot owns the session at a time, so the resident
@@ -4862,11 +4932,22 @@ fn runPrefillLlama(sch: *Scheduler, slot: *Slot, engine: *arch_llama.LlamaEngine
     entry_ptr.last_used_ns = @intCast(std.Io.Timestamp.now(sch.io, .boot).nanoseconds);
     const sess = entry_ptr.session;
 
+    // Remote prefill (`--remote-prefill`): hand the prompt to a peer holding the
+    // SAME GGUF on a faster backend and restore its sequence-state blob instead
+    // of decoding the prompt here. Placed AFTER the session pick because the
+    // restore CLEARS the sequence: whatever prefix this session already holds is
+    // discarded, so the gate must weigh what remote actually saves (the tokens
+    // this session would still have to decode) rather than the whole prompt.
+    // Every failure is a log line and a local prefill, never a failed request.
+    maybeRemotePrefill(sch, slot, engine, sess, i32_prompt);
+
     // `syncWithFallback` does the prefix-trim + suffix decode and, on any
     // libllama transient (the "failed to find a memory slot" class — see
     // `LlamaSession.syncWithFallback`), resets the session and retries once
     // cold. Either we serve the request with a clean response or we surface
-    // the error after leaving the session in a known-good state.
+    // the error after leaving the session in a known-good state. After a
+    // successful import the session holds prompt[0..N-1], so this decodes
+    // exactly the last token — the blob carries no logits.
     const cached = sess.syncWithFallback(i32_prompt) catch |err| {
         sess.reset();
         return err;
