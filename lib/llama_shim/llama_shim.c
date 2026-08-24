@@ -281,7 +281,12 @@ mlx_llama_engine *mlx_llama_open_ex(const char *gguf_path, int32_t n_gpu_layers,
     }
     e->model = model;
     e->vocab = llama_model_get_vocab(model);
-    e->rpc_with_metal = (n_rpc > 0) && (ggml_backend_reg_by_name("Metal") != NULL);
+    // b10472's Metal backend registers itself as "MTL" (ggml-metal.cpp's
+    // GGML_METAL_NAME), NOT "Metal" -- confirmed live on a real Metal+RPC
+    // load (m4max, 2026-08-24): "Metal" always read back NULL despite Metal
+    // being fully active (device MTL0, kernels compiled), silently defeating
+    // this whole gate. Device names ("MTL0") were the tell.
+    e->rpc_with_metal = (n_rpc > 0) && (ggml_backend_reg_by_name("MTL") != NULL);
     return e;
 }
 

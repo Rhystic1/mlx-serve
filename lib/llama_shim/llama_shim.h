@@ -203,7 +203,7 @@ int32_t mlx_llama_session_state_set(mlx_llama_session *s, const uint8_t *src, si
 // ── Backend registry queries + ggml RPC (rpc-offload-plan.md Part 1) ───────
 // "Staged on disk" is not "loaded": ggml skips a backend whose deps fail to
 // resolve and the model silently runs on the rest. These ask the REGISTRY.
-bool    mlx_llama_backend_present(const char *name);                 // e.g. "RPC", "CUDA", "Metal"
+bool    mlx_llama_backend_present(const char *name);                 // ggml_backend_reg names, e.g. "RPC", "CUDA", "MTL" (NOT "Metal" -- ggml-metal.cpp's GGML_METAL_NAME)
 int32_t mlx_llama_backend_names(char *buf, size_t cap);              // comma-joined; returns length
 
 // Open with ggml RPC devices appended after the local GPUs (rpc-offload-plan.md
