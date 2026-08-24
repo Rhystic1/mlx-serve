@@ -78,6 +78,41 @@ if llama_asset_plan Plan9 x86_64 "$T" >/dev/null 2>&1; then
   fail "llama_asset_plan accepted an unsupported OS"
 else pass; fi
 
+# ── 3. The CUDA runtime companion (Windows) ────────────────────────────────
+# ggml-cuda.dll DLOPENS its CUDA runtime by filename and, when it is missing,
+# ggml SILENTLY CONTINUES ON THE CPU. So a Windows stage that ships
+# ggml-cuda.dll without cudart/cublas produces a build that reports CUDA
+# support, links fine, boots fine, and prefills at CPU speed. The runtime is a
+# SEPARATE release asset from the main win-cuda zip, which is why it is easy to
+# omit: this is exactly what a fresh checkout hit (2026-08-23), and the tell
+# was a missing `ggml_cuda_init: found N CUDA devices` line, not any error.
+eq "cudart asset name" "cudart-llama-bin-win-cuda-13.3-x64.zip"    "$(llama_cudart_asset)"
+
+# The version rides LLAMA_CUDA_VER, exactly like the main asset — the two are
+# published as a matched pair and a mismatch is a load-time failure.
+( export LLAMA_CUDA_VER=12.4
+  eq "cudart asset honors LLAMA_CUDA_VER" "cudart-llama-bin-win-cuda-12.4-x64.zip"      "$(llama_cudart_asset)" ) || fail "cudart asset override subshell failed"
+
+# The names the stage must contain afterwards. Asserted as a LIST because the
+# verification step greps for exactly these; drift here silently disarms it.
+eq "required cuda runtime dlls" "cublas64_13.dll cublasLt64_13.dll cudart64_13.dll"    "$(llama_cuda_runtime_dlls | sort | tr '
+' ' ' | sed 's/ $//')"
+
+# The verification itself, which is the whole point of the change: a complete
+# stage must be silent, and an incomplete one must NAME what is missing rather
+# than let the build proceed to a CPU fallback nobody notices.
+CUDA_T="$(mktemp -d)"
+for d in $(llama_cuda_runtime_dlls); do : > "$CUDA_T/$d"; done
+eq "complete cuda stage passes silently" "" "$(llama_missing_cuda_runtime "$CUDA_T")"
+
+rm -f "$CUDA_T/cublasLt64_13.dll"
+eq "missing cuda dll is named" "cublasLt64_13.dll" "$(llama_missing_cuda_runtime "$CUDA_T")"
+
+rm -f "$CUDA_T"/*.dll
+eq "empty stage names all three" "cublas64_13.dll cublasLt64_13.dll cudart64_13.dll"    "$(llama_missing_cuda_runtime "$CUDA_T" | sort | tr '
+' ' ' | sed 's/ $//')"
+rm -rf "$CUDA_T"
+
 # ── 4. The downloaded path and the extracted path must be the SAME path ────
 # A pure-helper test proves the resolver picks the right ASSET; it cannot see
 # that the script then saves the download under one name and untars another.

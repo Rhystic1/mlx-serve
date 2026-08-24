@@ -63,6 +63,31 @@ llama_asset_plan() {
   esac
 }
 
+# The CUDA runtime that ggml-cuda.dll dlopens, published as a SEPARATE release
+# asset from the main win-cuda zip and versioned in lockstep with it.
+llama_cudart_asset() {
+  echo "cudart-llama-bin-win-cuda-${LLAMA_CUDA_VER}-x64.zip"
+}
+
+# The runtime DLLs that must sit beside ggml-cuda.dll. ggml resolves them by
+# FILENAME at init and, when they are absent, SILENTLY FALLS BACK TO THE CPU —
+# no error, no missing-DLL dialog, just a build that reports CUDA support and
+# prefills at CPU speed. Staging is therefore verified, not assumed.
+llama_cuda_runtime_dlls() {
+  printf '%s
+' cudart64_13.dll cublas64_13.dll cublasLt64_13.dll
+}
+
+# Names any required runtime DLL missing from <dir>, one per line; silent when
+# the stage is complete. Factored out of the win-cuda branch so the check that
+# prevents a silent CPU build is itself testable without a 700 MB download.
+llama_missing_cuda_runtime() {
+  local dir="$1" dll
+  for dll in $(llama_cuda_runtime_dlls); do
+    [ -f "$dir/$dll" ] || echo "$dll"
+  done
+}
+
 # Sourced for its helpers only (tests): stop here, before any network or
 # filesystem work.
 if [ -n "${FETCH_LIB_ONLY:-}" ]; then return 0; fi
@@ -200,6 +225,35 @@ win-cuda)
     exit 1
   fi
 
+  # ── CUDA runtime companion ────────────────────────────────────────────
+  # A separate asset, and the ONLY thing standing between "links against CUDA"
+  # and "actually runs on the GPU": ggml dlopens these by filename and silently
+  # continues on the CPU when they are missing.
+  CUDART_ASSET="$(llama_cudart_asset)"
+  CUDART_URL="https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_TAG}/${CUDART_ASSET}"
+  echo "[fetch-llama] downloading $CUDART_URL"
+  curl -fSL --retry 3 -o "$TMP/cudart.zip" "$CUDART_URL"
+
+  mkdir -p "$TMP/cudart"
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q "$TMP/cudart.zip" -d "$TMP/cudart"
+  else
+    powershell.exe -NoProfile -Command       "Expand-Archive -Force -LiteralPath '$(cygpath -w "$TMP/cudart.zip")' -DestinationPath '$(cygpath -w "$TMP/cudart")'"
+  fi
+  find "$TMP/cudart" -name '*.dll' -exec cp {} "$DEST_BIN/" \;
+
+  # VERIFY, do not assume. A missing runtime DLL has no symptom at build time
+  # and no symptom at boot — only a prefill that runs on the CPU — so this is
+  # the one place it can still be caught by name.
+  MISSING="$(llama_missing_cuda_runtime "$DEST_BIN" | tr '
+' ' ')"
+  if [ -n "${MISSING// /}" ]; then
+    echo "[fetch-llama] ERROR: $CUDART_ASSET did not provide: $MISSING" >&2
+    echo "  ggml-cuda.dll dlopens these by filename; without them ggml falls" >&2
+    echo "  back to the CPU SILENTLY and the build only looks CUDA-enabled." >&2
+    exit 1
+  fi
+
   fetch_src_headers
 
   # No import libraries are generated: lld links directly against a DLL under
@@ -212,10 +266,17 @@ win-cuda)
   echo "[fetch-llama] staged llama.cpp ($LLAMA_TAG, CUDA $LLAMA_CUDA_VER):"
   echo "  $(ls "$DEST_BIN"/*.dll | wc -l | tr -d ' ') DLLs in $DEST_BIN"
   echo "  $(ls "$DEST_INC" | wc -l | tr -d ' ') headers in $DEST_INC"
+  echo "  CUDA runtime staged from $CUDART_ASSET:"
+  echo "    $(llama_cuda_runtime_dlls | tr '
+' ' ')"
   echo ""
-  echo "  NOTE: the CUDA runtime DLLs are a SEPARATE download:"
-  echo "    cudart-llama-bin-win-cuda-${LLAMA_CUDA_VER}-x64.zip"
-  echo "  Not needed when a matching CUDA toolkit is already on PATH."
+  echo "  IMPORTANT: clear the Zig caches before the next build —"
+  echo "    rm -rf .zig-cache \"\${LOCALAPPDATA:-\$HOME/.cache}/zig\""
+  echo "  build.zig enumerates lib/llama/bin at CONFIGURE time and Zig caches"
+  echo "  that build graph, so DLLs staged after an earlier build are NEVER"
+  echo "  copied beside mlx-serve.exe — and a missing CUDA runtime downgrades"
+  echo "  the backend SILENTLY. Same class as the stale-link-path note in"
+  echo "  CLAUDE.md (Building)."
   ;;
 
 # ── Linux: no prebuilt CUDA asset upstream ─────────────────────────────────
