@@ -436,6 +436,11 @@ pub const Slot = struct {
     /// hot-prefix-cache lookup/restore and the model forward over the
     /// uncached tail. Populated by the scheduler main loop.
     prefill_ns: u64,
+    /// Set when this slot's prompt was restored from a remote worker. Only a
+    /// LOCAL prefill is evidence about local speed, so the rate learner must
+    /// skip these — billing a round trip as local prefill would teach the
+    /// consumer it is slower than it is and refuse remote prefill thereafter.
+    remote_prefilled: bool = false,
     /// Wall-clock nanoseconds of interleaved decode ticks hosted INSIDE this
     /// slot's prefill (chunk-boundary yields). Charged to the decoding slots
     /// that received the tokens; subtracted from this slot's `prefill_ns` so
@@ -3975,6 +3980,16 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     continue;
                 };
                 slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;
+                // Learn this model's LOCAL prefill rate on THIS machine — the
+                // one input remote-prefill viability cannot get from the wire.
+                // Cached tokens were reused rather than computed, so the sample
+                // counts only what this box actually ran.
+                if (!slot.remote_prefilled and slot.prompt_tokens > slot.cached_tokens) {
+                    slot.model.local_prefill_rate.observe(
+                        @as(f64, @floatFromInt(slot.prefill_ns)) / 1_000_000.0,
+                        @intCast(slot.prompt_tokens - slot.cached_tokens),
+                    );
+                }
                 // Exact time-to-first-token: elapsed from request arrival
                 // (Slot.init, pre-queue-wait) to prefill completion. Captured
                 // here rather than derived by subtraction in finishSlot, so a
@@ -4975,6 +4990,7 @@ fn runPrefillLlama(sch: *Scheduler, slot: *Slot, engine: *arch_llama.LlamaEngine
     // which is billed into prefill_ns, so counting them as cached would divide
     // one token by the whole exchange and report a rate ~3000x too low.
     slot.cached_tokens = @intCast(rpc.cachedTokensAfterPrefill(remote_engaged, @intCast(cached)));
+    slot.remote_prefilled = remote_engaged;
     slot.state = .decoding;
 }
 

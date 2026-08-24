@@ -137,6 +137,44 @@ pub const Economics = struct {
     }
 };
 
+/// A model's LOCAL prefill rate on THIS machine, learned from its own local
+/// prefills rather than configured.
+///
+/// viable() needs local ms/token, and neither a flag nor a load-time probe is
+/// right: a flag is a number the operator cannot know (it is per model, per
+/// machine, and moves with thermal state), and a probe pays a prefill nobody
+/// asked for. The server already times every local prefill, so the rate is
+/// free — an EMA over observations, exactly how the blob shape is learned from
+/// replies.
+///
+/// Unmeasured means ATTEMPT, mirroring the blob-shape rule: refusing until
+/// calibrated would mean a server that never remote-prefills until it has
+/// already done the local work remote prefill exists to avoid.
+///
+/// The EMA is deliberately slow (1/8) because the thing it tracks is slow —
+/// thermal state and memory pressure drift over minutes — while individual
+/// prefills are noisy, especially a short one dominated by fixed overhead.
+pub const LocalRateEma = struct {
+    ms_per_token: f64 = 0,
+
+    /// Samples below this are dominated by per-request overhead rather than
+    /// per-token work, and would bias the rate upward.
+    pub const MIN_SAMPLE_TOKENS: usize = 64;
+
+    pub fn observe(self: *LocalRateEma, prefill_ms: f64, tokens_computed: usize) void {
+        if (tokens_computed < MIN_SAMPLE_TOKENS or prefill_ms <= 0) return;
+        const sample = prefill_ms / @as(f64, @floatFromInt(tokens_computed));
+        self.ms_per_token = if (self.ms_per_token == 0)
+            sample
+        else
+            self.ms_per_token * 0.875 + sample * 0.125;
+    }
+
+    pub fn known(self: LocalRateEma) bool {
+        return self.ms_per_token > 0;
+    }
+};
+
 /// Solve `fixed + slope*n` from two replies at different lengths.
 ///
 /// One reply cannot separate the two terms, and treating a single
@@ -713,6 +751,62 @@ test "viability degrades gracefully when the shape is unknown" {
     e.wire_bytes_per_sec = 0;
     try testing.expect(!e.viable(1000));
     try testing.expect(e.minViableTokens() == null);
+}
+
+test "LocalRateEma learns the consumer's own rate and ignores unusable samples" {
+    var ema = LocalRateEma{};
+    try testing.expect(!ema.known());
+
+    // A short prefill is dominated by fixed overhead, not per-token work —
+    // taking it would bias the rate upward and refuse remote prefill that
+    // would have paid.
+    ema.observe(500.0, 10);
+    try testing.expect(!ema.known());
+    // Degenerate timings are not evidence either.
+    ema.observe(0.0, 1000);
+    ema.observe(-5.0, 1000);
+    try testing.expect(!ema.known());
+
+    // First real sample IS the estimate — there is nothing to blend with, and
+    // starting from an invented prior would take many samples to shake off.
+    ema.observe(23_820.0, 3525); // m4mini, measured
+    try testing.expectApproxEqAbs(@as(f64, 6.757), ema.ms_per_token, 0.01);
+
+    // Later samples move it slowly: the thing being tracked (thermal state) is
+    // slow, while individual prefills are noisy.
+    const before = ema.ms_per_token;
+    ema.observe(100_000.0, 3525); // a wild outlier
+    try testing.expect(ema.ms_per_token > before);
+    try testing.expect(ema.ms_per_token < before * 1.6); // but not dragged to it
+}
+
+test "a learned local rate drives viability without any configuration" {
+    // The end state: nothing is configured. The blob shape comes from replies,
+    // the local rate from local prefills, and the two together decide.
+    var ema = LocalRateEma{};
+    ema.observe(23_820.0, 3525); // M4 mini
+    var e = Economics{
+        .fixed_bytes = 178_000_000, // q8_0, measured
+        .slope_bytes_per_token = 8 * 1024 + 700,
+        .wire_bytes_per_sec = 110_000_000,
+        .worker_ms_per_token = 1.398,
+        .local_ms_per_token = ema.ms_per_token,
+    };
+    try testing.expect(e.viable(3525));
+
+    const mini_min = e.minViableTokens().?;
+
+    // The SAME worker against a much faster consumer has less advantage to
+    // sell, so it needs a longer prompt to amortize the fixed blob.
+    var fast = LocalRateEma{};
+    fast.observe(7_020.0, 3329); // M4 Max, measured
+    e.local_ms_per_token = fast.ms_per_token;
+    const max_min = e.minViableTokens().?;
+    try testing.expect(max_min > mini_min);
+    // ...but q8_0 still brings the M4 Max's real 3329-token prompt inside the
+    // viable range, which is what m4max measured: remote won by ~0.8 s where
+    // f16 had lost by ~2 s.
+    try testing.expect(e.viable(3329));
 }
 
 test "solveBlobShape separates the window payload from the per-token slope" {

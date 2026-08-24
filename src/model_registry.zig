@@ -220,6 +220,11 @@ pub const LoadedModel = struct {
     /// `runPrefillLlama` when creating the persistent session. Mutating
     /// these after a session has been created has no effect — the values
     /// are baked into the libllama context at create-time.
+    /// This model's LOCAL prefill rate on this machine, learned from its own
+    /// local prefills (see remote_prefill_client.LocalRateEma). Lives on the
+    /// entry because it is per MODEL and per machine, and because a hot model
+    /// switch must not carry another model's rate.
+    local_prefill_rate: @import("remote_prefill_client.zig").LocalRateEma = .{},
     llama_kv_type_k: i32 = 0,
     llama_kv_type_v: i32 = 0,
     /// Lazily created embedding session for a GGUF model (`/v1/embeddings`).
