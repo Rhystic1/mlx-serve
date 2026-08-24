@@ -155,6 +155,33 @@ int32_t mlx_llama_session_argmax(mlx_llama_session *s);
 // Number of tokens currently in the KV cache.
 int32_t mlx_llama_session_pos(mlx_llama_session *s);
 
+// ── Sequence-state interchange (remote prefill) ────────────────────────────
+//
+// The session holds ONE sequence (seq_id 0). Its KV state serializes through
+// llama.cpp's own llama_state_seq_get_data / set_data, which is the ONLY thing
+// that makes a CUDA-prefilled cache loadable by a Metal decoder: upstream owns
+// the per-backend layout and the blob is backend-neutral. The blob is coupled
+// to the llama.cpp BUILD and the GGUF file -- both sides must run the same
+// pin and the same weights, or a restore silently produces garbage.
+
+// Exact size in bytes of the serialized state. 0 when the session is empty.
+size_t mlx_llama_session_state_size(mlx_llama_session *s);
+
+// Serialize the sequence state into `dst` (`cap` bytes). Returns the number of
+// bytes written, 0 on failure (cap too small or libllama refused).
+size_t mlx_llama_session_state_get(mlx_llama_session *s, uint8_t *dst, size_t cap);
+
+// Restore a blob produced by mlx_llama_session_state_get on the SAME llama.cpp
+// build + GGUF. The session is CLEARED first. On success the shim's own
+// position counter is set to `n_tokens` -- the token count the blob was
+// prefilled with, which llama.cpp does not carry -- because a restore that
+// left `pos` behind would make the next decode write at the wrong position:
+// coherent-looking output from a corrupt cache, no error anywhere. The blob
+// carries NO logits: decode at least one token before sampling. 0 ok, -1 on
+// failure (session left cleared; `err` names the reason).
+int32_t mlx_llama_session_state_set(mlx_llama_session *s, const uint8_t *src, size_t n,
+                                    int32_t n_tokens, char *err, size_t errlen);
+
 #ifdef __cplusplus
 }
 #endif

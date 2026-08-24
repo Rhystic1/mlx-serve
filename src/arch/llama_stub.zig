@@ -15,6 +15,8 @@ pub const Error = error{
     SessionCreateFailed,
     TokenizeFailed,
     DetokenizeFailed,
+    StateExportFailed,
+    StateImportFailed,
     OutOfMemory,
 };
 
@@ -139,6 +141,14 @@ pub const LlamaSession = struct {
         _ = self;
         @panic(unavailable);
     }
+    pub fn exportState(_: *LlamaSession, _: std.mem.Allocator) Error![]u8 {
+        return Error.StateExportFailed;
+    }
+
+    pub fn importState(_: *LlamaSession, _: []const u8, _: []const i32) Error!void {
+        return Error.StateImportFailed;
+    }
+
     pub fn pos(self: *LlamaSession) i32 {
         _ = self;
         @panic(unavailable);

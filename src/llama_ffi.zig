@@ -86,3 +86,8 @@ pub extern fn mlx_llama_session_eval(s: *Session, token: i32, err: ?[*]u8, errle
 pub extern fn mlx_llama_session_sample(s: *Session, temperature: f32, top_k: i32, top_p: f32, min_p: f32, rng: *u64) i32;
 pub extern fn mlx_llama_session_argmax(s: *Session) i32;
 pub extern fn mlx_llama_session_pos(s: *Session) i32;
+
+// Sequence-state interchange (remote prefill) -- see llama_shim.h.
+pub extern fn mlx_llama_session_state_size(s: *Session) usize;
+pub extern fn mlx_llama_session_state_get(s: *Session, dst: [*]u8, cap: usize) usize;
+pub extern fn mlx_llama_session_state_set(s: *Session, src: [*]const u8, n: usize, n_tokens: i32, err: ?[*]u8, errlen: usize) i32;

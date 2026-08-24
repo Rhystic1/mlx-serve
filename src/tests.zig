@@ -43,6 +43,7 @@ test {
     _ = @import("model_discovery.zig");
     _ = @import("gguf_meta.zig");
     _ = @import("llama_ffi.zig");
+    _ = @import("remote_prefill.zig");
     _ = @import("wav.zig");
     _ = @import("png.zig");
     _ = @import("marching_cubes.zig");

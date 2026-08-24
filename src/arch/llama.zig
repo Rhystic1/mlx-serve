@@ -18,6 +18,8 @@ pub const Error = error{
     SessionEvalFailed,
     EmbedFailed,
     TokenizeFailed,
+    StateExportFailed,
+    StateImportFailed,
     OutOfMemory,
 };
 
@@ -363,6 +365,39 @@ pub const LlamaSession = struct {
 
     pub fn pos(self: *LlamaSession) i32 {
         return ffi.mlx_llama_session_pos(self.handle);
+    }
+
+    /// Serialize the resident sequence state (remote prefill, server side).
+    /// llama.cpp's own backend-neutral blob: what a CUDA box prefilled, a Metal
+    /// decoder can `importState`. Coupled to the llama.cpp BUILD + GGUF file.
+    /// Caller frees. Fails on an empty session -- an empty blob is not a state.
+    pub fn exportState(self: *LlamaSession, allocator: std.mem.Allocator) Error![]u8 {
+        const need = ffi.mlx_llama_session_state_size(self.handle);
+        if (need == 0) return Error.StateExportFailed;
+        const buf = try allocator.alloc(u8, need);
+        errdefer allocator.free(buf);
+        const got = ffi.mlx_llama_session_state_get(self.handle, buf.ptr, buf.len);
+        if (got == 0) return Error.StateExportFailed;
+        return buf[0..got];
+    }
+
+    /// Restore a blob from `exportState` as THIS session's whole state, with
+    /// `tokens` = the ids it was prefilled from. The session is cleared first.
+    /// Sets the C-side position to `tokens.len` (the shim owns that counter
+    /// separately from llama's KV -- see llama_shim.h) AND the `resident`
+    /// mirror to `tokens`, so a following `sync(prompt)` finds the prompt
+    /// resident, backs off one position and re-decodes the last token for
+    /// logits (the blob carries none). On failure the session is left EMPTY.
+    pub fn importState(self: *LlamaSession, blob: []const u8, tokens: []const i32) Error!void {
+        self.resident.clearRetainingCapacity();
+        if (blob.len == 0 or tokens.len == 0) return Error.StateImportFailed;
+        var err_buf: [256]u8 = undefined;
+        const rc = ffi.mlx_llama_session_state_set(self.handle, blob.ptr, blob.len, @intCast(tokens.len), &err_buf, err_buf.len);
+        if (rc != 0) {
+            log.warn("[llama] state import failed: {s}\n", .{std.mem.sliceTo(&err_buf, 0)});
+            return Error.StateImportFailed;
+        }
+        try self.resident.appendSlice(self.allocator, tokens);
     }
 
     /// Sync the KV cache to `prompt_ids`, reusing the longest prefix already
@@ -811,4 +846,61 @@ test "llama: prefix reuse is byte-identical to cold decode" {
         try sess.eval(tok);
         tok = sess.argmax();
     }
+}
+
+test "llama: sequence state round-trips between sessions (remote prefill interchange)" {
+    const allocator = std.testing.allocator;
+    const path = testModelPath() orelse return error.SkipZigTest;
+    const remote_prefill = @import("../remote_prefill.zig");
+
+    var engine = try LlamaEngine.open(allocator, path, .{});
+    defer engine.close();
+    const ids = try engine.tokenizeText(allocator, "The capital of France is the city of", true);
+    defer allocator.free(ids);
+    try std.testing.expect(ids.len >= 3);
+
+    // Reference: one session, whole prompt, the next token it wants.
+    var reference = try engine.createSession(2048);
+    defer reference.free();
+    _ = try reference.sync(ids);
+    const expect_next = reference.argmax();
+
+    // Worker: prefill ALL BUT THE LAST token (the wire contract -- see
+    // remote_prefill.prefillSpan), export. pos must equal what was fed or the
+    // consumer's next decode lands at the wrong position.
+    const span = remote_prefill.prefillSpan(ids);
+    var producer = try engine.createSession(2048);
+    defer producer.free();
+    _ = try producer.sync(span);
+    try std.testing.expectEqual(@as(i32, @intCast(span.len)), producer.pos());
+    const blob = try producer.exportState(allocator);
+    defer allocator.free(blob);
+    try std.testing.expect(blob.len > 0);
+
+    // An empty session has no state to export.
+    var empty = try engine.createSession(2048);
+    defer empty.free();
+    try std.testing.expectError(Error.StateExportFailed, empty.exportState(allocator));
+
+    // Consumer: import, then the ORDINARY sync of the full prompt. It must
+    // reuse exactly N-1 (no trim -- a recurrent checkpoint like LFM2 refuses
+    // one and would cold-prefill instead) and decode only the last token,
+    // landing on the SAME next token as the reference.
+    var consumer = try engine.createSession(2048);
+    defer consumer.free();
+    try consumer.importState(blob, span);
+    try std.testing.expectEqual(@as(i32, @intCast(span.len)), consumer.pos());
+    try std.testing.expectEqualSlices(i32, span, consumer.resident.items);
+    const reused = try consumer.sync(ids);
+    try std.testing.expectEqual(@as(i32, @intCast(ids.len - 1)), reused);
+    try std.testing.expectEqual(@as(u32, 0), consumer.trim_refusals);
+    try std.testing.expectEqual(expect_next, consumer.argmax());
+
+    // Garbage is refused and leaves the session empty, never half-restored.
+    var victim = try engine.createSession(2048);
+    defer victim.free();
+    const junk = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0 };
+    try std.testing.expectError(Error.StateImportFailed, victim.importState(&junk, span));
+    try std.testing.expectEqual(@as(i32, 0), victim.pos());
+    try std.testing.expectEqual(@as(usize, 0), victim.resident.items.len);
 }

@@ -436,3 +436,38 @@ int32_t mlx_llama_session_sample(mlx_llama_session *s, float temperature, int32_
 int32_t mlx_llama_session_pos(mlx_llama_session *s) {
     return s->pos;
 }
+
+// ── Sequence-state interchange (remote prefill) ────────────────────────────
+
+size_t mlx_llama_session_state_size(mlx_llama_session *s) {
+    if (s->pos == 0) return 0;
+    return llama_state_seq_get_size(s->ctx, 0);
+}
+
+size_t mlx_llama_session_state_get(mlx_llama_session *s, uint8_t *dst, size_t cap) {
+    if (s->pos == 0) return 0;
+    size_t need = llama_state_seq_get_size(s->ctx, 0);
+    if (need == 0 || need > cap) return 0;
+    return llama_state_seq_get_data(s->ctx, dst, cap, 0);
+}
+
+int32_t mlx_llama_session_state_set(mlx_llama_session *s, const uint8_t *src, size_t n,
+                                    int32_t n_tokens, char *err, size_t errlen) {
+    // Clear first: set_data appends into whatever the sequence already holds,
+    // and the caller's contract is "this blob IS the sequence".
+    mlx_llama_session_reset(s);
+    if (n_tokens <= 0 || n == 0) {
+        copy_err(err, errlen, "state_set: empty blob or non-positive token count");
+        return -1;
+    }
+    size_t got = llama_state_seq_set_data(s->ctx, src, n, 0);
+    if (got == 0) {
+        // llama.cpp reports failure as 0 and may have partially populated the
+        // sequence before giving up -- never leave that behind.
+        mlx_llama_session_reset(s);
+        copy_err(err, errlen, "llama_state_seq_set_data refused the blob (build/model mismatch?)");
+        return -1;
+    }
+    s->pos = n_tokens;
+    return 0;
+}
