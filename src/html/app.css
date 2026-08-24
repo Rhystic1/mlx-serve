@@ -649,3 +649,16 @@ table.models .state.error { color: #f28b82 }
 .tp-edge.pf { stroke: #10b981; stroke-dasharray: 5 4 }
 .tp-edge.lan { stroke: var(--line); stroke-dasharray: 2 3 }
 .tp-elbl { fill: var(--dim); font-size: 10px; font-family: var(--mono); text-anchor: middle }
+
+/* ── Font Awesome icons (CDN) replace the pure-CSS glyphs ───────────────── */
+.nav-fa { width: 16px; text-align: center; margin-right: 2px; color: var(--dim); font-size: 14px }
+.nav-item.active .nav-fa { color: var(--fg) }
+/* the buttons that gained an <i> had ::before/::after glyphs — retire those so
+   the icon does not double up */
+.side-toggle::before, .side-toggle::after,
+.side-open::before, .side-open::after,
+.plus::before, .plus::after,
+.send::before, .send::after { content: none }
+.side-toggle i, .side-open i { font-size: 14px }
+.plus i { font-size: 16px }
+.send i { font-size: 15px }
