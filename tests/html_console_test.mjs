@@ -108,7 +108,7 @@ test('the DOM wiring boots without reaching for something out of scope', () => {
 test('the sidebar destinations are New chat, Monitor, API in that order', () => {
   const html = readFileSync(join(here, '..', 'src', 'html', 'index.html'), 'utf8');
   const order = [...html.matchAll(/data-tab="(\w+)"/g)].map(m => m[1]);
-  assert.deepEqual(order, ['chat', 'monitor', 'api']);
+  assert.deepEqual(order, ['chat', 'monitor', 'cluster', 'api']);
   // The panel that ships with `active` is what a visitor sees before any JS.
   const active = /<section class="panel active" id=tab-(\w+)>/.exec(html);
   assert.equal(active && active[1], 'chat');
@@ -974,4 +974,53 @@ test('speechBody never sends both voice and ref_audio', () => {
 
   const plain = C.speechBody({ model: 'm', text: 'hi' });
   assert.deepEqual(plain, { model: 'm', input: 'hi' });
+});
+
+test('renderCluster hides off subsystems and shows a standalone node', () => {
+  const html = C.renderCluster({
+    self: { name: 'M4Max', host: '127.0.0.1', port: 8080, platform: 'macos', engine: 'mlx', version: '26.8.10', models: ['gemma-4-12b'] },
+    lan: { enabled: false, peers: [] },
+    rpc: { role: 'none' },
+    prefill: { mode: 'none' },
+    live: { decode_tok_s: 42.5, requests_inflight: 0 },
+    hops: null,
+  });
+  assert.match(html, /M4Max/);
+  assert.match(html, /gemma-4-12b/);
+  // off subsystems draw nothing
+  assert.doesNotMatch(html, /LAN share/);
+  assert.doesNotMatch(html, /RPC ring/);
+  assert.doesNotMatch(html, /Remote prefill/);
+  assert.match(html, /42\.5/);
+});
+
+test('renderCluster draws RPC layer ranges and a consumer-engine badge', () => {
+  const html = C.renderCluster({
+    self: { name: 'n', host: 'h', port: 1, platform: 'macos', engine: 'llama.cpp', version: 'v' },
+    rpc: {
+      role: 'consumer', model: 'qwen', tensor_split: [0.5, 0.5],
+      workers: [{ endpoint: '192.168.0.150:50052', free_bytes: 15032385536, reachable: true }],
+      devices: [
+        { name: 'Metal', kind: 'local', layers: [0, 15], layer_count: 16 },
+        { name: 'RPC0', kind: 'remote', endpoint: '192.168.0.150:50052', layers: [16, 30], layer_count: 15 },
+      ],
+    },
+    prefill: { mode: 'consumer', consumer_engine: 'mlx', kv_type: 'q8_0', url: 'http://192.168.0.150:8080', last: { engaged: true, tokens: 3329, ms: 1600 } },
+  });
+  assert.match(html, /RPC ring/);
+  assert.match(html, /layers 0.15/);        // en-dash between
+  assert.match(html, /layers 16.30/);
+  assert.match(html, /mlx import/);
+  assert.match(html, /engaged 3329 tok/);
+  assert.doesNotMatch(html, /unreachable/);  // reachable worker: no warn
+});
+
+test('renderCluster escapes untrusted peer/model strings', () => {
+  const html = C.renderCluster({
+    self: { name: '<script>x', host: 'h', port: 1, platform: 'p', engine: 'e', version: 'v' },
+    lan: { enabled: true, peers: [{ name: '<img>', ip: '1.2.3.4', port: 80, models: ['a<b'] }] },
+  });
+  assert.doesNotMatch(html, /<script>x/);
+  assert.doesNotMatch(html, /<img>/);
+  assert.match(html, /&lt;script&gt;x/);
 });

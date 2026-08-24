@@ -823,6 +823,120 @@
   /// The mic may only be live while listening.
   function micShouldRun(state) { return state === 'listening'; }
 
+  // ── Cluster view ──────────────────────────────────────────────────────────
+  // Pure: GET /v1/cluster JSON → HTML string. Renders the whole mesh in one
+  // place — this node, LAN-share peers, the RPC ring with per-device layer
+  // ranges, and the remote-prefill relationship. Every subsystem is nullable,
+  // so each section self-hides when off. No DOM, no fetch — unit-tested.
+  function clEsc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+  function clGB(n) {
+    if (n == null || isNaN(n)) return '?';
+    return (n / 1073741824).toFixed(1) + ' GB';
+  }
+  function clModels(ids) {
+    if (!ids || !ids.length) return '';
+    return '<div class=cl-models>' + ids.map(function (m) {
+      return '<span class=cl-chip>' + clEsc(m) + '</span>';
+    }).join('') + '</div>';
+  }
+  function clNode(self) {
+    if (!self) return '';
+    var badges = '<span class="cl-badge on">' + clEsc(self.engine || '?') + '</span>' +
+      '<span class=cl-badge>' + clEsc(self.platform || '?') + '</span>';
+    return '<div class="cl-node self">' +
+      '<div class=cl-row><span class=cl-name>' + clEsc(self.name || self.host || 'this node') + '</span>' +
+      '<span class=cl-host>' + clEsc(self.host || '') + ':' + clEsc(self.port) + '</span>' + badges +
+      '<span class=cl-badge>v' + clEsc(self.version || '?') + '</span></div>' +
+      clModels(self.models) + '</div>';
+  }
+  function clLan(lan) {
+    if (!lan || !lan.enabled) return '';
+    var peers = (lan.peers || []);
+    var body = peers.length ? peers.map(function (p) {
+      return '<div class=cl-node><div class=cl-row>' +
+        '<span class=cl-name>' + clEsc(p.name || p.ip) + '</span>' +
+        '<span class=cl-host>' + clEsc(p.ip || '') + ':' + clEsc(p.port) + '</span>' +
+        (p.caps && p.caps.prefill ? '<span class="cl-badge on">prefill</span>' : '') +
+        (p.caps && p.caps.rpc ? '<span class="cl-badge on">rpc</span>' : '') +
+        '</div>' + clModels(p.models) + '</div>';
+    }).join('') : '<div class=cl-off>No peers discovered.</div>';
+    return '<div class=cl-sec><h3>LAN share</h3>' + body + '</div>';
+  }
+  function clDevices(devs) {
+    if (!devs || !devs.length) return '';
+    // Total layers = the max last index + 1, so bars are proportional.
+    var span = 0;
+    devs.forEach(function (d) { if (d.layers && d.layers.length === 2) span = Math.max(span, d.layers[1] + 1); });
+    if (span < 1) span = 1;
+    return devs.map(function (d) {
+      var has = d.layers && d.layers.length === 2 && d.layer_count > 0;
+      var left = has ? (d.layers[0] / span * 100) : 0;
+      var w = has ? (d.layer_count / span * 100) : 0;
+      var bar = has
+        ? '<span class="' + (d.kind === 'remote' ? 'remote' : 'local') + '" style="left:' + left.toFixed(1) + '%;width:' + w.toFixed(1) + '%"></span>'
+        : '';
+      var lbl = has ? ('layers ' + d.layers[0] + '–' + d.layers[1] + ' (' + d.layer_count + ')') : 'no layers';
+      return '<div class=cl-dev>' +
+        '<span class=cl-dev-name>' + clEsc(d.name) + '<br><span class=kind>' + clEsc(d.kind) + '</span></span>' +
+        '<span class=cl-bar>' + bar + '</span>' +
+        '<span class=cl-dev-n>' + lbl + '</span></div>';
+    }).join('');
+  }
+  function clRpc(rpc) {
+    if (!rpc || rpc.role === 'none' || rpc.role == null) return '';
+    var head = '<div class=cl-row><span class=cl-name>Layer offload</span>' +
+      '<span class="cl-badge on">' + clEsc(rpc.role) + '</span>' +
+      (rpc.model ? '<span class=cl-host>' + clEsc(rpc.model) + '</span>' : '') + '</div>';
+    var serve = rpc.serve
+      ? '<div class=cl-meta><span>serving <b>' + clEsc(rpc.serve.device) + '</b> on ' + clEsc(rpc.serve.endpoint) +
+        '</span><span><b>' + clGB(rpc.serve.free_bytes) + '</b> free of ' + clGB(rpc.serve.total_bytes) + '</span></div>'
+      : '';
+    var workers = (rpc.workers && rpc.workers.length)
+      ? '<div class=cl-meta>' + rpc.workers.map(function (w) {
+        return '<span>' + clEsc(w.endpoint) + ' · ' +
+          (w.reachable ? '<b>' + clGB(w.free_bytes) + '</b> free' : '<span class=cl-badge warn>unreachable</span>') + '</span>';
+      }).join('') + '</div>'
+      : '';
+    return '<div class=cl-sec><h3>RPC ring</h3><div class=cl-node>' +
+      head + serve + workers + clDevices(rpc.devices) + '</div></div>';
+  }
+  function clPrefill(pf) {
+    if (!pf || pf.mode === 'none' || pf.mode == null) return '';
+    var line = '<div class=cl-row><span class=cl-name>Remote prefill</span>' +
+      '<span class="cl-badge on">' + clEsc(pf.mode) + '</span>' +
+      (pf.consumer_engine ? '<span class=cl-badge>' + clEsc(pf.consumer_engine) + ' import</span>' : '') +
+      (pf.kv_type ? '<span class=cl-badge>KV ' + clEsc(pf.kv_type) + '</span>' : '') + '</div>';
+    var meta = [];
+    if (pf.url) meta.push('worker <b>' + clEsc(pf.url) + '</b>');
+    if (pf.model) meta.push(clEsc(pf.model));
+    if (pf.rates && (pf.rates.local_tok_s || pf.rates.remote_tok_s)) {
+      meta.push('local <b>' + (pf.rates.local_tok_s || 0).toFixed(0) + '</b> tok/s · remote <b>' + (pf.rates.remote_tok_s || 0).toFixed(0) + '</b> tok/s');
+    }
+    var last = '';
+    if (pf.last) {
+      last = pf.last.engaged
+        ? '<div class=cl-meta><span class="cl-badge on">engaged ' + clEsc(pf.last.tokens) + ' tok</span><span>' + (pf.last.ms || 0).toFixed(0) + ' ms</span></div>'
+        : '<div class=cl-meta><span class=cl-badge>fell back</span><span>' + clEsc(pf.last.reason || '') + '</span></div>';
+    }
+    var metaHtml = meta.length ? '<div class=cl-meta><span>' + meta.join('</span><span>') + '</span></div>' : '';
+    return '<div class=cl-sec><h3>Remote prefill</h3><div class=cl-node>' + line + metaHtml + last + '</div></div>';
+  }
+  function clLive(live) {
+    if (!live) return '';
+    return '<div class=cl-sec><h3>Live</h3><div class=cl-node><div class=cl-live>' +
+      '<span><b>' + (live.decode_tok_s || 0).toFixed(1) + '</b>decode tok/s</span>' +
+      '<span><b>' + (live.requests_inflight || 0) + '</b>in flight</span></div></div></div>';
+  }
+  function renderCluster(data) {
+    if (!data || typeof data !== 'object') return '<div class=cluster-empty>Cluster data unavailable.</div>';
+    var html = clNode(data.self) + clRpc(data.rpc) + clPrefill(data.prefill) + clLan(data.lan) + clLive(data.live);
+    return html || '<div class=cluster-empty>No cluster activity — this node is standalone.</div>';
+  }
+
   // Everything above is IIFE-scoped on purpose: the DOM wiring below calls
   // these too, and a helper declared inside this block would be visible to the
   // export and to the tests while being a ReferenceError on the page.
@@ -861,6 +975,7 @@
       tokensPerSecond: tokensPerSecond,
       formatBytes: formatBytes,
       errorText: errorText,
+      renderCluster: renderCluster,
     };
   }
 
@@ -1990,4 +2105,19 @@
   refreshMemory();
   setInterval(refreshMemory, 5000);
   setInterval(function () { if (!chatAbort) refreshModels(); }, 15000);
+
+  // Cluster tab: poll /v1/cluster only while the tab is showing. The endpoint
+  // is cheap (no llama calls per request) but there's no reason to hit it when
+  // nobody is looking. A failure leaves the last render in place.
+  async function refreshCluster() {
+    var view = $('cluster-view');
+    if (!view || !$('tab-cluster').classList.contains('active')) return;
+    try {
+      var res = await fetch('/v1/cluster', { headers: authHeaders(API_KEY) });
+      if (!res.ok) return;
+      view.innerHTML = renderCluster(await res.json());
+    } catch (e) { /* keep the last good render */ }
+  }
+  setInterval(refreshCluster, 2000);
+  document.querySelector('[data-tab="cluster"]').addEventListener('click', refreshCluster);
 })();

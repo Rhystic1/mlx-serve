@@ -94,7 +94,7 @@ if boot; then
 
     # ── 2. The console + the full endpoint reference are in the page ────────
     echo "[2/3] console markup + endpoint coverage"
-    for tab in chat monitor api; do
+    for tab in chat monitor cluster api; do
         grep -q "data-tab=\"$tab\"" "$BODY"
         check "sidebar destination '$tab' present" "$([ $? -eq 0 ] && echo 1 || echo 0)"
     done
