@@ -70,12 +70,14 @@ worker, fresh server per run, greedy:
 | M4 mini 16 GB | f16 (~570 MB) | ~32.2 s | ~16.9 s | ~1.9x faster end to end |
 | M4 Max | f16 (~570 MB) | 7.0 s | 9.0 s | loses, transfer eats the win |
 | M4 Max | q8_0 (~210 MB) | 7.7 s | 6.9 s | wins by ~0.8 s |
+| M4 mini 16 GB | q8_0 (~210 MB) | ~33.1 s | ~10.9 s | ~3.0x end to end, 4.2x on prefill |
 
 The mini wins big because its own prefill is slow (~6.7 ms/token) and the GPU
 does that part far faster. The Max lost on f16 because it is nearly as fast as
 the worker (~2.0 vs ~0.8 ms/token) and a 570 MB transfer ate the difference.
-Quantizing the exported KV cache to q8_0 cut the wire roughly in half and
-flipped the Max to a win.
+Quantizing the exported KV cache to q8_0 cut the wire roughly in half,
+flipped the Max to a win, and took the mini from 1.9x to 3.0x: its prefill
+phase went from 24 s to 5.7 s, and 5.7 s is now almost entirely the transfer.
 
 ### What the wire actually costs
 
@@ -105,7 +107,7 @@ rows as estimates, not measurements.
 | Consumer | Local prefill | Break-even | 4k prompt | 16k prompt | 32k prompt |
 |---|---|---|---|---|---|
 | M1 / M2 MacBook Air, 8 GPU cores (est.) | ~9 ms/tok | ~200 tok | 36 s vs 5 s | 144 s vs 16 s | 288 s vs 30 s |
-| M4 mini / MacBook Air, 10 cores (measured) | ~6.7 ms/tok | ~300 tok | 27 s vs 5 s | 107 s vs 16 s | 214 s vs 30 s |
+| M4 mini / MacBook Air, 10 cores (measured) | ~6.8 ms/tok | ~300 tok | 27 s vs 5 s | 108 s vs 16 s | 217 s vs 30 s |
 | M4 Pro, 20 cores (est.) | ~3.5 ms/tok | ~600 tok | 14 s vs 5 s | 56 s vs 16 s | 112 s vs 30 s |
 | M4 Max, 40 cores (measured) | ~2.0 ms/tok | ~2k tok | 8 s vs 5 s | 32 s vs 16 s | 64 s vs 30 s |
 | M3 Ultra, 80 cores (est.) | ~1.2 ms/tok | ~5k tok | loses | 19 s vs 16 s | 38 s vs 30 s |
