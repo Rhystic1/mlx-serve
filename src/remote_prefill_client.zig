@@ -57,81 +57,121 @@ pub const PREFILL_PATH = "/v1/prefill";
 /// every failure degrades to.
 pub var g_remote_prefill_url: ?[]const u8 = null;
 
-/// Whether remote prefill can pay for itself, as a PER-TOKEN comparison.
+/// Whether remote prefill can pay for itself at a given prompt length.
 ///
-/// The flat MIN_REMOTE_TOKENS floor this replaces was the wrong SHAPE, not
-/// merely the wrong number. Blob bytes scale linearly with tokens and prefill
-/// time scales linearly with tokens, so their ratio is constant in n: a config
-/// that loses at 1k tokens loses at 100k, and one that wins, wins everywhere.
-/// No token threshold can express that.
+/// The blob is NOT proportional to the prompt. Measured on gemma-4-12b
+/// (linux-x64, b10472, 2026-08-23) it is `fixed + slope x tokens`: a sliding-
+/// window arch exports a WINDOW-worth of cells for its 43 sliding layers
+/// whatever the prompt length, and only its 8 global layers grow with it.
 ///
-/// THAT LINEARITY IS A SHORT-CONTEXT APPROXIMATION, and the rates below are
-/// only valid at the length they were measured at. Prefill carries an O(n^2)
-/// attention term while the blob stays strictly linear — and goes SUB-linear
-/// under `swa_full=false`, where most layers cap at their window — so at long
-/// contexts the two curves genuinely diverge in REMOTE's favour and a real
-/// crossover can exist even for a config that loses at 3k. Deliberately not
-/// modelled here (the PoC lives in the short-context regime), but do not
-/// "fix" this by trusting a rate learned at 2k to describe 64k: re-measure
-/// per length band, or the model will refuse a config that would have won.
+///   f16   fixed ~335 MB   slope 16.4 KB/token
+///   q8_0  fixed ~178 MB   slope  8.7 KB/token
+///   (below the 1024 window the whole thing is still filling, ~344 KB/token)
 ///
-/// What it actually turns on is the WORKER'S ADVANTAGE. Per token the remote
-/// path costs `worker_prefill + transfer` and the local path costs
-/// `local_prefill`, so the entire budget for transfer is
-/// `local_ms_per_token - worker_ms_per_token`. A worker only 1.5x faster than
-/// the consumer leaves a third of local prefill to spend on the wire, however
-/// fat the pipe — measured 2026-08-23: gemma-4-12b at 167 KB/token needs a
-/// 2.2x blob shrink just to break even on gigabit against a CUDA worker that
-/// prefills at 1.398 ms/token versus the Mac's 2.109.
+/// That fixed term is why a token threshold turns out to be the RIGHT shape
+/// after all — my earlier "no crossover can exist" reasoning was correct only
+/// for the strictly-linear blob I assumed. The fixed cost amortizes over the
+/// prompt, so there is a genuine break-even length:
 ///
-/// A small token floor still earns its place, but only to amortize the fixed
-/// round-trip overhead this model ignores — not to decide viability.
+///   transfer(n) = (fixed + slope*n) / wire
+///   saving(n)   = n * (local_ms_per_token - worker_ms_per_token)
+///   viable  <=>  fixed/wire  <  n * (budget - slope/wire)
+///
+/// It still turns on the WORKER'S ADVANTAGE: when `budget - slope/wire <= 0`
+/// no prompt is long enough, because every extra token costs more to ship than
+/// it saves. A worker only 1.5x faster leaves a third of local prefill to spend
+/// on the wire however fat the pipe.
+///
+/// The model reproduces both independently measured results, which is the only
+/// reason to trust it: M4 Max f16 needs 5455 tokens and measured a LOSS at
+/// 3329; M4 mini f16 needs 595 and measured a WIN at 3525.
+///
+/// Still an approximation past the window in one direction: prefill carries an
+/// O(n^2) attention term while the blob stays linear, so at long contexts the
+/// real crossover arrives EARLIER than this predicts. Erring toward refusing a
+/// config that would have won is the safe direction; do not "fix" it by
+/// extrapolating rates measured at one length to another.
 pub const Economics = struct {
-    /// Blob bytes per prompt token, learned from a previous reply. 0 = not yet
-    /// measured for this model.
-    bytes_per_token: u64 = 0,
+    /// Window payload, paid whatever the prompt length. 0 with `slope` also 0
+    /// means "not yet measured for this model".
+    fixed_bytes: u64 = 0,
+    /// Marginal blob bytes per prompt token past the window.
+    slope_bytes_per_token: u64 = 0,
     /// Assumed usable wire throughput. 0 is a configuration error, never
     /// evidence about speed.
     wire_bytes_per_sec: u64 = 0,
     worker_ms_per_token: f64 = 0,
     local_ms_per_token: f64 = 0,
 
-    pub fn viable(self: Economics) bool {
-        if (self.wire_bytes_per_sec == 0) return false;
-        // A worker that is not FASTER can never pay, at any blob size.
-        const budget_ms = self.local_ms_per_token - self.worker_ms_per_token;
-        if (budget_ms <= 0) return false;
-        // Unmeasured rate ⇒ attempt, and learn it from the reply. Refusing here
-        // would mean the client could never bootstrap a model's rate.
-        if (self.bytes_per_token == 0) return true;
-        const transfer_ms = @as(f64, @floatFromInt(self.bytes_per_token)) /
+    fn measured(self: Economics) bool {
+        return self.fixed_bytes != 0 or self.slope_bytes_per_token != 0;
+    }
+
+    /// Milliseconds of local prefill each token saves, net of shipping it.
+    fn netPerTokenMs(self: Economics) f64 {
+        const budget = self.local_ms_per_token - self.worker_ms_per_token;
+        const slope_ms = @as(f64, @floatFromInt(self.slope_bytes_per_token)) /
             @as(f64, @floatFromInt(self.wire_bytes_per_sec)) * 1000.0;
-        return transfer_ms < budget_ms;
+        return budget - slope_ms;
+    }
+
+    /// Shortest prompt at which remote prefill pays. Null when no length does —
+    /// either the worker is not faster, or each token costs more to ship than
+    /// it saves.
+    pub fn minViableTokens(self: Economics) ?usize {
+        if (self.wire_bytes_per_sec == 0) return null;
+        const net_ms = self.netPerTokenMs();
+        if (net_ms <= 0) return null;
+        const fixed_ms = @as(f64, @floatFromInt(self.fixed_bytes)) /
+            @as(f64, @floatFromInt(self.wire_bytes_per_sec)) * 1000.0;
+        return @intFromFloat(@ceil(fixed_ms / net_ms));
+    }
+
+    pub fn viable(self: Economics, n_tokens: usize) bool {
+        if (self.wire_bytes_per_sec == 0) return false;
+        // Unmeasured shape ⇒ attempt, and learn it from the replies. Refusing
+        // here would stop the client ever bootstrapping a model's numbers.
+        if (!self.measured()) return true;
+        const min = self.minViableTokens() orelse return false;
+        return n_tokens >= min;
     }
 };
 
-/// The blob rate a reply implies. Null when either number is degenerate — a
-/// rate invented from a zero is worse than no rate at all.
-pub fn observedBytesPerToken(blob_bytes: u64, n_tokens: usize) ?u64 {
-    if (blob_bytes == 0 or n_tokens == 0) return null;
-    return blob_bytes / @as(u64, @intCast(n_tokens));
+/// Solve `fixed + slope*n` from two replies at different lengths.
+///
+/// One reply cannot separate the two terms, and treating a single
+/// bytes/token average as the slope is wrong by 20x across the window (344
+/// KB/token while filling vs 16.4 past it). Null when the samples cannot
+/// determine a shape — same length, out of order, or an implied negative slope
+/// (which means the two came from different configs and neither describes the
+/// model).
+pub fn solveBlobShape(bytes_a: u64, n_a: usize, bytes_b: u64, n_b: usize) ?struct { fixed: u64, slope: u64 } {
+    if (n_a == n_b or n_a == 0 or n_b == 0) return null;
+    const lo_n: u64 = @intCast(@min(n_a, n_b));
+    const hi_n: u64 = @intCast(@max(n_a, n_b));
+    const lo_b = if (n_a < n_b) bytes_a else bytes_b;
+    const hi_b = if (n_a < n_b) bytes_b else bytes_a;
+    if (hi_b < lo_b) return null; // a bigger prompt cannot ship fewer bytes
+    const slope = (hi_b - lo_b) / (hi_n - lo_n);
+    const grown = slope * hi_n;
+    if (grown > hi_b) return null;
+    return .{ .fixed = hi_b - grown, .slope = slope };
 }
 
 /// What to report as `cached_n` after a prefill.
 ///
 /// `cached_n` means "reused for FREE from local KV", and prefill throughput is
-/// computed as (prompt - cached) / prefill_ms. A remote restore leaves the
-/// session holding N-1 tokens, so reporting them as cached divides ONE token by
-/// the entire round trip and reports a rate ~3000x too low — m4mini measured
-/// 0.093 tok/s on a path whose real effective rate was ~300 (2026-08-23), which
-/// is exactly the kind of broken instrument that gets a working feature
-/// diagnosed as a catastrophic regression.
+/// (prompt - cached) / prefill_ms. A remote restore leaves the session holding
+/// N-1 tokens, so reporting them as cached divides ONE token by the entire
+/// round trip and reports a rate ~3000x too low — m4mini measured 0.093 tok/s
+/// on a path whose real effective rate was ~300 (2026-08-23), the kind of
+/// broken instrument that gets a working feature diagnosed as a catastrophic
+/// regression.
 ///
 /// Remotely-prefilled tokens were not free: they cost the exchange, and that
-/// time IS billed into prefill_ns. So the honest report is zero cache hits and
-/// a prefill that paid for the whole prompt, which makes prompt_per_second the
-/// effective end-to-end rate of the remote path — the number worth comparing
-/// against local prefill.
+/// time IS billed into prefill_ns. The honest report is zero cache hits and a
+/// prefill that paid for the whole prompt, which makes prompt_per_second the
+/// effective end-to-end rate of the remote path.
 pub fn cachedTokensAfterPrefill(remote_engaged: bool, local_reuse: usize) usize {
     return if (remote_engaged) 0 else local_reuse;
 }
@@ -586,68 +626,102 @@ test "every fallback reason has distinct non-empty text" {
     }
 }
 
-test "viability is a PER-TOKEN comparison, so it does not vary with prompt length" {
-    // The insight the flat floor got wrong. Blob bytes scale linearly with
-    // tokens AND prefill time scales linearly with tokens, so the ratio between
-    // them is constant: a config that loses at 1k tokens loses at 100k too, and
-    // one that wins, wins everywhere. A token threshold cannot express that.
-    const c = Economics{
-        .bytes_per_token = 167 * 1024, // gemma-4-12b, measured
-        .wire_bytes_per_sec = 110_000_000, // gigabit, real-world
-        .worker_ms_per_token = 1.398, // measured, CUDA worker
-        .local_ms_per_token = 2.109, // measured, m4max's Mac
-    };
-    // Same verdict at every length — that IS the property.
-    try testing.expectEqual(c.viable(), c.viable());
-    try testing.expect(!c.viable()); // gemma on gigabit today: remote LOSES
+// Measured on gemma-4-12b (linux-x64, b10472, 2026-08-23) and on the two Mac
+// consumers. Every case below is a real number, so a change that breaks the
+// model breaks against reality rather than against an invented threshold.
+const GEMMA_F16 = Economics{
+    .fixed_bytes = 335_000_000,
+    .slope_bytes_per_token = 16 * 1024 + 410,
+    .wire_bytes_per_sec = 110_000_000, // gigabit, real-world
+    .worker_ms_per_token = 1.398, // RTX 5060 Ti CUDA worker
+    .local_ms_per_token = 2.109, // M4 Max consumer
+};
 
-    // Shrink the blob enough and the same config flips, with no change to n.
-    var shrunk = c;
-    shrunk.bytes_per_token = 60 * 1024;
-    try testing.expect(shrunk.viable());
+test "the model reproduces both independently measured outcomes" {
+    // This is the only reason to trust it. The M4 Max measured a LOSS at 3329
+    // tokens on f16, and the M4 mini measured a WIN at 3525 on the same config
+    // and the same worker — a model that cannot tell those apart is worthless.
+    const max_f16 = GEMMA_F16;
+    try testing.expect(!max_f16.viable(3329)); // m4max: measured loss
+    try testing.expect(max_f16.minViableTokens().? > 3329);
+
+    var mini_f16 = GEMMA_F16;
+    mini_f16.local_ms_per_token = 6.67; // M4 mini, measured 150 tok/s
+    try testing.expect(mini_f16.viable(3525)); // m4mini: measured win
+    try testing.expect(mini_f16.minViableTokens().? < 3525);
 }
 
-test "viability tracks the WORKER's advantage, not its absolute speed" {
-    // The ceiling on this whole technique: you can only spend
-    // (local - worker) per token on transfer. A worker that is barely faster
-    // leaves no budget however fat the pipe, which is why a 1.5x-faster worker
-    // needs a 2.2x blob shrink just to break even.
-    var c = Economics{
-        .bytes_per_token = 1024,
-        .wire_bytes_per_sec = 110_000_000,
-        .worker_ms_per_token = 2.0,
-        .local_ms_per_token = 2.109,
-    };
-    try testing.expect(c.viable()); // a thin blob still fits the thin budget
-
-    // A worker no faster than the consumer can NEVER pay, at any blob size.
-    c.worker_ms_per_token = 2.109;
-    try testing.expect(!c.viable());
-    c.bytes_per_token = 1;
-    try testing.expect(!c.viable());
-
-    // A SLOWER worker is never viable either.
-    c.worker_ms_per_token = 5.0;
-    try testing.expect(!c.viable());
+test "the FIXED term is what creates a crossover, so viability varies with n" {
+    // The correction to my earlier model: I argued no token threshold could
+    // express this, which was true only for the strictly-linear blob I assumed.
+    // A sliding-window arch ships a window payload whatever the prompt length,
+    // and that cost amortizes — so there IS a break-even length.
+    const e = GEMMA_F16;
+    const min = e.minViableTokens().?;
+    try testing.expect(!e.viable(min - 1));
+    try testing.expect(e.viable(min));
+    try testing.expect(e.viable(min * 10));
 }
 
-test "viability degrades gracefully when a term is unknown" {
-    // Before the first exchange with a model there is no measured
-    // bytes_per_token. Unknown must mean ATTEMPT (we learn the rate from the
-    // reply) rather than refuse, or the client can never bootstrap — but a
-    // known-bad rate must still refuse.
-    var c = Economics{
-        .bytes_per_token = 0, // unmeasured
-        .wire_bytes_per_sec = 110_000_000,
-        .worker_ms_per_token = 1.398,
-        .local_ms_per_token = 2.109,
-    };
-    try testing.expect(c.viable());
+test "no prompt is long enough when the worker has no advantage to sell" {
+    // The ceiling on the whole technique. If each token costs more to ship than
+    // it saves, amortizing the fixed cost cannot rescue it at any length.
+    var e = GEMMA_F16;
+    e.worker_ms_per_token = e.local_ms_per_token; // no faster
+    try testing.expect(e.minViableTokens() == null);
+    try testing.expect(!e.viable(1_000_000));
 
-    // A zero/absent wire rate is a configuration error, not evidence of speed.
-    c.bytes_per_token = 167 * 1024;
-    c.wire_bytes_per_sec = 0;
-    try testing.expect(!c.viable());
+    e.worker_ms_per_token = 5.0; // slower
+    try testing.expect(e.minViableTokens() == null);
+
+    // Slope alone can also sink it: a per-token wire cost above the budget.
+    e = GEMMA_F16;
+    e.slope_bytes_per_token = 1024 * 1024; // 1 MB/token
+    try testing.expect(e.minViableTokens() == null);
+}
+
+test "quantized KV moves the crossover, which is the point of the shrink round" {
+    // q8_0 roughly halves both terms, so it should roughly halve the break-even
+    // length — the lever that makes this viable on a strong consumer.
+    const f16_min = GEMMA_F16.minViableTokens().?;
+    var q8 = GEMMA_F16;
+    q8.fixed_bytes = 178_000_000;
+    q8.slope_bytes_per_token = 8 * 1024 + 700;
+    const q8_min = q8.minViableTokens().?;
+    try testing.expect(q8_min < f16_min);
+    // And it brings the M4 Max's 3329-token prompt inside the viable range,
+    // which f16 did not.
+    try testing.expect(!GEMMA_F16.viable(3329));
+    try testing.expect(q8.viable(3329));
+}
+
+test "viability degrades gracefully when the shape is unknown" {
+    // Before any exchange with a model there is no measured shape. Unknown must
+    // mean ATTEMPT — the shape is learned from replies, so refusing would stop
+    // the client bootstrapping. A zero wire rate is a config error, not
+    // evidence about speed, and must refuse.
+    var e = Economics{ .wire_bytes_per_sec = 110_000_000, .worker_ms_per_token = 1.4, .local_ms_per_token = 6.67 };
+    try testing.expect(e.viable(1000));
+    e.wire_bytes_per_sec = 0;
+    try testing.expect(!e.viable(1000));
+    try testing.expect(e.minViableTokens() == null);
+}
+
+test "solveBlobShape separates the window payload from the per-token slope" {
+    // One reply cannot separate them, and a single bytes/token average is wrong
+    // by 20x across the window — 344 KB/token while filling vs 16.4 past it.
+    // Two of linux-x64's measured points must recover the shape they came from.
+    const sol = solveBlobShape(360_000_000, 1518, 385_000_000, 3000).?;
+    try testing.expect(sol.slope > 15_000 and sol.slope < 18_000); // ~16.4 KB
+    try testing.expect(sol.fixed > 320_000_000 and sol.fixed < 345_000_000);
+
+    // Degenerate or contradictory samples must yield nothing rather than a
+    // confident wrong shape.
+    try testing.expect(solveBlobShape(360_000_000, 1518, 385_000_000, 1518) == null);
+    try testing.expect(solveBlobShape(360_000_000, 0, 385_000_000, 3000) == null);
+    // A longer prompt shipping FEWER bytes means the two came from different
+    // configs; neither describes the model.
+    try testing.expect(solveBlobShape(385_000_000, 3000, 360_000_000, 4000) == null);
 }
 
 test "remotely-prefilled tokens are NOT reported as cache hits" {
@@ -662,15 +736,6 @@ test "remotely-prefilled tokens are NOT reported as cache hits" {
     // Without remote prefill the local reuse count is the truth, untouched.
     try testing.expectEqual(@as(usize, 3524), cachedTokensAfterPrefill(false, 3524));
     try testing.expectEqual(@as(usize, 0), cachedTokensAfterPrefill(false, 0));
-}
-
-test "observedBytesPerToken reads the rate straight off a reply" {
-    // No new header needed: the contract already carries both numbers, so the
-    // client learns each model's rate from its first successful exchange.
-    try testing.expectEqual(@as(u64, 1000), observedBytesPerToken(2_000_000, 2000).?);
-    // Degenerate inputs must not divide by zero or invent a rate.
-    try testing.expect(observedBytesPerToken(2_000_000, 0) == null);
-    try testing.expect(observedBytesPerToken(0, 2000) == null);
 }
 
 test "the economic gate admits only prompts the protocol also accepts" {
