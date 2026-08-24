@@ -7,7 +7,14 @@
 
 #include "llama.h"
 #include "ggml-backend.h"
-#include "ggml-rpc.h"
+// The only thing this shim needs from ggml-rpc.h is the server cap; every RPC
+// entry point is reached through the registry proc table at runtime, never
+// linked. Including the header dragged in a full ggml.h by a second path — on a
+// host with a stale brew ggml on the include search path (webp pulls in
+// /opt/homebrew/include) that is a hard redefinition against the vendored
+// ggml.h, and the macOS asset ships no ggml-rpc.h at all. Define the constant
+// (ggml's own value) and drop the dependency on every platform.
+#define GGML_RPC_MAX_SERVERS 16
 
 #include <pthread.h>
 #include <stdio.h>
