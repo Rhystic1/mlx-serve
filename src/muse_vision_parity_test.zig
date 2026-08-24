@@ -16,6 +16,7 @@ const model_mod = @import("model.zig");
 const log = @import("log.zig");
 const muse_vision = @import("muse_vision.zig");
 const qwen_vision = @import("qwen_vision.zig");
+const MuseVision = muse_vision.MuseVision;
 
 // Vision-tower parity vs the EXECUTED reference
 // (tests/dump_muse_vision_fixture.py runs transformers' own muse_glimmer vision
@@ -122,4 +123,3 @@ fn sumSq(a_arr: mlx.mlx_array, b_arr: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
 
 // ── Tests ──
 
-const testing = std.testing;

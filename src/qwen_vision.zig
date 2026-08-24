@@ -1135,7 +1135,7 @@ fn getWeightLocal(weights: *const Weights, buf: *[256]u8, name: []const u8) ?mlx
     return weights.get(name);
 }
 
-fn fmtLayer(buf: *[256]u8, prefix: []const u8, layer: usize, suffix: []const u8) []const u8 {
+pub fn fmtLayer(buf: *[256]u8, prefix: []const u8, layer: usize, suffix: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}blocks.{d}.{s}", .{ prefix, layer, suffix }) catch unreachable;
 }
 
@@ -1371,7 +1371,7 @@ test "qwen roundHalfEven matches python banker's rounding" {
     try std.testing.expectEqual(@as(f64, 94.0), roundHalfEven(93.75));
 }
 
-fn readBinF32(io: std.Io, alloc: std.mem.Allocator, path: []const u8) ![]f32 {
+pub fn readBinF32(io: std.Io, alloc: std.mem.Allocator, path: []const u8) ![]f32 {
     const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
     defer file.close(io);
     var buf: [4096]u8 = undefined;

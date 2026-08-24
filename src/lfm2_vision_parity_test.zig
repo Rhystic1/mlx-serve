@@ -16,6 +16,7 @@ const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
 const qwen_vision = @import("qwen_vision.zig");
+const Lfm2Vision = lfm2_vision.Lfm2Vision;
 const log = @import("log.zig");
 
 // Vision-tower parity vs the EXECUTED reference

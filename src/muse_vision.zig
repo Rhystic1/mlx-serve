@@ -469,7 +469,7 @@ pub const MuseVision = struct {
 
     /// Learned position table bilinearly resampled onto the image's patch grid,
     /// row-major → [N, hidden].
-    fn posEmbed(self: *MuseVision, grid_h: u32, grid_w: u32) !mlx.mlx_array {
+    pub fn posEmbed(self: *MuseVision, grid_h: u32, grid_w: u32) !mlx.mlx_array {
         const a = self.allocator;
         const n: usize = @as(usize, grid_h) * grid_w;
         var ha = try bilinearAxis(a, grid_h, self.pos_side);

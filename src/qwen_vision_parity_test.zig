@@ -17,6 +17,12 @@ const log = @import("log.zig");
 const qwen_vision = @import("qwen_vision.zig");
 const QwenVision = qwen_vision.QwenVision;
 const QBlock = qwen_vision.QBlock;
+const Weights = model_mod.Weights;
+const resolveVisionPrefix = qwen_vision.resolveVisionPrefix;
+const readBinF32 = qwen_vision.readBinF32;
+const PatchProjLayout = qwen_vision.PatchProjLayout;
+const patchProjLayout = qwen_vision.patchProjLayout;
+const fmtLayer = qwen_vision.fmtLayer;
 
 test "qwen vision tower prefix and patch_embed layout are PROBED, not hardcoded" {
     const allocator = std.testing.allocator;

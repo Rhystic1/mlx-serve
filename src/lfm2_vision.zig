@@ -362,7 +362,7 @@ pub const Lfm2Vision = struct {
 
     /// `Lfm2VlMultiModalProjector` — unshuffle, then Linear/GELU/Linear into
     /// language-model space. [gh*gw, hidden] → [1, tokens, text_hidden].
-    fn project(self: *Lfm2Vision, hidden: mlx.mlx_array, grid_h: u32, grid_w: u32) !mlx.mlx_array {
+    pub fn project(self: *Lfm2Vision, hidden: mlx.mlx_array, grid_h: u32, grid_w: u32) !mlx.mlx_array {
         var x = try self.pixelUnshuffle(hidden, grid_h, grid_w);
         defer _ = mlx.mlx_array_free(x);
         replace(&x, try self.linear(x, self.proj1));
@@ -423,7 +423,7 @@ pub const Lfm2Vision = struct {
     /// PIL-convention triangle weights — the reference's
     /// `interpolate(mode="bilinear", antialias=True)`, whose footprint widening
     /// is load-bearing whenever a grid axis is SHORTER than `pos_side`.
-    fn posEmbed(self: *Lfm2Vision, grid_h: u32, grid_w: u32) !mlx.mlx_array {
+    pub fn posEmbed(self: *Lfm2Vision, grid_h: u32, grid_w: u32) !mlx.mlx_array {
         const side: c_int = @intCast(self.pos_side);
         const d: c_int = @intCast(self.hidden);
 

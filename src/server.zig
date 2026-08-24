@@ -4615,7 +4615,7 @@ fn handleEmbeddings(
             return;
         };
         try xfm.resetCache();
-        break :fallback gen_mod.computeEmbeddingsBatch(allocator, xfm, seqs.items) catch |err| {
+        break :fallback generate_mod.computeEmbeddingsBatch(allocator, xfm, seqs.items) catch |err| {
             log.err("  embedding error: {}\n", .{err});
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute embedding", null);
             return;
