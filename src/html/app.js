@@ -853,9 +853,29 @@
       '<span class=cl-badge>v' + clEsc(self.version || '?') + '</span></div>' +
       clModels(self.models) + '</div>';
   }
-  function clLan(lan) {
+  // Bare IP from a "ip:port" or "http://ip:port" endpoint.
+  function clIpOf(ep) { return String(ep == null ? '' : ep).replace(/^https?:\/\//, '').split(':')[0]; }
+  // Friendly machine name for an endpoint: the discovered peer's name if we
+  // have one for that IP, else the IP itself.
+  function clMachineFor(endpoint, ipName) {
+    var ip = clIpOf(endpoint);
+    return (ipName && ipName[ip]) || ip || 'remote';
+  }
+  // One node per PHYSICAL machine: dedup peers by IP (a box running two servers
+  // advertises twice), and drop any peer that is already an RPC device in this
+  // consumer's ring (it is shown there, with its layers).
+  function clDedupPeers(peers, rpcIps) {
+    var seen = {}, out = [];
+    (peers || []).forEach(function (p) {
+      var ip = clIpOf(p.ip);
+      if (!ip || seen[ip] || (rpcIps && rpcIps[ip])) return;
+      seen[ip] = 1; out.push(p);
+    });
+    return out;
+  }
+  function clLan(lan, rpcIps) {
     if (!lan || !lan.enabled) return '';
-    var peers = (lan.peers || []);
+    var peers = clDedupPeers(lan.peers, rpcIps);
     var body = peers.length ? peers.map(function (p) {
       return '<div class=cl-node><div class=cl-row>' +
         '<span class=cl-name>' + clEsc(p.name || p.ip) + '</span>' +
@@ -863,10 +883,10 @@
         (p.caps && p.caps.prefill ? '<span class="cl-badge on">prefill</span>' : '') +
         (p.caps && p.caps.rpc ? '<span class="cl-badge on">rpc</span>' : '') +
         '</div>' + clModels(p.models) + '</div>';
-    }).join('') : '<div class=cl-off>No peers discovered.</div>';
+    }).join('') : '<div class=cl-off>No other machines discovered.</div>';
     return '<div class=cl-sec><h3>LAN share</h3>' + body + '</div>';
   }
-  function clDevices(devs) {
+  function clDevices(devs, ipName, data_self_name) {
     if (!devs || !devs.length) return '';
     // Total layers = the max last index + 1, so bars are proportional.
     var span = 0;
@@ -880,13 +900,17 @@
         ? '<span class="' + (d.kind === 'remote' ? 'remote' : 'local') + '" style="left:' + left.toFixed(1) + '%;width:' + w.toFixed(1) + '%"></span>'
         : '';
       var lbl = has ? ('layers ' + d.layers[0] + '–' + d.layers[1] + ' (' + d.layer_count + ')') : 'no layers';
+      // Name the MACHINE, not just the ggml device: a remote device shows the
+      // discovered peer name for its endpoint (or the IP), so RPC0/RPC1 read as
+      // "the 5060 Ti" / "the mini" rather than opaque device ids.
+      var machine = d.kind === 'remote' ? clMachineFor(d.endpoint, ipName) : (data_self_name || 'local');
       return '<div class=cl-dev>' +
-        '<span class=cl-dev-name>' + clEsc(d.name) + '<br><span class=kind>' + clEsc(d.kind) + '</span></span>' +
+        '<span class=cl-dev-name>' + clEsc(machine) + '<br><span class=kind>' + clEsc(d.name) + ' · ' + clEsc(d.kind) + '</span></span>' +
         '<span class=cl-bar>' + bar + '</span>' +
         '<span class=cl-dev-n>' + lbl + '</span></div>';
     }).join('');
   }
-  function clRpc(rpc) {
+  function clRpc(rpc, ipName, data_self_name) {
     if (!rpc || rpc.role === 'none' || rpc.role == null) return '';
     var head = '<div class=cl-row><span class=cl-name>Layer offload</span>' +
       '<span class="cl-badge on">' + clEsc(rpc.role) + '</span>' +
@@ -902,7 +926,7 @@
       }).join('') + '</div>'
       : '';
     return '<div class=cl-sec><h3>RPC ring</h3><div class=cl-node>' +
-      head + serve + workers + clDevices(rpc.devices) + '</div></div>';
+      head + serve + workers + clDevices(rpc.devices, ipName, data_self_name) + '</div></div>';
   }
   function clPrefill(pf) {
     if (!pf || pf.mode === 'none' || pf.mode == null) return '';
@@ -951,11 +975,21 @@
       (label ? '<text x="' + mx + '" y="' + (my - 4) + '" class=tp-elbl>' + clEsc(label) + '</text>' : '');
   }
   function svgIp(s) { return String(s || '').replace(/^https?:\/\//, ''); }
+  function clIpNameMap(lan) {
+    var m = {};
+    (lan && lan.peers || []).forEach(function (p) { var ip = clIpOf(p.ip); if (ip) m[ip] = p.name || ip; });
+    return m;
+  }
   function renderClusterSvg(data) {
     var rpc = data.rpc || {}, pf = data.prefill || {}, lan = data.lan || {};
     var remotes = (rpc.devices || []).filter(function (d) { return d.kind === 'remote'; }).slice(0, 4);
     var localDev = (rpc.devices || []).filter(function (d) { return d.kind === 'local'; })[0];
-    var peers = (lan.peers || []).slice(0, 4);
+    var ipName = clIpNameMap(lan);
+    var rpcIps = {};
+    remotes.forEach(function (d) { var ip = clIpOf(d.endpoint); if (ip) rpcIps[ip] = 1; });
+    // A machine that is an RPC device is drawn in the ring column, not also as a
+    // LAN peer; peers are deduped by IP (one box, one node).
+    var peers = clDedupPeers(lan.peers, rpcIps).slice(0, 4);
     var hasPrefill = pf.mode === 'consumer' && pf.url;
     if (!remotes.length && !hasPrefill && !peers.length) return '';
 
@@ -993,7 +1027,9 @@
     if (hasPrefill) s += svgNode(pfX, selfY, pfW, nodeH, 'prefill', svgIp(pf.url), 'pf');
     remotes.forEach(function (d, i) {
       var ry = 24 + i * (nodeH + 14);
-      s += svgNode(rpcX, ry, rpcW, nodeH, d.name, (d.layer_count || 0) + ' layers', 'rpc');
+      // Label by MACHINE (peer name or IP) so you can tell the 5060 Ti from the
+      // mini; the device id + layer count go in the sub-line.
+      s += svgNode(rpcX, ry, rpcW, nodeH, clMachineFor(d.endpoint, ipName), d.name + ' · ' + (d.layer_count || 0) + 'L', 'rpc');
     });
     peers.forEach(function (p, i) {
       var px = 10 + i * (pw + colGap);
@@ -1007,7 +1043,14 @@
 
   function renderCluster(data) {
     if (!data || typeof data !== 'object') return '<div class=cluster-empty>Cluster data unavailable.</div>';
-    var html = renderClusterSvg(data) + clNode(data.self) + clRpc(data.rpc) + clPrefill(data.prefill) + clLan(data.lan) + clLive(data.live);
+    var ipName = clIpNameMap(data.lan);
+    var selfName = (data.self && (data.self.name || data.self.host)) || 'local';
+    var rpcIps = {};
+    ((data.rpc && data.rpc.devices) || []).forEach(function (d) {
+      if (d.kind === 'remote') { var ip = clIpOf(d.endpoint); if (ip) rpcIps[ip] = 1; }
+    });
+    var html = renderClusterSvg(data) + clNode(data.self) + clRpc(data.rpc, ipName, selfName) +
+      clPrefill(data.prefill) + clLan(data.lan, rpcIps) + clLive(data.live);
     return html || '<div class=cluster-empty>No cluster activity — this node is standalone.</div>';
   }
 
