@@ -950,49 +950,57 @@
     return '<line x1="' + x1 + '" y1="' + y1 + '" x2="' + x2 + '" y2="' + y2 + '" class="tp-edge ' + cls + '"></line>' +
       (label ? '<text x="' + mx + '" y="' + (my - 4) + '" class=tp-elbl>' + clEsc(label) + '</text>' : '');
   }
+  function svgIp(s) { return String(s || '').replace(/^https?:\/\//, ''); }
   function renderClusterSvg(data) {
     var rpc = data.rpc || {}, pf = data.prefill || {}, lan = data.lan || {};
-    var remotes = (rpc.devices || []).filter(function (d) { return d.kind === 'remote'; });
+    var remotes = (rpc.devices || []).filter(function (d) { return d.kind === 'remote'; }).slice(0, 4);
     var localDev = (rpc.devices || []).filter(function (d) { return d.kind === 'local'; })[0];
-    var peers = (lan.peers || []);
+    var peers = (lan.peers || []).slice(0, 4);
     var hasPrefill = pf.mode === 'consumer' && pf.url;
     if (!remotes.length && !hasPrefill && !peers.length) return '';
 
-    var W = 640, H = 90 + Math.max(remotes.length, 1) * 56 + (peers.length ? 70 : 0);
-    var cx = 250, cyTop = 40, nodeW = 140, nodeH = 46;
-    var selfName = (data.self && (data.self.name || data.self.host)) || 'this node';
-    var selfSub = localDev ? (localDev.name + ' · ' + (localDev.layer_count || 0) + 'L') : (data.self && data.self.engine);
+    // Bounded layout: three columns inside a fixed 720-wide viewBox — prefill
+    // worker left, self centre, RPC devices right — with a LAN-peer row below.
+    // Every node stays within [0,720]; the whole SVG then scales to the panel.
+    var W = 720, nodeH = 48, colGap = 16;
+    var rows = Math.max(remotes.length, 1);
+    var topH = 24 + rows * (nodeH + 14);
+    var peerH = peers.length ? 78 : 8;
+    var H = topH + peerH;
+    var selfX = 280, selfW = 160, selfY = (topH - nodeH) / 2;
+    var pfX = 20, pfW = 150;
+    var rpcX = 520, rpcW = 180;
     var s = '<svg viewBox="0 0 ' + W + ' ' + H + '" class=tp-svg preserveAspectRatio="xMinYMin meet">';
+    var selfCy = selfY + nodeH / 2;
 
-    // edges first (under nodes)
-    var selfCx = cx + nodeW, selfCy = cyTop + nodeH / 2;
+    // edges (under nodes)
+    if (hasPrefill) s += svgEdge(pfX + pfW, selfCy, selfX, selfCy, 'pf', 'prefill');
     remotes.forEach(function (d, i) {
-      var ry = 20 + i * 56, rcy = ry + nodeH / 2;
-      s += svgEdge(selfCx, selfCy, cx + 340, rcy, 'rpc', (d.layers && d.layers.length === 2 ? d.layers[0] + '–' + d.layers[1] : (d.layer_count || 0) + 'L'));
+      var ry = 24 + i * (nodeH + 14), rcy = ry + nodeH / 2;
+      s += svgEdge(selfX + selfW, selfCy, rpcX, rcy, 'rpc',
+        (d.layers && d.layers.length === 2 ? d.layers[0] + '–' + d.layers[1] : (d.layer_count || 0) + 'L'));
     });
-    if (hasPrefill) s += svgEdge(cx, selfCy, 40 + 120, selfCy, 'pf', 'prefill');
+    var pw = peers.length ? Math.min(160, (W - (peers.length - 1) * colGap) / peers.length) : 0;
     peers.forEach(function (p, i) {
-      var py = H - 46, pxc = 80 + i * 150 + 60;
-      s += svgEdge(cx + nodeW / 2, cyTop + nodeH, pxc, py, 'lan', null);
+      var px = 10 + i * (pw + colGap) + pw / 2;
+      s += svgEdge(selfX + selfW / 2, selfY + nodeH, px, H - 40, 'lan', null);
     });
 
     // nodes
-    s += svgNode(cx, cyTop, nodeW, nodeH, selfName, selfSub, 'self');
+    var selfName = (data.self && (data.self.name || data.self.host)) || 'this node';
+    var selfSub = localDev ? (localDev.name + ' · ' + (localDev.layer_count || 0) + 'L') : (data.self && data.self.engine) || '';
+    s += svgNode(selfX, selfY, selfW, nodeH, selfName, selfSub, 'self');
+    if (hasPrefill) s += svgNode(pfX, selfY, pfW, nodeH, 'prefill', svgIp(pf.url), 'pf');
     remotes.forEach(function (d, i) {
-      var ry = 20 + i * 56;
-      var free = d.endpoint ? '' : '';
-      s += svgNode(cx + 340, ry, 150, nodeH, d.name, (d.endpoint || 'remote') + free, 'rpc');
+      var ry = 24 + i * (nodeH + 14);
+      s += svgNode(rpcX, ry, rpcW, nodeH, d.name, (d.layer_count || 0) + ' layers', 'rpc');
     });
-    if (hasPrefill) {
-      var host = pf.url.replace(/^https?:\/\//, '');
-      s += svgNode(20, cyTop, 120, nodeH, 'prefill', host, 'pf');
-    }
     peers.forEach(function (p, i) {
-      var pxc = 80 + i * 150;
+      var px = 10 + i * (pw + colGap);
       var caps = [];
       if (p.caps && p.caps.prefill) caps.push('pf');
       if (p.caps && p.caps.rpc) caps.push('rpc');
-      s += svgNode(pxc, H - 46, 120, 38, p.name || p.ip, caps.join(' ') || (p.models && p.models.length ? p.models.length + ' models' : ''), 'lan');
+      s += svgNode(px, H - 40, pw, 34, p.name || p.ip, caps.join(' ') || svgIp(p.ip), 'lan');
     });
     return '<div class=tp-wrap>' + s + '</svg></div>';
   }
