@@ -65,6 +65,16 @@ pub var g_remote_prefill_url: ?[]const u8 = null;
 /// that loses at 1k tokens loses at 100k, and one that wins, wins everywhere.
 /// No token threshold can express that.
 ///
+/// THAT LINEARITY IS A SHORT-CONTEXT APPROXIMATION, and the rates below are
+/// only valid at the length they were measured at. Prefill carries an O(n^2)
+/// attention term while the blob stays strictly linear — and goes SUB-linear
+/// under `swa_full=false`, where most layers cap at their window — so at long
+/// contexts the two curves genuinely diverge in REMOTE's favour and a real
+/// crossover can exist even for a config that loses at 3k. Deliberately not
+/// modelled here (the PoC lives in the short-context regime), but do not
+/// "fix" this by trusting a rate learned at 2k to describe 64k: re-measure
+/// per length band, or the model will refuse a config that would have won.
+///
 /// What it actually turns on is the WORKER'S ADVANTAGE. Per token the remote
 /// path costs `worker_prefill + transfer` and the local path costs
 /// `local_prefill`, so the entire budget for transfer is

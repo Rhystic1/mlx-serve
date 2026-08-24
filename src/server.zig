@@ -2632,7 +2632,19 @@ fn safeAutoContext(raw: u32) u32 {
 /// This model's auto-context: memory ceiling with headroom, then capped by what
 /// the checkpoint actually supports.
 fn autoContextFor(config: *const model_mod.ModelConfig) u32 {
-    const with_headroom = safeAutoContext(computeMemoryContext(config));
+    return autoContextFrom(config, computeMemoryContext(config));
+}
+
+/// The clamp itself, with the memory reading handed IN. Split out because the
+/// rule under test — the 85% margin applies to MEMORY and never to the model's
+/// own declared max — is pure, while `computeMemoryContext` reads the machine's
+/// live free RAM. A test calling `autoContextFor` therefore passed or failed on
+/// ambient memory pressure: it asserts a 4096-token model gets its full 4096,
+/// which is true only while the box has room, and it read 870 twice on a busy
+/// host (2026-08-23). A unit test that depends on how much RAM is free is not
+/// testing the thing it names.
+fn autoContextFrom(config: *const model_mod.ModelConfig, memory_context: u32) u32 {
+    const with_headroom = safeAutoContext(memory_context);
     const max_pos = config.max_position_embeddings;
     return if (max_pos > 0) @min(with_headroom, max_pos) else with_headroom;
 }
@@ -14899,14 +14911,23 @@ test "autoContextFor: the safety margin applies to MEMORY, never to the model's 
     small.head_dim = 64;
     small.hidden_size = 512;
     small.intermediate_size = 1024;
-    try testing.expectEqual(@as(u32, 4096), autoContextFor(&small));
+    // Memory reading handed in, so the assertion is about the CLAMP and not
+    // about how much RAM this machine happens to have free right now.
+    const roomy: u32 = 131072; // more than memory could ever constrain here
+    try testing.expectEqual(@as(u32, 4096), autoContextFrom(&small, roomy));
+
+    // The margin still applies when MEMORY is the binding constraint — the
+    // model's max is a ceiling, never a floor.
+    try testing.expectEqual(safeAutoContext(2048), autoContextFrom(&small, 2048));
 
     // No declared max: fall back to the margined memory ceiling.
     var unbounded = small;
     unbounded.max_position_embeddings = 0;
-    const got = autoContextFor(&unbounded);
-    try testing.expect(got > 0);
-    try testing.expectEqual(safeAutoContext(computeMemoryContext(&unbounded)), got);
+    try testing.expectEqual(safeAutoContext(roomy), autoContextFrom(&unbounded, roomy));
+
+    // And the live path still composes the two (value unasserted: it depends
+    // on free RAM, which is exactly what the checks above must not).
+    try testing.expect(autoContextFor(&unbounded) > 0);
 }
 
 test "getEffectiveContextLength returns the PINNED value, not a fresh memory reading" {
