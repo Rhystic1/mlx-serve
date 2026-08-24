@@ -4085,3 +4085,47 @@ delete the `rpc_with_metal` gate, not to weaken it — a silently-reintroduced
 regression there reads identically to this one and would not be caught by any
 existing test (this bug is Metal+RPC-hardware-dependent and has no coverage on
 CI, which is CUDA-only).
+
+### Update (same day): the "MTL" vs "Metal" registry-name bug, and FA-off alone is NOT sufficient for Metal-host/CUDA-worker
+
+Two follow-ups from the fix above, both surfaced by m4max testing on real
+hardware (something this Windows/Linux dev box cannot do):
+
+1. **The gate was a silent no-op.** `ggml_backend_reg_by_name("Metal")` read
+   back NULL on a real Metal+RPC load with Metal fully active (`MTL0` device,
+   FA kernels compiling). b10472's `ggml-metal.cpp` registers the backend
+   under `GGML_METAL_NAME`, which is the string `"MTL"`, not `"Metal"` — the
+   device names it hands out (`MTL0`, matching every log line and `/v1/cluster`
+   row) were the tell that should have caught this before shipping it. Fixed
+   to check `"MTL"`; `mlx_llama_backend_present`'s doc comment corrected too
+   (its own example named "Metal" and was equally wrong).
+
+2. **Flash-attention is not the (whole) story for a Metal-host/CUDA-worker
+   split.** With the gate now firing (confirmed via the `[llama-shim]`
+   log line) and FA genuinely off, Gemma-4 across local-Metal +
+   remote-CUDA-RPC still decoded degenerate garbage — and NOT proportional
+   to the split boundary: 44 local / 5 remote and 1 local / 48 remote both
+   failed identically. That rules out a boundary-count-dependent theory
+   (e.g. only the SWA tail layers) and points at something broader in the
+   cross-vendor (Metal client ↔ CUDA worker) tensor path specifically,
+   independent of FA. Issue #16657's `-fa off` fix was confirmed on a
+   Metal↔Metal (two Mac) pairing — it evidently does not generalize to a
+   Metal↔CUDA pairing, which is a different combination hitting a different
+   (or additional) bug.
+
+   llama.cpp's own RPC README depicts mixed Metal/CUDA/CPU hosts as an
+   intended topology, but opens with "this example and the RPC backend are
+   currently in a proof-of-concept development stage... fragile" — so this
+   remains genuinely open upstream territory, not a documented limitation to
+   route around. Next isolation step (not yet run): a Metal-host consumer
+   against a CPU-only RPC worker, to tell whether this is generic
+   heterogeneous-backend RPC breakage (would also break Metal+CPU) or
+   specific to the CUDA worker path. Whoever picks this back up should start
+   there before filing upstream — a report needs a backend pairing that DOES
+   and DOES NOT reproduce to be actionable.
+
+The FA-off gate stays in the tree regardless of this outcome: it addresses a
+real, confirmed, upstream-cited bug (#16657) for the Metal↔Metal case, costs
+nothing when RPC isn't in play, and is a strict safety improvement even if it
+turns out to be one of two required fixes for the Metal↔CUDA case rather than
+the whole fix.
