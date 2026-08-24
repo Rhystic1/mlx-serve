@@ -1562,3 +1562,57 @@ GPU-PV backs every VRAM allocation with host commit, and killed WSL processes
 appear to leave theirs behind. The cap is the HOST's and the recovery
 (`wsl --shutdown` or a reboot) is the user's — the endpoint was proven on
 LFM2.5 (1.6 GB), which fits under it.
+
+## Remote-prefill blob shrink round: the window is the payload (2026-08-23)
+
+Mac e2e proved the mechanism but lost 8.96 s vs 7.02 s local at 3.3k tokens on
+gigabit — ~570 MB on the wire. Two approved levers: `swa_full=false` on the
+worker session (gemma 4 is 40/48 sliding layers @ 1024) and q8_0 KV.
+
+Measured with a bare libllama probe against `lib/llama` (b10472, CUDA,
+gemma-4-12b-it-Q4_K_M), `llama_state_seq_get_size` after N tokens:
+
+| tokens | f16 full | f16 windowed | q8_0 |
+|---|---|---|---|
+| 300 | 103 MB | | |
+| 512 | 176 MB | | 94 MB |
+| 1518 | 360 MB | 360 MB (identical bytes) | 192 MB |
+| 2000 | 368 MB | | |
+| 2100 | 370 MB | | 197 MB |
+| 3000 | 385 MB | 385 MB | |
+
+Below the window the slope is 344 KB/token (every layer holds every token);
+past it the slope collapses to **16.4 KB/token** (f16) / **8.7 KB/token**
+(q8_0) — only the 8 global layers keep growing (2 KV heads x 256 x 2 halves).
+The rest is a FIXED ~335 MB (f16) / ~178 MB (q8_0): 1024 window cells x 40
+sliding layers x 8 KB. `swa_full=false` changes the CACHE size (4096 → 1536
+cells) and not one byte of the blob: llama.cpp's full-size SWA cache already
+reuses masked cells (`find_slot` treats an SWA-masked cell as free), so the
+export never carried more than window-worth per sliding layer to begin with.
+Read the reference's ALLOCATOR before promising a size lever.
+
+What shipped anyway:
+- `mlx_llama_session_create_ex(..., swa_full)` / `LlamaEngine.createSessionWithOptions`
+  (ONE constructor; the old two are wrappers). The worker session is windowed
+  — it is reset per request and never trimmed, so the persistent-session abort
+  that forces `swa_full=true` elsewhere cannot happen, and the worker gets its
+  SWA VRAM back. The consumer keeps its FULL cache: `state_read_meta` is a
+  plain `find_slot` of `cell_count` cells and the mask is by position, so a
+  windowed blob restores into a full cache (pinned by the gemma round-trip
+  test, which also decodes 8 tokens past the restore).
+- K == V enforced at create (`SessionOptions`), so the ONE wire name
+  (`kvTypeName`: `f16|q8_0|q4_0|unknown`) can never half-describe the cache.
+- Wire v2: `X-Prefill-Kv-Type` + `X-Prefill-Swa` (both REQUIRED, `VERSION` 2).
+  A q8_0 blob into an f16 cache is refused by llama.cpp itself
+  (`state_read_data: mismatched key type (1 != 8, layer 5)`) and leaves the
+  session empty — the header check is belt, the engine check is braces.
+- The actual lever is `--kv-quant 8` on BOTH sides: at 3.3k tokens the blob
+  goes ~390 MB → ~207 MB. q4_0 would halve again (quality cost; not adopted).
+
+Two traps from the round: a synthetic "long" test prompt must be COUNTED
+(`Entry N: ...` x 260 tokenized to ~4.4k on gemma, over the 4096 ctx, and
+llama.cpp reports that as `failed to find a memory slot for batch of size
+512` — a memory-slot error, not a length error); and `zig build test` caches
+the RUN step, so an env-var-selected model (`LLAMA_TEST_MODEL`) does not
+invalidate it — run the test binary directly, picking it by embedded test
+name AND newest mtime (two cached binaries can carry the same name).

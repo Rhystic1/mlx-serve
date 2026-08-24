@@ -73,3 +73,13 @@ Flow:
   and note the memory cost.
 - Wire cost: blob is per-layer KV f16 — a few hundred MB at long contexts;
   fine on LAN for the PoC.
+
+## Shrink round (2026-08-23, linux-x64)
+
+- `swa_full=false` verified round-trip-safe (windowed blob → full consumer) but
+  is NOT a size lever on b10472: the blob is already window-bounded on SWA
+  layers. Measured gemma-4-12b: fixed ~335 MB (f16) / ~178 MB (q8_0) + 16.4 /
+  8.7 KB per token. Worker session windowed anyway (VRAM).
+- q8_0 KV: works with FA forced; restore refused across types by llama.cpp.
+  Wire v2 adds `X-Prefill-Kv-Type` + `X-Prefill-Swa`. Run `--kv-quant 8` on
+  both sides. See docs/gotchas/server-http.md.

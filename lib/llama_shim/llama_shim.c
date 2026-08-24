@@ -149,8 +149,24 @@ mlx_llama_session *mlx_llama_session_create_kv_quant(mlx_llama_engine *e,
                                                     int32_t type_k,
                                                     int32_t type_v,
                                                     char *err, size_t errlen) {
+    return mlx_llama_session_create_ex(e, n_ctx, type_k, type_v, true, err, errlen);
+}
+
+mlx_llama_session *mlx_llama_session_create_ex(mlx_llama_engine *e,
+                                               int32_t n_ctx,
+                                               int32_t type_k,
+                                               int32_t type_v,
+                                               bool swa_full,
+                                               char *err, size_t errlen) {
     struct llama_context_params cp = llama_context_default_params();
     if (n_ctx > 0) cp.n_ctx = (uint32_t)n_ctx;
+    // swa_full=true is the default for every PERSISTENT session (below); a
+    // remote-prefill WORKER session passes false so the exported state carries
+    // only window-worth of cells per sliding layer (gemma 4: 43/49 layers at
+    // window 1024 -- the blob shrinks ~10x at long contexts). A windowed blob
+    // restores into a full-size consumer cache: state_read is a plain
+    // find_slot of cell_count cells, the mask is by position.
+    //
     // Force the full-size SWA cache. With swa_full=false (the libllama default
     // since b73xx) sliding-window-attention layers only expose `window`-many KV
     // slots per sequence; after `llama_memory_seq_rm` trims a divergent tail in
@@ -162,7 +178,7 @@ mlx_llama_session *mlx_llama_session_create_kv_quant(mlx_llama_engine *e,
     // swa_full=true costs (window→full per SWA layer) is exactly what we
     // already accounted for. Matches `llama-server --swa-full` and addresses
     // llama.cpp issues #19794 / #21831 / #17196 for hybrid/SWA GGUFs.
-    cp.swa_full = true;
+    cp.swa_full = swa_full;
     // Flash attention. The llama.cpp default is AUTO, which on Metal already
     // enables FA when beneficial AND safely falls back when a model's head_dim
     // isn't supported by the FA kernel — measured equivalent to forcing ENABLED

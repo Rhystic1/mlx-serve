@@ -205,18 +205,33 @@ pub const LlamaEngine = struct {
         type_k: i32,
         type_v: i32,
     ) Error!*LlamaSession {
+        return self.createSessionWithOptions(ctx_size, .{ .type_k = type_k, .type_v = type_v });
+    }
+
+    /// The ONE session constructor; the two above are wrappers. `swa_full`
+    /// defaults to true (every persistent session -- see the shim comment);
+    /// a remote-prefill WORKER session sets false so its exported state is
+    /// window-sized on sliding layers. K and V must agree: the wire contract
+    /// describes the KV cache with ONE type name (`kvTypeName`), so an
+    /// asymmetric cache is refused here rather than half-described there.
+    pub fn createSessionWithOptions(self: *LlamaEngine, ctx_size: i32, opts: SessionOptions) Error!*LlamaSession {
+        if (opts.type_k != opts.type_v) {
+            log.err("[llama] refusing asymmetric KV cache types (type_k={d}, type_v={d})\n", .{ opts.type_k, opts.type_v });
+            return Error.SessionCreateFailed;
+        }
         var err_buf: [256]u8 = undefined;
-        const raw = ffi.mlx_llama_session_create_kv_quant(
+        const raw = ffi.mlx_llama_session_create_ex(
             self.handle,
             ctx_size,
-            type_k,
-            type_v,
+            opts.type_k,
+            opts.type_v,
+            opts.swa_full,
             &err_buf,
             err_buf.len,
         );
         if (raw == null) {
-            log.err("[llama] session_create_kv_quant failed: {s} (ctx={d}, type_k={d}, type_v={d})\n", .{
-                std.mem.sliceTo(&err_buf, 0), ctx_size, type_k, type_v,
+            log.err("[llama] session_create failed: {s} (ctx={d}, type_k={d}, type_v={d}, swa_full={})\n", .{
+                std.mem.sliceTo(&err_buf, 0), ctx_size, opts.type_k, opts.type_v, opts.swa_full,
             });
             return Error.SessionCreateFailed;
         }
@@ -229,6 +244,8 @@ pub const LlamaEngine = struct {
             .engine = self,
             .handle = raw.?,
             .ctx_size = ctx_size,
+            .kv_type = opts.type_k,
+            .swa_full = opts.swa_full,
             .resident = .empty,
         };
         return sess;
@@ -341,11 +358,39 @@ pub fn commonPrefixLen(a: []const i32, b: []const i32) usize {
     return i;
 }
 
+pub const SessionOptions = struct {
+    /// ggml_type integers (`llama_ffi.GgmlType`); 0 = libllama default (F16).
+    type_k: i32 = 0,
+    type_v: i32 = 0,
+    swa_full: bool = true,
+};
+
+/// Wire spelling of a KV cache type -- ggml's OWN names, never the enum int
+/// (a llama.cpp bump may renumber; a name is stable and greppable). Anything
+/// this server cannot produce is "unknown", which no consumer may accept.
+pub fn kvTypeName(ggml_type: i32) []const u8 {
+    if (ggml_type == 0 or ggml_type == ffi.GgmlType.F16) return "f16";
+    if (ggml_type == ffi.GgmlType.Q8_0) return "q8_0";
+    if (ggml_type == ffi.GgmlType.Q4_0) return "q4_0";
+    return "unknown";
+}
+
+pub const SWA_FULL_NAME = "full";
+pub const SWA_WINDOWED_NAME = "windowed";
+
+pub fn swaModeName(swa_full: bool) []const u8 {
+    return if (swa_full) SWA_FULL_NAME else SWA_WINDOWED_NAME;
+}
+
 pub const LlamaSession = struct {
     allocator: std.mem.Allocator,
     engine: *LlamaEngine,
     handle: *ffi.Session,
     ctx_size: i32,
+    /// What the KV cache was created with (K == V, enforced at create).
+    kv_type: i32 = 0,
+    /// SWA cache mode this context was created with (see `SessionOptions`).
+    swa_full: bool = true,
     /// Token ids currently resident in the KV cache (prompt + every token fed via
     /// `eval`), in position order. `sync` diffs the next prompt against this to
     /// reuse the common prefix; it always mirrors the C session's KV exactly.
@@ -846,6 +891,138 @@ test "llama: prefix reuse is byte-identical to cold decode" {
         try sess.eval(tok);
         tok = sess.argmax();
     }
+}
+
+test "llama: kvTypeName / swaModeName spell the wire names" {
+    try std.testing.expectEqualStrings("f16", kvTypeName(0));
+    try std.testing.expectEqualStrings("f16", kvTypeName(ffi.GgmlType.F16));
+    try std.testing.expectEqualStrings("q8_0", kvTypeName(ffi.GgmlType.Q8_0));
+    try std.testing.expectEqualStrings("q4_0", kvTypeName(ffi.GgmlType.Q4_0));
+    try std.testing.expectEqualStrings("unknown", kvTypeName(ffi.GgmlType.Q5_0));
+    try std.testing.expectEqualStrings("full", swaModeName(true));
+    try std.testing.expectEqualStrings("windowed", swaModeName(false));
+}
+
+/// Build a prompt longer than gemma's 1024-token sliding window so the
+/// windowed worker cache (1536 cells) actually prunes. MEASURED on b10472 /
+/// gemma-4-12b: the blob is the SAME size either way -- llama.cpp already
+/// drops SWA-masked cells from a full-size cache, so the export is
+/// ~335 MB of window (f16) + 16.4 KB/token of global layers; q8_0 halves
+/// both (178 MB + 8.7 KB/token). Windowed still buys the worker its VRAM
+/// back, and the restore direction (windowed blob -> full consumer) is
+/// what this test pins. Asserted <=, never <.
+fn longTestPrompt(allocator: std.mem.Allocator, engine: *LlamaEngine) ![]i32 {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    var i: usize = 0;
+    while (i < 80) : (i += 1) {
+        var line: [96]u8 = undefined;
+        try text.appendSlice(allocator, try std.fmt.bufPrint(&line, "Entry {d}: the river bends east past the old mill and the road follows it. ", .{i}));
+    }
+    try text.appendSlice(allocator, "The capital of France is the city of");
+    return engine.tokenizeText(allocator, text.items, true);
+}
+
+test "llama: a WINDOWED worker blob restores into a FULL consumer cache and is no larger (remote prefill)" {
+    const allocator = std.testing.allocator;
+    const path = testModelPath() orelse return error.SkipZigTest;
+    const remote_prefill = @import("../remote_prefill.zig");
+
+    var engine = try LlamaEngine.open(allocator, path, .{});
+    defer engine.close();
+    const ids = try longTestPrompt(allocator, engine);
+    defer allocator.free(ids);
+    try std.testing.expect(ids.len > 1100 and ids.len < 3000);
+    const span = remote_prefill.prefillSpan(ids);
+
+    var reference = try engine.createSession(4096);
+    defer reference.free();
+    _ = try reference.sync(ids);
+    const expect_next = reference.argmax();
+
+    // Full-cache worker: what v1 shipped.
+    var full_worker = try engine.createSession(4096);
+    defer full_worker.free();
+    _ = try full_worker.sync(span);
+    const full_blob = try full_worker.exportState(allocator);
+    defer allocator.free(full_blob);
+
+    // Windowed worker: sliding layers keep window-worth of cells only
+    // (the blob does not shrink on this build -- see longTestPrompt).
+    var win_worker = try engine.createSessionWithOptions(4096, .{ .swa_full = false });
+    defer win_worker.free();
+    try std.testing.expectEqualStrings("windowed", swaModeName(win_worker.swa_full));
+    try std.testing.expectEqualStrings("f16", kvTypeName(win_worker.kv_type));
+    _ = try win_worker.sync(span);
+    try std.testing.expectEqual(@as(i32, @intCast(span.len)), win_worker.pos());
+    const win_blob = try win_worker.exportState(allocator);
+    defer allocator.free(win_blob);
+    try std.testing.expect(win_blob.len <= full_blob.len);
+    std.debug.print("[shrink] tokens={d} full={d} B ({d} B/tok) windowed={d} B ({d} B/tok)\n", .{
+        span.len, full_blob.len, full_blob.len / span.len, win_blob.len, win_blob.len / span.len,
+    });
+
+    // Consumer keeps the FULL cache (persistent sessions must) and still
+    // lands on the reference's next token from the windowed blob.
+    var consumer = try engine.createSession(4096);
+    defer consumer.free();
+    try consumer.importState(win_blob, span);
+    const reused = try consumer.sync(ids);
+    try std.testing.expectEqual(@as(i32, @intCast(ids.len - 1)), reused);
+    try std.testing.expectEqual(@as(u32, 0), consumer.trim_refusals);
+    try std.testing.expectEqual(expect_next, consumer.argmax());
+
+    // And the consumer can keep decoding past the restore (the sliding
+    // window must roll on from partial cells without an abort).
+    var k: usize = 0;
+    var tok = consumer.argmax();
+    while (k < 8) : (k += 1) {
+        if (engine.isEog(tok)) break;
+        try consumer.eval(tok);
+        tok = consumer.argmax();
+    }
+}
+
+test "llama: a q8_0 worker blob restores into a q8_0 consumer, is refused by an f16 one, and asymmetric K/V is refused at create" {
+    const allocator = std.testing.allocator;
+    const path = testModelPath() orelse return error.SkipZigTest;
+    const remote_prefill = @import("../remote_prefill.zig");
+
+    var engine = try LlamaEngine.open(allocator, path, .{});
+    defer engine.close();
+    const ids = try longTestPrompt(allocator, engine);
+    defer allocator.free(ids);
+    const span = remote_prefill.prefillSpan(ids);
+    const q8 = ffi.GgmlType.Q8_0;
+
+    try std.testing.expectError(Error.SessionCreateFailed, engine.createSessionWithOptions(4096, .{ .type_k = q8, .type_v = 0 }));
+
+    var reference = try engine.createSessionWithOptions(4096, .{ .type_k = q8, .type_v = q8 });
+    defer reference.free();
+    _ = try reference.sync(ids);
+    const expect_next = reference.argmax();
+
+    var worker = try engine.createSessionWithOptions(4096, .{ .type_k = q8, .type_v = q8, .swa_full = false });
+    defer worker.free();
+    try std.testing.expectEqualStrings("q8_0", kvTypeName(worker.kv_type));
+    _ = try worker.sync(span);
+    const blob = try worker.exportState(allocator);
+    defer allocator.free(blob);
+    std.debug.print("[shrink] tokens={d} q8_0+windowed={d} B ({d} B/tok)\n", .{ span.len, blob.len, blob.len / span.len });
+
+    var consumer = try engine.createSessionWithOptions(4096, .{ .type_k = q8, .type_v = q8 });
+    defer consumer.free();
+    try consumer.importState(blob, span);
+    const reused = try consumer.sync(ids);
+    try std.testing.expectEqual(@as(i32, @intCast(ids.len - 1)), reused);
+    try std.testing.expectEqual(expect_next, consumer.argmax());
+
+    // Type mismatch is an ERROR from llama.cpp (state_read_data checks the
+    // per-layer type), never a silent restore -- the header check is belt.
+    var f16_consumer = try engine.createSession(4096);
+    defer f16_consumer.free();
+    try std.testing.expectError(Error.StateImportFailed, f16_consumer.importState(blob, span));
+    try std.testing.expectEqual(@as(i32, 0), f16_consumer.pos());
 }
 
 test "llama: sequence state round-trips between sessions (remote prefill interchange)" {

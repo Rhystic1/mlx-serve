@@ -526,11 +526,11 @@ test "splitResponse needs a complete head and reports the real status" {
 }
 
 test "readHeaders finds the six reply headers case-insensitively" {
-    const head = "HTTP/1.1 200 OK\r\nx-prefill-version: 1\r\nX-PREFILL-MODEL: m\r\n" ++
+    const head = "HTTP/1.1 200 OK\r\nx-prefill-version: 2\r\nX-PREFILL-MODEL: m\r\n" ++
         "X-Prefill-Tokens: 7\r\nx-Prefill-Bytes: 99\r\nX-Prefill-Vocab: 256000\r\n" ++
         "X-Prefill-Model-Bytes: 1234";
     const h = readHeaders(head);
-    try testing.expectEqualStrings("1", h.version.?);
+    try testing.expectEqualStrings("2", h.version.?);
     try testing.expectEqualStrings("m", h.model.?);
     try testing.expectEqualStrings("7", h.tokens.?);
     try testing.expectEqualStrings("99", h.bytes.?);

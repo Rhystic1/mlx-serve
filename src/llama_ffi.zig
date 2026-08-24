@@ -48,6 +48,15 @@ pub extern fn mlx_llama_session_create_kv_quant(
     err: ?[*]u8,
     errlen: usize,
 ) ?*Session;
+pub extern fn mlx_llama_session_create_ex(
+    e: *Engine,
+    n_ctx: i32,
+    type_k: i32,
+    type_v: i32,
+    swa_full: bool,
+    err: ?[*]u8,
+    errlen: usize,
+) ?*Session;
 pub extern fn mlx_llama_session_free(s: ?*Session) void;
 
 // ── Embeddings ─────────────────────────────────────────────────────────────

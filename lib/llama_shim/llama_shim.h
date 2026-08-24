@@ -73,6 +73,18 @@ mlx_llama_session *mlx_llama_session_create_kv_quant(mlx_llama_engine *e,
                                                      int32_t type_k,
                                                      int32_t type_v,
                                                      char *err, size_t errlen);
+// Like mlx_llama_session_create_kv_quant plus the SWA cache mode: swa_full
+// true = every sliding-window layer keeps a full-context cache (what every
+// persistent session needs -- a windowed cache aborts the next decode after
+// a partial seq_rm); false = window-worth of cells only, for a session whose
+// exported state must be SMALL (remote-prefill worker: reset per request,
+// never trimmed).
+mlx_llama_session *mlx_llama_session_create_ex(mlx_llama_engine *e,
+                                               int32_t n_ctx,
+                                               int32_t type_k,
+                                               int32_t type_v,
+                                               bool swa_full,
+                                               char *err, size_t errlen);
 void mlx_llama_session_free(mlx_llama_session *s);
 
 // ── Embeddings ─────────────────────────────────────────────────────────────

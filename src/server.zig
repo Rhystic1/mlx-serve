@@ -4820,8 +4820,12 @@ fn handlePrefill(
 
     const model_bytes: u64 = modelFileSize(stream.io, lm.path);
     var extra_buf: [512]u8 = undefined;
-    const extra = try remote_prefill.formatHeaders(&extra_buf, req.model, req.tokens.len, blob.len, @intCast(engine.nVocab()), model_bytes);
-    log.info("POST /v1/prefill -> 200 ({d} tokens, {d} bytes)\n", .{ req.tokens.len, blob.len });
+    // The worker session is ALWAYS windowed (scheduler.runPrefillRequest) and
+    // its KV type is the model's --kv-quant; both are what the blob carries.
+    const kv_name = arch_llama.kvTypeName(lm.llama_kv_type_k);
+    const swa_name = arch_llama.swaModeName(false);
+    const extra = try remote_prefill.formatHeaders(&extra_buf, req.model, req.tokens.len, blob.len, @intCast(engine.nVocab()), model_bytes, kv_name, swa_name);
+    log.info("POST /v1/prefill -> 200 ({d} tokens, {d} bytes, kv={s}, swa={s})\n", .{ req.tokens.len, blob.len, kv_name, swa_name });
     try sendBinaryResponse(stream, remote_prefill.CONTENT_TYPE, extra, blob);
 }
 

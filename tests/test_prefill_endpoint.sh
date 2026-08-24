@@ -48,7 +48,9 @@ echo "[1] a well-formed request answers a binary state blob with every identity 
 code="$(post @"$TMP/req.json" "$TMP/blob1.bin" "$TMP/h1.txt")"
 [ "$code" = "200" ] && ok "200" || bad "status $code: $(head -c 300 "$TMP/blob1.bin")"
 [ "$(hdr "$TMP/h1.txt" Content-Type)" = "application/octet-stream" ] && ok "application/octet-stream" || bad "content-type $(hdr "$TMP/h1.txt" Content-Type)"
-[ "$(hdr "$TMP/h1.txt" X-Prefill-Version)" = "1" ] && ok "X-Prefill-Version: 1" || bad "version header"
+[ "$(hdr "$TMP/h1.txt" X-Prefill-Version)" = "2" ] && ok "X-Prefill-Version: 2" || bad "version header"
+[ "$(hdr "$TMP/h1.txt" X-Prefill-Swa)" = "windowed" ] && ok "X-Prefill-Swa: windowed (worker session prunes sliding layers)" || bad "swa header $(hdr "$TMP/h1.txt" X-Prefill-Swa)"
+case "$(hdr "$TMP/h1.txt" X-Prefill-Kv-Type)" in f16|q8_0|q4_0) ok "X-Prefill-Kv-Type names the cache type" ;; *) bad "kv-type header $(hdr "$TMP/h1.txt" X-Prefill-Kv-Type)" ;; esac
 [ "$(hdr "$TMP/h1.txt" X-Prefill-Model)" = "$MODEL_ID" ] && ok "X-Prefill-Model echoes the request" || bad "model header $(hdr "$TMP/h1.txt" X-Prefill-Model)"
 [ "$(hdr "$TMP/h1.txt" X-Prefill-Tokens)" = "$N" ] && ok "X-Prefill-Tokens == N ($N)" || bad "tokens header $(hdr "$TMP/h1.txt" X-Prefill-Tokens)"
 BL="$(stat -c %s "$TMP/blob1.bin")"

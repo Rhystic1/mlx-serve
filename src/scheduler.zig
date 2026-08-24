@@ -4290,14 +4290,22 @@ fn runPrefillRequest(sch: *Scheduler, req: *PrefillRequest) void {
         const ctx_size: i32 = if (req.model.config) |c| @intCast(c.max_position_embeddings) else 0;
         const type_k = req.model.llama_kv_type_k;
         const type_v = req.model.llama_kv_type_v;
-        req.model.llama_prefill_session = (if (type_k != 0 or type_v != 0)
-            engine.createSessionWithKvQuant(ctx_size, type_k, type_v)
-        else
-            engine.createSession(ctx_size)) catch |err| {
+        // WINDOWED SWA cache: this session is reset per request and never
+        // trimmed, so the persistent-session abort that forces swa_full=true
+        // elsewhere cannot happen here, and the exported blob carries only
+        // window-worth of cells per sliding layer. The consumer keeps its
+        // full cache; the blob still restores (see the shim comment).
+        req.model.llama_prefill_session = engine.createSessionWithOptions(ctx_size, .{
+            .type_k = type_k,
+            .type_v = type_v,
+            .swa_full = false,
+        }) catch |err| {
             finishPrefillRequest(sch, req, @errorName(err));
             return;
         };
-        log.info("[prefill] created dedicated session (ctx={d})\n", .{ctx_size});
+        log.info("[prefill] created dedicated session (ctx={d}, kv={s}, swa={s})\n", .{
+            ctx_size, arch_llama.kvTypeName(type_k), arch_llama.swaModeName(false),
+        });
     }
     const sess = req.model.llama_prefill_session.?;
     sess.reset();

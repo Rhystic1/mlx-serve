@@ -10,13 +10,22 @@
 //!            {"model": "<id>", "tokens": [int, ...]}
 //!   Success  200 application/octet-stream, body = the raw llama.cpp
 //!            sequence-state blob (`llama_state_seq_get_data`), plus headers:
-//!              X-Prefill-Version: 1
+//!              X-Prefill-Version: 2
 //!              X-Prefill-Model:   <request model, verbatim>
 //!              X-Prefill-Tokens:  <len(tokens)>
 //!              X-Prefill-Bytes:   <blob length == body length>
 //!              X-Prefill-Vocab:   <llama_n_vocab>
 //!              X-Prefill-Model-Bytes: <GGUF file size>
+//!              X-Prefill-Kv-Type: f16 | q8_0 | q4_0   (ggml type NAME of the worker's KV cache)
+//!              X-Prefill-Swa:     full | windowed     (the worker's SWA cache mode)
 //!   Failure  any non-200; the consumer never parses the body.
+//!
+//! v2 added the last two: a q8_0 blob read into an f16 cache is not an error,
+//! it is garbage KV, so the cache type is part of the fingerprint; the SWA
+//! mode says how much of a sliding layer the blob carries (a windowed blob
+//! restores into a FULL consumer cache -- llama.cpp's state_read is a plain
+//! find_slot of cell_count cells and the mask is by position -- so the
+//! consumer compares these against its OWN session, never assumes).
 //!
 //! Every header is REQUIRED: the blob is coupled to the llama.cpp build and
 //! the GGUF weights, and restoring the wrong one is the failure that produces
@@ -27,7 +36,7 @@
 //! fail a request.
 const std = @import("std");
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 pub const H_VERSION = "X-Prefill-Version";
 pub const H_MODEL = "X-Prefill-Model";
@@ -35,6 +44,8 @@ pub const H_TOKENS = "X-Prefill-Tokens";
 pub const H_BYTES = "X-Prefill-Bytes";
 pub const H_VOCAB = "X-Prefill-Vocab";
 pub const H_MODEL_BYTES = "X-Prefill-Model-Bytes";
+pub const H_KV_TYPE = "X-Prefill-Kv-Type";
+pub const H_SWA = "X-Prefill-Swa";
 
 pub const CONTENT_TYPE = "application/octet-stream";
 
@@ -149,10 +160,11 @@ fn parseU64(s: []const u8) ?u64 {
     return std.fmt.parseInt(u64, std.mem.trim(u8, s, " \t"), 10) catch null;
 }
 
-/// Format the six reply headers (server side). Lines end in CRLF, ready to be
-/// spliced into a response head.
-pub fn formatHeaders(buf: []u8, model: []const u8, n_tokens: usize, blob_len: usize, vocab: u32, model_bytes: u64) ![]const u8 {
-    return std.fmt.bufPrint(buf, H_VERSION ++ ": {d}\r\n" ++ H_MODEL ++ ": {s}\r\n" ++ H_TOKENS ++ ": {d}\r\n" ++ H_BYTES ++ ": {d}\r\n" ++ H_VOCAB ++ ": {d}\r\n" ++ H_MODEL_BYTES ++ ": {d}\r\n", .{ VERSION, model, n_tokens, blob_len, vocab, model_bytes });
+/// Format the eight reply headers (server side). Lines end in CRLF, ready to
+/// be spliced into a response head. `kv_type` / `swa` are the NAMES from
+/// `arch/llama.zig` (`kvTypeName`, `swaModeName`).
+pub fn formatHeaders(buf: []u8, model: []const u8, n_tokens: usize, blob_len: usize, vocab: u32, model_bytes: u64, kv_type: []const u8, swa: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, H_VERSION ++ ": {d}\r\n" ++ H_MODEL ++ ": {s}\r\n" ++ H_TOKENS ++ ": {d}\r\n" ++ H_BYTES ++ ": {d}\r\n" ++ H_VOCAB ++ ": {d}\r\n" ++ H_MODEL_BYTES ++ ": {d}\r\n" ++ H_KV_TYPE ++ ": {s}\r\n" ++ H_SWA ++ ": {s}\r\n", .{ VERSION, model, n_tokens, blob_len, vocab, model_bytes, kv_type, swa });
 }
 
 test "remote_prefill: parseRequest accepts the v1 body and refuses each malformed shape by name" {
@@ -177,14 +189,14 @@ test "remote_prefill: parseRequest accepts the v1 body and refuses each malforme
 
 test "remote_prefill: validateResponse passes a matching reply and names every mismatch" {
     const e = Expected{ .model = "gemma-4-12b", .n_tokens = 3, .vocab = 262144, .model_bytes = 7_000_000, .body_len = 4096 };
-    const ok = ResponseHeaders{ .version = "1", .model = "gemma-4-12b", .tokens = "3", .bytes = "4096", .vocab = "262144", .model_bytes = "7000000" };
+    const ok = ResponseHeaders{ .version = "2", .model = "gemma-4-12b", .tokens = "3", .bytes = "4096", .vocab = "262144", .model_bytes = "7000000" };
     try std.testing.expect(validateResponse(ok, e) == null);
 
     var h = ok;
     h.version = null;
     try std.testing.expectEqualStrings("missing " ++ H_VERSION, validateResponse(h, e).?);
     h = ok;
-    h.version = "2";
+    h.version = "1";
     try std.testing.expectEqualStrings("unsupported " ++ H_VERSION, validateResponse(h, e).?);
     h = ok;
     h.model = "gemma-4-12b-q8";
@@ -213,10 +225,10 @@ test "remote_prefill: validateResponse passes a matching reply and names every m
     try std.testing.expectEqualStrings("empty blob", validateResponse(h0, e0).?);
 }
 
-test "remote_prefill: formatHeaders emits exactly the six headers validateResponse reads" {
+test "remote_prefill: formatHeaders emits exactly the eight v2 headers" {
     var buf: [512]u8 = undefined;
-    const out = try formatHeaders(&buf, "gemma-4-12b", 3, 4096, 262144, 7_000_000);
-    try std.testing.expectEqualStrings("X-Prefill-Version: 1\r\nX-Prefill-Model: gemma-4-12b\r\nX-Prefill-Tokens: 3\r\nX-Prefill-Bytes: 4096\r\nX-Prefill-Vocab: 262144\r\nX-Prefill-Model-Bytes: 7000000\r\n", out);
+    const out = try formatHeaders(&buf, "gemma-4-12b", 3, 4096, 262144, 7_000_000, "q8_0", "windowed");
+    try std.testing.expectEqualStrings("X-Prefill-Version: 2\r\nX-Prefill-Model: gemma-4-12b\r\nX-Prefill-Tokens: 3\r\nX-Prefill-Bytes: 4096\r\nX-Prefill-Vocab: 262144\r\nX-Prefill-Model-Bytes: 7000000\r\nX-Prefill-Kv-Type: q8_0\r\nX-Prefill-Swa: windowed\r\n", out);
 }
 
 test "remote_prefill: prefillSpan leaves exactly the last token for the consumer" {

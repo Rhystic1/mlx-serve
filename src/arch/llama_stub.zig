@@ -124,6 +124,11 @@ pub const LlamaEngine = struct {
         _ = ctx_size;
         @panic(unavailable);
     }
+    pub fn createSessionWithOptions(self: *LlamaEngine, _: i32, _: SessionOptions) Error!*LlamaSession {
+        _ = self;
+        return Error.SessionCreateFailed;
+    }
+
     pub fn createSessionWithKvQuant(self: *LlamaEngine, ctx_size: i32, type_k: i32, type_v: i32) Error!*LlamaSession {
         _ = self;
         _ = ctx_size;
@@ -132,6 +137,14 @@ pub const LlamaEngine = struct {
         @panic(unavailable);
     }
 };
+
+pub const SessionOptions = struct { type_k: i32 = 0, type_v: i32 = 0, swa_full: bool = true };
+pub fn kvTypeName(_: i32) []const u8 {
+    return "unknown";
+}
+pub fn swaModeName(swa_full: bool) []const u8 {
+    return if (swa_full) "full" else "windowed";
+}
 
 pub const LlamaSession = struct {
     allocator: std.mem.Allocator,
