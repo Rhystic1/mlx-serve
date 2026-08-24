@@ -931,9 +931,75 @@
       '<span><b>' + (live.decode_tok_s || 0).toFixed(1) + '</b>decode tok/s</span>' +
       '<span><b>' + (live.requests_inflight || 0) + '</b>in flight</span></div></div></div>';
   }
+  // ── Topology diagram ──────────────────────────────────────────────────────
+  // Pure: cluster JSON → an inline SVG of the mesh. `self` sits at the centre;
+  // RPC devices fan out to the right (solid edges labelled with layer counts),
+  // a remote-prefill worker sits left (dashed edge), LAN peers sit below
+  // (dotted edges). Theme-aware via currentColor + CSS vars. Returns '' when
+  // there is nothing but a lone node to draw (the section list covers that).
+  function svgNode(x, y, w, h, label, sub, cls) {
+    var r = 8;
+    return '<g class="tp-node ' + cls + '">' +
+      '<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" rx="' + r + '"></rect>' +
+      '<text x="' + (x + w / 2) + '" y="' + (y + (sub ? 20 : 24)) + '" class=tp-lbl>' + clEsc(label) + '</text>' +
+      (sub ? '<text x="' + (x + w / 2) + '" y="' + (y + 35) + '" class=tp-sub>' + clEsc(sub) + '</text>' : '') +
+      '</g>';
+  }
+  function svgEdge(x1, y1, x2, y2, cls, label) {
+    var mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+    return '<line x1="' + x1 + '" y1="' + y1 + '" x2="' + x2 + '" y2="' + y2 + '" class="tp-edge ' + cls + '"></line>' +
+      (label ? '<text x="' + mx + '" y="' + (my - 4) + '" class=tp-elbl>' + clEsc(label) + '</text>' : '');
+  }
+  function renderClusterSvg(data) {
+    var rpc = data.rpc || {}, pf = data.prefill || {}, lan = data.lan || {};
+    var remotes = (rpc.devices || []).filter(function (d) { return d.kind === 'remote'; });
+    var localDev = (rpc.devices || []).filter(function (d) { return d.kind === 'local'; })[0];
+    var peers = (lan.peers || []);
+    var hasPrefill = pf.mode === 'consumer' && pf.url;
+    if (!remotes.length && !hasPrefill && !peers.length) return '';
+
+    var W = 640, H = 90 + Math.max(remotes.length, 1) * 56 + (peers.length ? 70 : 0);
+    var cx = 250, cyTop = 40, nodeW = 140, nodeH = 46;
+    var selfName = (data.self && (data.self.name || data.self.host)) || 'this node';
+    var selfSub = localDev ? (localDev.name + ' · ' + (localDev.layer_count || 0) + 'L') : (data.self && data.self.engine);
+    var s = '<svg viewBox="0 0 ' + W + ' ' + H + '" class=tp-svg preserveAspectRatio="xMinYMin meet">';
+
+    // edges first (under nodes)
+    var selfCx = cx + nodeW, selfCy = cyTop + nodeH / 2;
+    remotes.forEach(function (d, i) {
+      var ry = 20 + i * 56, rcy = ry + nodeH / 2;
+      s += svgEdge(selfCx, selfCy, cx + 340, rcy, 'rpc', (d.layers && d.layers.length === 2 ? d.layers[0] + '–' + d.layers[1] : (d.layer_count || 0) + 'L'));
+    });
+    if (hasPrefill) s += svgEdge(cx, selfCy, 40 + 120, selfCy, 'pf', 'prefill');
+    peers.forEach(function (p, i) {
+      var py = H - 46, pxc = 80 + i * 150 + 60;
+      s += svgEdge(cx + nodeW / 2, cyTop + nodeH, pxc, py, 'lan', null);
+    });
+
+    // nodes
+    s += svgNode(cx, cyTop, nodeW, nodeH, selfName, selfSub, 'self');
+    remotes.forEach(function (d, i) {
+      var ry = 20 + i * 56;
+      var free = d.endpoint ? '' : '';
+      s += svgNode(cx + 340, ry, 150, nodeH, d.name, (d.endpoint || 'remote') + free, 'rpc');
+    });
+    if (hasPrefill) {
+      var host = pf.url.replace(/^https?:\/\//, '');
+      s += svgNode(20, cyTop, 120, nodeH, 'prefill', host, 'pf');
+    }
+    peers.forEach(function (p, i) {
+      var pxc = 80 + i * 150;
+      var caps = [];
+      if (p.caps && p.caps.prefill) caps.push('pf');
+      if (p.caps && p.caps.rpc) caps.push('rpc');
+      s += svgNode(pxc, H - 46, 120, 38, p.name || p.ip, caps.join(' ') || (p.models && p.models.length ? p.models.length + ' models' : ''), 'lan');
+    });
+    return '<div class=tp-wrap>' + s + '</svg></div>';
+  }
+
   function renderCluster(data) {
     if (!data || typeof data !== 'object') return '<div class=cluster-empty>Cluster data unavailable.</div>';
-    var html = clNode(data.self) + clRpc(data.rpc) + clPrefill(data.prefill) + clLan(data.lan) + clLive(data.live);
+    var html = renderClusterSvg(data) + clNode(data.self) + clRpc(data.rpc) + clPrefill(data.prefill) + clLan(data.lan) + clLive(data.live);
     return html || '<div class=cluster-empty>No cluster activity — this node is standalone.</div>';
   }
 
@@ -976,6 +1042,7 @@
       formatBytes: formatBytes,
       errorText: errorText,
       renderCluster: renderCluster,
+      renderClusterSvg: renderClusterSvg,
     };
   }
 

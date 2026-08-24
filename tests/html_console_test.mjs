@@ -1024,3 +1024,32 @@ test('renderCluster escapes untrusted peer/model strings', () => {
   assert.doesNotMatch(html, /<img>/);
   assert.match(html, /&lt;script&gt;x/);
 });
+
+test('renderClusterSvg draws self + rpc device edges with layer labels', () => {
+  const svg = C.renderClusterSvg({
+    self: { name: 'M4Max', engine: 'llama.cpp' },
+    rpc: { role: 'consumer', devices: [
+      { name: 'MTL0', kind: 'local', layers: [0, 59], layer_count: 60 },
+      { name: 'RPC0', kind: 'remote', endpoint: '192.168.0.150:50052', layers: [60, 65], layer_count: 6 },
+    ] },
+    prefill: { mode: 'none' }, lan: { peers: [] },
+  });
+  assert.match(svg, /<svg/);
+  assert.match(svg, /M4Max/);
+  assert.match(svg, /RPC0/);
+  assert.match(svg, /60.65/);        // edge label layer range
+  assert.doesNotMatch(svg, /<script/);
+});
+
+test('renderClusterSvg returns empty when nothing to draw', () => {
+  assert.equal(C.renderClusterSvg({ self: { name: 'x' }, rpc: { role: 'none', devices: [] }, prefill: { mode: 'none' }, lan: { peers: [] } }), '');
+});
+
+test('renderClusterSvg escapes peer names in the diagram', () => {
+  const svg = C.renderClusterSvg({
+    self: { name: 'x' }, rpc: { devices: [] }, prefill: { mode: 'none' },
+    lan: { peers: [{ name: '<img>', ip: '1.2.3.4', port: 80, caps: { prefill: true } }] },
+  });
+  assert.doesNotMatch(svg, /<img>/);
+  assert.match(svg, /&lt;img&gt;/);
+});

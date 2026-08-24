@@ -634,3 +634,18 @@ table.models .state.error { color: #f28b82 }
 #chat-voice.listening #chat-voice-label::after { content: " ● "; color: #e5534b; }
 #chat-voice.speaking #chat-voice-label::after { content: " ♪"; }
 #chat-voice.thinking #chat-voice-label::after { content: " …"; }
+
+/* ── Cluster topology diagram ──────────────────────────────────────────── */
+.tp-wrap { border: 1px solid var(--line); border-radius: 12px; background: var(--card); padding: 8px; margin-bottom: 16px; overflow-x: auto }
+.tp-svg { width: 100%; min-width: 560px; height: auto; display: block }
+.tp-node rect { fill: var(--side); stroke: var(--line); stroke-width: 1 }
+.tp-node.self rect { stroke: var(--accent); stroke-width: 1.5 }
+.tp-node.rpc rect { stroke: #7b8ff5 }
+.tp-node.pf rect { stroke: #10b981 }
+.tp-lbl { fill: var(--fg); font-size: 13px; font-weight: 600; text-anchor: middle }
+.tp-sub { fill: var(--dim); font-size: 10px; font-family: var(--mono); text-anchor: middle }
+.tp-edge { stroke: var(--dim); stroke-width: 1.5; fill: none }
+.tp-edge.rpc { stroke: #7b8ff5 }
+.tp-edge.pf { stroke: #10b981; stroke-dasharray: 5 4 }
+.tp-edge.lan { stroke: var(--line); stroke-dasharray: 2 3 }
+.tp-elbl { fill: var(--dim); font-size: 10px; font-family: var(--mono); text-anchor: middle }
