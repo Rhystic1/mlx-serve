@@ -5432,96 +5432,101 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // cold prefill below runs unchanged. Skips the hot cache when it engages —
     // the two both fill the cache from position 0 and are mutually exclusive.
     var remote_mlx_matched: u32 = 0;
-    if (rpc.g_remote_prefill_url) |url| {
-        if (slot.vision_embeddings == null and xfm_ptr.config.isGemma4Layers() and
-            slot.full_prompt.len > remote_prefill_mlx.MIN_MLX_TOKENS and
-            slot.model.remote_prefill_cal.shouldTry())
-        {
-            const remote_model = remote_prefill_mlx.g_remote_model orelse slot.model.id;
-            const rt_start = std.Io.Timestamp.now(sch.io, .boot);
-            const n = remote_prefill_mlx.tryImport(
-                slot.allocator,
-                &slot.cache,
-                &xfm_ptr.config,
-                url,
-                remote_model,
-                slot.full_prompt,
-                @intCast(xfm_ptr.config.vocab_size),
-                xfm_ptr.s,
-            );
-            if (n > 0) {
-                const rt_ms: f64 = @floatFromInt(@divTrunc(std.Io.Timestamp.now(sch.io, .boot).nanoseconds - rt_start.nanoseconds, std.time.ns_per_ms));
-                slot.model.remote_prefill_cal.observeRemote(rt_ms, slot.full_prompt.len);
-                remote_mlx_matched = @intCast(n);
-                hot_matched = @intCast(n);
-                prefill_tokens = slot.full_prompt[n..];
-                slot.remote_prefilled = true;
-                slot.remote_prefill_tokens = @intCast(n);
-            } else {
-                slot.model.remote_prefill_cal.observeFailure();
+    // GGUF-only builds import `remote_prefill_mlx` as an empty struct (no MLX),
+    // so this whole block must be comptime-dead there — it reaches for the
+    // importer's members, which do not exist on the stub.
+    if (comptime @import("build_cfg.zig").mlx_enabled) {
+        if (rpc.g_remote_prefill_url) |url| {
+            if (slot.vision_embeddings == null and xfm_ptr.config.isGemma4Layers() and
+                slot.full_prompt.len > remote_prefill_mlx.MIN_MLX_TOKENS and
+                slot.model.remote_prefill_cal.shouldTry())
+            {
+                const remote_model = remote_prefill_mlx.g_remote_model orelse slot.model.id;
+                const rt_start = std.Io.Timestamp.now(sch.io, .boot);
+                const n = remote_prefill_mlx.tryImport(
+                    slot.allocator,
+                    &slot.cache,
+                    &xfm_ptr.config,
+                    url,
+                    remote_model,
+                    slot.full_prompt,
+                    @intCast(xfm_ptr.config.vocab_size),
+                    xfm_ptr.s,
+                );
+                if (n > 0) {
+                    const rt_ms: f64 = @floatFromInt(@divTrunc(std.Io.Timestamp.now(sch.io, .boot).nanoseconds - rt_start.nanoseconds, std.time.ns_per_ms));
+                    slot.model.remote_prefill_cal.observeRemote(rt_ms, slot.full_prompt.len);
+                    remote_mlx_matched = @intCast(n);
+                    hot_matched = @intCast(n);
+                    prefill_tokens = slot.full_prompt[n..];
+                    slot.remote_prefilled = true;
+                    slot.remote_prefill_tokens = @intCast(n);
+                } else {
+                    slot.model.remote_prefill_cal.observeFailure();
+                }
             }
         }
     }
 
     if (remote_mlx_matched == 0) {
-    if (slot.model.prefix_cache) |*hc| {
-        if (slot.vision_embeddings == null) {
-            // Only build a restore target when this request will actually
-            // draft — a non-dflash turn leaves the payload in the entry for
-            // the next one that does.
-            var dfl_target: ?dflash_mod.DflashCtx = if (use_dflash and slot.dflash != null)
-                dflash_mod.DflashCtx.init(slot.allocator, slot.dflash.?, 0) catch null
-            else
-                null;
-            errdefer if (dfl_target) |*dc| dc.deinit();
-            var dfl_base: usize = 0;
-            var mtp_target: ?generate_mod.MtpCacheRef = if (use_mtp and slot.mtp != null)
-                slot.mtp.?.makeCache(slot.allocator) catch null
-            else
-                null;
-            errdefer if (mtp_target) |*mc| mc.deinit();
-            var mtp_base: usize = 0;
-            const lookup = hc.lookupAndRestore(
-                &slot.cache,
-                &slot.moe_seq_offset,
-                slot.ssm_entries,
-                xfm_ptr.s,
-                slot.full_prompt,
-                slot.has_tools,
-                if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
-                if (mtp_target) |*mc| .{ .cache = mc.kv(), .base_pos = &mtp_base } else null,
-            ) catch |err| blk: {
-                log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
-                break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
-            };
-            if (lookup.matched > 0 and lookup.matched <= slot.full_prompt.len) {
-                hot_matched = @intCast(lookup.matched);
-                prefill_tokens = slot.full_prompt[hot_matched..];
-            }
-            if (dfl_target) |*dc| {
-                // Adopt only a context that lines up EXACTLY with the trunk
-                // cursor — `nextDflash` asserts `absLen() == cache.step`, and
-                // a blind start is always a valid fallback.
-                if (lookup.dflash_base != null and dfl_base + dc.cache.step == hot_matched) {
-                    dc.base_pos = dfl_base;
-                    dflash_restored = dc.*;
-                } else {
-                    dc.deinit();
+        if (slot.model.prefix_cache) |*hc| {
+            if (slot.vision_embeddings == null) {
+                // Only build a restore target when this request will actually
+                // draft — a non-dflash turn leaves the payload in the entry for
+                // the next one that does.
+                var dfl_target: ?dflash_mod.DflashCtx = if (use_dflash and slot.dflash != null)
+                    dflash_mod.DflashCtx.init(slot.allocator, slot.dflash.?, 0) catch null
+                else
+                    null;
+                errdefer if (dfl_target) |*dc| dc.deinit();
+                var dfl_base: usize = 0;
+                var mtp_target: ?generate_mod.MtpCacheRef = if (use_mtp and slot.mtp != null)
+                    slot.mtp.?.makeCache(slot.allocator) catch null
+                else
+                    null;
+                errdefer if (mtp_target) |*mc| mc.deinit();
+                var mtp_base: usize = 0;
+                const lookup = hc.lookupAndRestore(
+                    &slot.cache,
+                    &slot.moe_seq_offset,
+                    slot.ssm_entries,
+                    xfm_ptr.s,
+                    slot.full_prompt,
+                    slot.has_tools,
+                    if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
+                    if (mtp_target) |*mc| .{ .cache = mc.kv(), .base_pos = &mtp_base } else null,
+                ) catch |err| blk: {
+                    log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
+                    break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
+                };
+                if (lookup.matched > 0 and lookup.matched <= slot.full_prompt.len) {
+                    hot_matched = @intCast(lookup.matched);
+                    prefill_tokens = slot.full_prompt[hot_matched..];
                 }
-                dfl_target = null;
-            }
-            if (mtp_target) |*mc| {
-                // Same exact-alignment rule (the Generator asserts
-                // `base + step == ssm_cp_offset` on adoption).
-                if (lookup.mtp_base != null and mtp_base + mc.step() == hot_matched) {
-                    mtp_restored = .{ .cache = mc.*, .base = mtp_base };
-                } else {
-                    mc.deinit();
+                if (dfl_target) |*dc| {
+                    // Adopt only a context that lines up EXACTLY with the trunk
+                    // cursor — `nextDflash` asserts `absLen() == cache.step`, and
+                    // a blind start is always a valid fallback.
+                    if (lookup.dflash_base != null and dfl_base + dc.cache.step == hot_matched) {
+                        dc.base_pos = dfl_base;
+                        dflash_restored = dc.*;
+                    } else {
+                        dc.deinit();
+                    }
+                    dfl_target = null;
                 }
-                mtp_target = null;
+                if (mtp_target) |*mc| {
+                    // Same exact-alignment rule (the Generator asserts
+                    // `base + step == ssm_cp_offset` on adoption).
+                    if (lookup.mtp_base != null and mtp_base + mc.step() == hot_matched) {
+                        mtp_restored = .{ .cache = mc.*, .base = mtp_base };
+                    } else {
+                        mc.deinit();
+                    }
+                    mtp_target = null;
+                }
             }
         }
-    }
     }
 
     // Phase 1 (perf-plan): forward the SSM-checkpoint stride from the
