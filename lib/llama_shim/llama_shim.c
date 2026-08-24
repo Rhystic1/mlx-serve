@@ -6,11 +6,11 @@
 #include "llama_shim.h"
 
 #include "llama.h"
-#ifndef __APPLE__
 #include "ggml-backend.h"
-#endif
+#include "ggml-rpc.h"
 
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -67,10 +67,133 @@ static void copy_err(char *err, size_t errlen, const char *msg) {
 }
 
 mlx_llama_engine *mlx_llama_open(const char *gguf_path, int32_t n_gpu_layers, char *err, size_t errlen) {
-    pthread_once(&g_backend_once, backend_init_once);
+    return mlx_llama_open_ex(gguf_path, n_gpu_layers, NULL, 0, NULL, err, errlen);
+}
+
+// ggml RPC entry points are reached through the registry's proc table, NOT
+// linked: ggml-rpc is a dlopen'd backend everywhere but the Apple
+// XCFramework, and linking its symbols would make the exe refuse to start on
+// a host whose build has no RPC (the stock rpc-server tool does the same).
+typedef ggml_backend_reg_t (*rpc_add_server_fn)(const char *endpoint);
+typedef void (*rpc_get_device_memory_fn)(const char *endpoint, uint32_t device, size_t *free, size_t *total);
+typedef void (*rpc_start_server_fn)(const char *endpoint, const char *cache_dir,
+                                    size_t n_threads, size_t n_devices, ggml_backend_dev_t *devices);
+
+static void ensure_backend_init(void) { pthread_once(&g_backend_once, backend_init_once); }
+
+static void *rpc_proc(const char *name) {
+    ensure_backend_init();
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+    if (!reg) return NULL;
+    return ggml_backend_reg_get_proc_address(reg, name);
+}
+
+// One registry per endpoint, created on first contact and reused by
+// mlx_llama_open_ex: adding the same server twice would register its device
+// twice, and llama.cpp would then see two "GPUs" that are one card.
+static struct { char endpoint[256]; ggml_backend_reg_t reg; } g_rpc_regs[GGML_RPC_MAX_SERVERS];
+static int g_rpc_regs_n = 0;
+static pthread_mutex_t g_rpc_regs_mu = PTHREAD_MUTEX_INITIALIZER;
+
+// NULL = unreachable, no RPC backend, or the worker exports no device. The
+// proc table at b10472 exposes add_server/start_server, NOT get_device_memory,
+// which is why reachability rides add_server (the path common.cpp uses too).
+static ggml_backend_reg_t rpc_reg_for(const char *endpoint) {
+    pthread_mutex_lock(&g_rpc_regs_mu);
+    for (int i = 0; i < g_rpc_regs_n; i++) {
+        if (strcmp(g_rpc_regs[i].endpoint, endpoint) == 0) {
+            ggml_backend_reg_t r = g_rpc_regs[i].reg;
+            pthread_mutex_unlock(&g_rpc_regs_mu);
+            return r;
+        }
+    }
+    ggml_backend_reg_t reg = NULL;
+    rpc_add_server_fn add = (rpc_add_server_fn)rpc_proc("ggml_backend_rpc_add_server");
+    if (add) reg = add(endpoint);
+    if (reg && ggml_backend_reg_dev_count(reg) == 0) reg = NULL;
+    if (reg && g_rpc_regs_n < GGML_RPC_MAX_SERVERS) {
+        strncpy(g_rpc_regs[g_rpc_regs_n].endpoint, endpoint, sizeof g_rpc_regs[0].endpoint - 1);
+        g_rpc_regs[g_rpc_regs_n].endpoint[sizeof g_rpc_regs[0].endpoint - 1] = '\0';
+        g_rpc_regs[g_rpc_regs_n].reg = reg;
+        g_rpc_regs_n++;
+    }
+    pthread_mutex_unlock(&g_rpc_regs_mu);
+    return reg;
+}
+
+bool mlx_llama_rpc_device_memory(const char *endpoint, uint64_t *free_out, uint64_t *total_out) {
+    ggml_backend_reg_t reg = rpc_reg_for(endpoint);
+    if (!reg) return false;
+    size_t f = 0, t = 0;
+    ggml_backend_dev_memory(ggml_backend_reg_dev_get(reg, 0), &f, &t);
+    if (free_out) *free_out = (uint64_t)f;
+    if (total_out) *total_out = (uint64_t)t;
+    // A worker that dies between add_server and now answers 0/0.
+    return t > 0;
+}
+
+// First GPU-class device (CUDA0 / Metal), else the CPU device.
+static ggml_backend_dev_t best_local_device(void) {
+    ensure_backend_init();
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) return d;
+    }
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU) return d;
+    }
+    return NULL;
+}
+
+mlx_llama_engine *mlx_llama_open_ex(const char *gguf_path, int32_t n_gpu_layers,
+                                    const char **rpc_endpoints, int32_t n_rpc,
+                                    const float *tensor_split,
+                                    char *err, size_t errlen) {
+    ensure_backend_init();
 
     struct llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = n_gpu_layers;
+
+    // Explicit device list: every local GPU (registry order) followed by the
+    // RPC devices in the order the user named them; `tensor_split` is indexed
+    // the same way. Without RPC devices mp.devices stays NULL and llama.cpp
+    // picks exactly what it always did.
+    ggml_backend_dev_t devs[GGML_RPC_MAX_SERVERS + 17];
+    size_t n_devs = 0;
+    if (n_rpc > 0) {
+        if (!rpc_proc("ggml_backend_rpc_add_server")) {
+            copy_err(err, errlen, "ggml RPC backend is not loaded (ggml-rpc missing beside the executable)");
+            return NULL;
+        }
+        for (size_t i = 0; i < ggml_backend_dev_count() && n_devs < 16; i++) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) devs[n_devs++] = d;
+        }
+        for (int32_t i = 0; i < n_rpc && i < GGML_RPC_MAX_SERVERS; i++) {
+            // Reachability FIRST: rpc-offload-plan.md says a dead peer is a
+            // named load failure, never a model half-loaded on whatever is left.
+            uint64_t f = 0, t = 0;
+            char msg[320];
+            if (!mlx_llama_rpc_device_memory(rpc_endpoints[i], &f, &t)) {
+                snprintf(msg, sizeof msg, "RPC worker unreachable: %s", rpc_endpoints[i]);
+                copy_err(err, errlen, msg);
+                return NULL;
+            }
+            ggml_backend_reg_t reg = rpc_reg_for(rpc_endpoints[i]);
+            if (!reg) {
+                snprintf(msg, sizeof msg, "RPC add_server failed: %s", rpc_endpoints[i]);
+                copy_err(err, errlen, msg);
+                return NULL;
+            }
+            for (size_t j = 0; j < ggml_backend_reg_dev_count(reg) && n_devs < GGML_RPC_MAX_SERVERS + 16; j++)
+                devs[n_devs++] = ggml_backend_reg_dev_get(reg, j);
+        }
+        devs[n_devs] = NULL;
+        mp.devices = devs;
+        mp.tensor_split = tensor_split;
+        mp.split_mode = LLAMA_SPLIT_MODE_LAYER;
+    }
 
     struct llama_model *model = llama_model_load_from_file(gguf_path, mp);
     if (!model) {
@@ -486,4 +609,64 @@ int32_t mlx_llama_session_state_set(mlx_llama_session *s, const uint8_t *src, si
     }
     s->pos = n_tokens;
     return 0;
+}
+
+// -- Backend registry queries --------------------------------------------------
+bool mlx_llama_backend_present(const char *name) {
+    ensure_backend_init();
+    return ggml_backend_reg_by_name(name) != NULL;
+}
+
+int32_t mlx_llama_backend_names(char *buf, size_t cap) {
+    ensure_backend_init();
+    if (!buf || cap == 0) return 0;
+    size_t used = 0;
+    buf[0] = '\0';
+    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+        const char *n = ggml_backend_reg_name(ggml_backend_reg_get(i));
+        size_t len = strlen(n);
+        if (used + len + 2 > cap) break;
+        if (used) buf[used++] = ',';
+        memcpy(buf + used, n, len);
+        used += len;
+        buf[used] = '\0';
+    }
+    return (int32_t)used;
+}
+
+// -- RPC worker --------------------------------------------------------------
+int32_t mlx_llama_rpc_local_device(char *name_buf, size_t cap, uint64_t *free_out, uint64_t *total_out) {
+    ggml_backend_dev_t best = best_local_device();
+    if (!best) return -1;
+    size_t f = 0, t = 0;
+    ggml_backend_dev_memory(best, &f, &t);
+    if (free_out) *free_out = f;
+    if (total_out) *total_out = t;
+    if (name_buf && cap) { strncpy(name_buf, ggml_backend_dev_name(best), cap - 1); name_buf[cap - 1] = '\0'; }
+    return (int32_t)(ggml_backend_dev_type(best) == GGML_BACKEND_DEVICE_TYPE_GPU);
+}
+
+bool mlx_llama_rpc_serve(const char *endpoint, const char *cache_dir, int32_t n_threads, char *err, size_t errlen) {
+    rpc_start_server_fn start = (rpc_start_server_fn)rpc_proc("ggml_backend_rpc_start_server");
+    if (!start) {
+        copy_err(err, errlen, "ggml RPC backend is not loaded (ggml-rpc missing beside the executable)");
+        return false;
+    }
+    ggml_backend_dev_t best = best_local_device();
+    if (!best) { copy_err(err, errlen, "no ggml device to serve"); return false; }
+    ggml_backend_dev_t devs[1] = { best };
+    // Blocks for the life of the process (accept loop); the caller runs it on
+    // its own thread.
+    start(endpoint, (cache_dir && cache_dir[0]) ? cache_dir : NULL,
+          (size_t)(n_threads > 0 ? n_threads : 1), 1, devs);
+    copy_err(err, errlen, "rpc server loop returned");
+    return false;
+}
+
+int32_t mlx_llama_local_gpu_count(void) {
+    ensure_backend_init();
+    int32_t n = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++)
+        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) n++;
+    return n;
 }

@@ -26,7 +26,50 @@ pub const Error = error{
 pub const OpenOptions = struct {
     /// Layers to offload to Metal. 999 = "all" (every real model has fewer).
     n_gpu_layers: i32 = 999,
+    /// ggml RPC workers ("host:port") appended after the local GPUs
+    /// (rpc-offload-plan.md). An unreachable one is a NAMED open failure.
+    rpc_endpoints: []const []const u8 = &.{},
+    /// One weight per device in [local GPUs..., rpc...] order; empty = by free memory.
+    tensor_split: []const f32 = &.{},
 };
+
+pub const DeviceMemory = struct { free: u64, total: u64 };
+
+/// Free/total bytes on an RPC worker's device; null = unreachable (or no RPC backend).
+pub fn rpcDeviceMemory(allocator: std.mem.Allocator, endpoint: []const u8) ?DeviceMemory {
+    const z = allocator.dupeSentinel(u8, endpoint, 0) catch return null;
+    defer allocator.free(z);
+    var m = DeviceMemory{ .free = 0, .total = 0 };
+    if (!ffi.mlx_llama_rpc_device_memory(z.ptr, &m.free, &m.total)) return null;
+    return m;
+}
+
+pub fn localGpuCount() usize {
+    return @intCast(@max(ffi.mlx_llama_local_gpu_count(), 0));
+}
+
+pub const LocalDevice = struct { name: []const u8, is_gpu: bool, mem: DeviceMemory };
+
+/// The device `--rpc-serve` exports (first GPU, else CPU). `buf` backs `name`.
+pub fn localRpcDevice(buf: []u8) ?LocalDevice {
+    var m = DeviceMemory{ .free = 0, .total = 0 };
+    const r = ffi.mlx_llama_rpc_local_device(buf.ptr, buf.len, &m.free, &m.total);
+    if (r < 0) return null;
+    return .{ .name = std.mem.sliceTo(buf, 0), .is_gpu = r == 1, .mem = m };
+}
+
+/// Serve the best local device over ggml RPC. Blocks for the life of the
+/// process on success; returns (with the shim's reason logged) only on failure.
+pub fn serveRpc(allocator: std.mem.Allocator, endpoint: []const u8, cache_dir: ?[]const u8, n_threads: i32) Error!void {
+    const ez = allocator.dupeSentinel(u8, endpoint, 0) catch return Error.OutOfMemory;
+    defer allocator.free(ez);
+    const cz: ?[:0]u8 = if (cache_dir) |c| (allocator.dupeSentinel(u8, c, 0) catch return Error.OutOfMemory) else null;
+    defer if (cz) |c| allocator.free(c);
+    var err_buf: [256]u8 = undefined;
+    _ = ffi.mlx_llama_rpc_serve(ez.ptr, if (cz) |c| c.ptr else null, n_threads, &err_buf, err_buf.len);
+    log.err("[rpc-serve] stopped: {s}\n", .{std.mem.sliceTo(&err_buf, 0)});
+    return Error.EngineOpenFailed;
+}
 
 pub const LlamaEngine = struct {
     allocator: std.mem.Allocator,
@@ -37,8 +80,28 @@ pub const LlamaEngine = struct {
         const path_z = allocator.dupeSentinel(u8, model_path, 0) catch return Error.OutOfMemory;
         errdefer allocator.free(path_z);
 
+        // RPC endpoints as C strings for the shim (bounded by GGML_RPC_MAX_SERVERS).
+        var ep_z: [16][*:0]const u8 = undefined;
+        var ep_owned: [16][:0]u8 = undefined;
+        var n_ep: usize = 0;
+        defer for (ep_owned[0..n_ep]) |e| allocator.free(e);
+        for (opts.rpc_endpoints) |e| {
+            if (n_ep == ep_z.len) break;
+            ep_owned[n_ep] = allocator.dupeSentinel(u8, e, 0) catch return Error.OutOfMemory;
+            ep_z[n_ep] = ep_owned[n_ep].ptr;
+            n_ep += 1;
+        }
+
         var err_buf: [256]u8 = undefined;
-        const raw = ffi.mlx_llama_open(path_z.ptr, opts.n_gpu_layers, &err_buf, err_buf.len);
+        const raw = ffi.mlx_llama_open_ex(
+            path_z.ptr,
+            opts.n_gpu_layers,
+            if (n_ep > 0) &ep_z else null,
+            @intCast(n_ep),
+            if (opts.tensor_split.len > 0) opts.tensor_split.ptr else null,
+            &err_buf,
+            err_buf.len,
+        );
         if (raw == null) {
             log.err("[llama] open failed: {s} (model={s})\n", .{ std.mem.sliceTo(&err_buf, 0), model_path });
             return Error.EngineOpenFailed;
@@ -303,9 +366,9 @@ pub const LlamaEngine = struct {
 /// flag onto ggml types; F16 is the dense default, Q8_0 halves KV bytes,
 /// Q4_0 quarters them. See `mlx_llama_session_create_kv_quant`.
 pub const LlamaKvQuant = enum(u8) {
-    off,    // F16 (default)
-    q8,     // Q8_0 (~2x compression, near-lossless on most archs)
-    q4,     // Q4_0 (~4x compression, some quality impact)
+    off, // F16 (default)
+    q8, // Q8_0 (~2x compression, near-lossless on most archs)
+    q4, // Q4_0 (~4x compression, some quality impact)
 
     pub fn fromString(s: []const u8) ?LlamaKvQuant {
         if (std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "f16") or std.mem.eql(u8, s, "F16")) return .off;
@@ -1080,4 +1143,28 @@ test "llama: sequence state round-trips between sessions (remote prefill interch
     try std.testing.expectError(Error.StateImportFailed, victim.importState(&junk, span));
     try std.testing.expectEqual(@as(i32, 0), victim.pos());
     try std.testing.expectEqual(@as(usize, 0), victim.resident.items.len);
+}
+
+/// Names of the ggml backends actually REGISTERED in this process (after
+/// `llama_backend_init` + the dlopen sweep). "exists on disk" is not "loaded":
+/// a backend whose deps are missing is silently skipped by ggml and the model
+/// runs on whatever is left (windows-plan.md §6.1) — so anything that depends
+/// on a backend asks THIS, never `stat`.
+pub fn backendPresent(name: [:0]const u8) bool {
+    return ffi.mlx_llama_backend_present(name.ptr);
+}
+
+pub fn backendNames(buf: []u8) []const u8 {
+    const n = ffi.mlx_llama_backend_names(buf.ptr, buf.len);
+    return buf[0..@intCast(@max(n, 0))];
+}
+
+test "llama: the RPC backend is LOADED, not merely staged (rpc-offload-plan.md Part 1.1)" {
+    var buf: [512]u8 = undefined;
+    const names = backendNames(&buf);
+    if (!backendPresent("RPC")) {
+        std.debug.print("registered backends: {s}\n", .{names});
+        return error.RpcBackendNotLoaded;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, names, "RPC") != null);
 }

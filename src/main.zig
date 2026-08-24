@@ -14,6 +14,7 @@ const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
 const remote_prefill_client = @import("remote_prefill_client.zig");
+const rpc_offload = @import("rpc_offload.zig");
 const vision_mod = if (@import("build_cfg.zig").mlx_enabled) @import("vision.zig") else @import("vision_stub.zig");
 const build_cfg = @import("build_cfg.zig");
 const platform = @import("platform.zig");
@@ -115,6 +116,14 @@ fn printUsage(io: std.Io) void {
         \\                      that keeps generating never times out, however long it runs.
         \\  --reasoning-budget <n>  Max thinking tokens per request (default: unlimited)
         \\  --no-vision         Disable vision encoder (saves memory)
+        \\  --rpc <host:port[,...]>  Split a GGUF model's layers across ggml RPC
+        \\                      workers (other machines running --rpc-serve). Remote
+        \\                      device memory counts toward the load preflight; an
+        \\                      unreachable worker FAILS the load by name.
+        \\  --tensor-split <w,w,...>  Layer split weights, one per device in
+        \\                      [local GPUs..., --rpc workers...] order (default: by free memory)
+        \\  --rpc-serve <[host:]port>  Also serve this machine's best device (CUDA/Metal)
+        \\                      over ggml RPC for a --rpc consumer; the HTTP server stays up.
         \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
         \\                        refuses a load whose weights + warmup headroom
         \\                        look too big for current free memory. The check
@@ -614,6 +623,22 @@ pub fn main(init: std.process.Init) !void {
             if (comptime build_cfg.mlx_enabled) {
                 if (args[i].len > 0) @import("remote_prefill_mlx.zig").g_remote_model = args[i];
             }
+        } else if (std.mem.eql(u8, args[i], "--rpc") and i + 1 < args.len) {
+            i += 1;
+            // Validated NOW: a typo here is a config error, not a runtime
+            // fallback — this feature has no silent fallback by design.
+            var ep_buf: [rpc_offload.MAX_ENDPOINTS][]const u8 = undefined;
+            _ = rpc_offload.parseEndpoints(args[i], &ep_buf) catch |err| {
+                log.err("--rpc: expected host:port[,host:port...], got '{s}' ({s})\n", .{ args[i], @errorName(err) });
+                std.process.exit(1);
+            };
+            rpc_offload.g_endpoints = args[i];
+        } else if (std.mem.eql(u8, args[i], "--tensor-split") and i + 1 < args.len) {
+            i += 1;
+            rpc_offload.g_tensor_split = args[i]; // checked at load, when the device count is known
+        } else if (std.mem.eql(u8, args[i], "--rpc-serve") and i + 1 < args.len) {
+            i += 1;
+            rpc_offload.g_rpc_serve = args[i];
         } else if (std.mem.eql(u8, args[i], "--lan-name") and i + 1 < args.len) {
             i += 1;
             if (args[i].len > 0) server_mod.g_lan_name = args[i];
@@ -952,6 +977,37 @@ pub fn main(init: std.process.Init) !void {
             log.warn("Listening on {s}:{d} — reachable by every device on the network this machine is on.\n", .{ host, port });
             log.warn("Restrict to this Mac with --host 127.0.0.1 (a future version will make that the default).\n", .{});
         }
+    }
+
+    // `--rpc-serve`: export the best local ggml device over RPC on its own
+    // thread (the accept loop blocks forever) while the HTTP server boots as
+    // usual. Started BEFORE any model load so a consumer can connect while
+    // this box is still loading its own model.
+    if (serve_mode and rpc_offload.g_rpc_serve.len > 0) {
+        var ep_buf: [64]u8 = undefined;
+        const ep = rpc_offload.serveEndpoint(&ep_buf, rpc_offload.g_rpc_serve) catch {
+            log.err("--rpc-serve: expected [host:]port, got '{s}'\n", .{rpc_offload.g_rpc_serve});
+            std.process.exit(1);
+        };
+        if (!llama_arch.backendPresent("RPC")) {
+            log.err("--rpc-serve: the ggml RPC backend is not loaded (is ggml-rpc beside the executable? build with GGML_RPC=ON)\n", .{});
+            std.process.exit(1);
+        }
+        var name_buf: [128]u8 = undefined;
+        const dev = llama_arch.localRpcDevice(&name_buf) orelse {
+            log.err("--rpc-serve: no ggml device to export\n", .{});
+            std.process.exit(1);
+        };
+        const ep_owned = try allocator.dupe(u8, ep);
+        log.info("[rpc-serve] exporting {s} ({s}, {d:.2} GB free / {d:.2} GB) on {s}\n", .{
+            dev.name,
+            if (dev.is_gpu) "GPU" else "CPU",
+            @as(f64, @floatFromInt(dev.mem.free)) / (1024.0 * 1024.0 * 1024.0),
+            @as(f64, @floatFromInt(dev.mem.total)) / (1024.0 * 1024.0 * 1024.0),
+            ep_owned,
+        });
+        const t = try std.Thread.spawn(.{}, rpcServeThreadMain, .{ allocator, ep_owned });
+        t.detach();
     }
 
     // `mlx-serve run` on a TTY: chat REPL on a side thread. It polls
@@ -1458,6 +1514,10 @@ pub fn main(init: std.process.Init) !void {
 const isGgufPath = model_discovery.isGgufModelPath;
 const resolveGgufFile = model_discovery.resolveGgufFile;
 const logResolveGgufError = model_discovery.logResolveGgufError;
+
+fn rpcServeThreadMain(allocator: std.mem.Allocator, endpoint: []const u8) void {
+    llama_arch.serveRpc(allocator, endpoint, null, 0) catch {};
+}
 
 /// Decide which embedded engine serves a `.gguf` file (or dir containing one).
 ///

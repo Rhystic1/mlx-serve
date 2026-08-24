@@ -93,10 +93,10 @@ git clone --depth 1 --branch "$LLAMA_TAG" https://github.com/ggml-org/llama.cpp 
 
 if [ "${LLAMA_CPU_ONLY:-0}" = "1" ]; then
   echo "[build-llama-cuda] configuring (CPU ONLY -- no CUDA backend)"
-  CUDA_ARGS=(-DGGML_CUDA=OFF)
+  CUDA_ARGS=(-DGGML_CUDA=OFF -DGGML_RPC=ON)
 else
   echo "[build-llama-cuda] configuring (CUDA archs: $CUDA_ARCHS)"
-  CUDA_ARGS=(-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS")
+  CUDA_ARGS=(-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" -DGGML_RPC=ON)
 fi
 # $ORIGIN, not the build tree. ELF RUNPATH is NOT inherited by transitive
 # dependencies -- unlike a macOS @rpath, which dyld resolves against the whole
@@ -138,6 +138,15 @@ if [ "${LLAMA_CPU_ONLY:-0}" != "1" ] && ! find "$TMP/build" -name 'libggml-cuda.
   echo "[build-llama-cuda] ERROR: the build produced no libggml-cuda.so." >&2
   echo "  GGML_CUDA=ON did not take. Check that nvcc matches your driver and" >&2
   echo "  that CMake found the CUDA toolkit; do NOT stage this build." >&2
+  exit 1
+fi
+
+# GGML_RPC=ON: layer offload across machines (rpc-offload-plan.md). Same
+# silent-downgrade class as CUDA -- a missing libggml-rpc.so makes --rpc /
+# --rpc-serve fail at RUNTIME by name (the shim asks the registry), but a build
+# that did not produce it must not be staged as if it had.
+if ! find "$TMP/build" -name 'libggml-rpc.so' | grep -q .; then
+  echo "[build-llama-cuda] ERROR: the build produced no libggml-rpc.so (GGML_RPC=ON did not take)." >&2
   exit 1
 fi
 

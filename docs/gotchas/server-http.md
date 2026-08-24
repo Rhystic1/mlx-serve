@@ -1616,3 +1616,55 @@ llama.cpp reports that as `failed to find a memory slot for batch of size
 the RUN step, so an env-var-selected model (`LLAMA_TEST_MODEL`) does not
 invalidate it — run the test binary directly, picking it by embedded test
 name AND newest mtime (two cached binaries can carry the same name).
+
+## Layer offload over ggml RPC: the probe that read "not loaded" as "unreachable" (2026-08-23)
+
+rpc-offload-plan.md Part 1. llama.cpp already has the whole mechanism — a
+worker runs `ggml_backend_rpc_start_server` over its best device and a
+consumer adds `ggml_backend_rpc_add_server(endpoint)`'s device to
+`llama_model_params.devices`; layers then split across devices exactly as
+across two local GPUs. What we build is one binary doing both (`--rpc-serve`
+keeps the HTTP server up beside the RPC accept loop; `--rpc` on the consumer),
+plus the preflight and the refusal rules the plan sets: NO silent fallback.
+
+Three things worth not re-deriving:
+
+1. **ggml-rpc is a dlopen'd backend, so its entry points are reached through
+   the registry's proc table, never linked** (linking `ggml_backend_rpc_*`
+   would make the exe refuse to start on a host whose build has no RPC — the
+   stock `rpc-server` tool does the same). At b10472 that table exposes
+   `ggml_backend_rpc_add_server` and `ggml_backend_rpc_start_server` and NOT
+   `ggml_backend_rpc_get_device_memory`, even though the header declares it.
+   The first probe asked the table for get_device_memory, got NULL, and the
+   scheduler logged `worker unreachable` for a worker that was listening and
+   answering (Python ctypes against the DLL returned 14.8 GB free in the same
+   minute). Reachability now rides `add_server` — the path common.cpp uses —
+   and reads `ggml_backend_dev_memory` off the device it returns.
+2. **Registries are cached per endpoint** (`rpc_reg_for` in the shim): the
+   probe and the open both need one, and adding the same server twice
+   registers its device twice — llama.cpp then sees two "GPUs" that are one
+   card and splits across both.
+3. **"Loaded" is asked of the registry, not the filesystem**
+   (`mlx_llama_backend_present("RPC")`, pinned by the `RPC backend is LOADED`
+   unit test): ggml skips a backend whose deps fail and the model runs on
+   what is left, the same class as the CUDA-runtime trap in build-llama-cuda.sh
+   (which now also refuses to stage a build that produced no libggml-rpc.so).
+
+Preflight (plan step 4): a split load bills `loadRequirementBytes(weights)`
+against local available + every worker's FREE device bytes, refuses by name
+naming both numbers, and refuses an unreachable worker BEFORE
+`llama_model_load` — a model half-resident on a dead peer is the failure this
+feature must not have. `--tensor-split` must carry one weight per device in
+[local GPUs..., workers...] order; llama.cpp zero-fills a short list, and a
+device at weight 0 gets no layers, so a wrong length is a config error.
+
+Measured on loopback (worker and consumer on the SAME 5060 Ti, so this is the
+pure per-boundary hop tax, LFM2.5-2.6B Q4_K_M, 15/31 layers on RPC0): decode
+170 tok/s local → ~108-129 tok/s split, prefill ~3000 → ~1500 tok/s. Coherent
+output; byte-identity is not the bar across backends.
+
+Guards: `src/rpc_offload.zig` (parsing, capacity, refusal text),
+`tests/test_rpc_offload.sh` (RPC_WORKER + RPC_TEST_GGUF gated: dead-endpoint
+refusal by name, layers on RPC0, coherent decode with tok/s). Windows note for
+the shell test: `command -v python3` finds the Microsoft Store alias stub, so
+prefer `python` first.

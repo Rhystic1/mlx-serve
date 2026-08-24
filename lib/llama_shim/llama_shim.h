@@ -199,3 +199,27 @@ int32_t mlx_llama_session_state_set(mlx_llama_session *s, const uint8_t *src, si
 #endif
 
 #endif // MLX_LLAMA_SHIM_H
+
+// ── Backend registry queries + ggml RPC (rpc-offload-plan.md Part 1) ───────
+// "Staged on disk" is not "loaded": ggml skips a backend whose deps fail to
+// resolve and the model silently runs on the rest. These ask the REGISTRY.
+bool    mlx_llama_backend_present(const char *name);                 // e.g. "RPC", "CUDA", "Metal"
+int32_t mlx_llama_backend_names(char *buf, size_t cap);              // comma-joined; returns length
+
+// Open with ggml RPC devices appended after the local GPUs (rpc-offload-plan.md
+// Part 1). `rpc_endpoints` are "host:port"; `tensor_split` (may be NULL) has
+// one weight per device in [local GPUs..., rpc...] order. An UNREACHABLE
+// endpoint is a named failure, never a partial load.
+mlx_llama_engine *mlx_llama_open_ex(const char *gguf_path, int32_t n_gpu_layers,
+                                    const char **rpc_endpoints, int32_t n_rpc,
+                                    const float *tensor_split,
+                                    char *err, size_t errlen);
+// Free/total bytes of the worker's device. false = unreachable (or no RPC backend).
+bool mlx_llama_rpc_device_memory(const char *endpoint, uint64_t *free_out, uint64_t *total_out);
+// The device --rpc-serve would export: 1 = GPU, 0 = CPU, -1 = none.
+int32_t mlx_llama_rpc_local_device(char *name_buf, size_t cap, uint64_t *free_out, uint64_t *total_out);
+// Serve the best local device over ggml RPC. BLOCKS forever on success; returns
+// false only when it could not start (err names why).
+bool mlx_llama_rpc_serve(const char *endpoint, const char *cache_dir, int32_t n_threads, char *err, size_t errlen);
+// Local GPU-class devices (what precedes the RPC devices in the split order).
+int32_t mlx_llama_local_gpu_count(void);

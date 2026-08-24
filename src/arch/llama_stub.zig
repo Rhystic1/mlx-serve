@@ -22,7 +22,27 @@ pub const Error = error{
 
 pub const OpenOptions = struct {
     n_gpu_layers: i32 = 999,
+    rpc_endpoints: []const []const u8 = &.{},
+    tensor_split: []const f32 = &.{},
 };
+
+pub const DeviceMemory = struct { free: u64, total: u64 };
+pub const LocalDevice = struct { name: []const u8, is_gpu: bool, mem: DeviceMemory };
+pub fn rpcDeviceMemory(_: std.mem.Allocator, _: []const u8) ?DeviceMemory {
+    return null;
+}
+pub fn localGpuCount() usize {
+    return 0;
+}
+pub fn localRpcDevice(_: []u8) ?LocalDevice {
+    return null;
+}
+pub fn serveRpc(_: std.mem.Allocator, _: []const u8, _: ?[]const u8, _: i32) Error!void {
+    return Error.EngineOpenFailed;
+}
+pub fn backendPresent(_: [:0]const u8) bool {
+    return false;
+}
 
 pub const ChatTurn = struct { role: []const u8, content: []const u8 };
 

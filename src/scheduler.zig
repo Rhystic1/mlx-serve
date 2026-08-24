@@ -73,6 +73,7 @@ const dflash_mod = if (@import("build_cfg.zig").mlx_enabled) @import("dflash.zig
 const round_cost_mod = @import("round_cost.zig");
 const remote_prefill = @import("remote_prefill.zig");
 const rpc = @import("remote_prefill_client.zig");
+const rpc_offload = @import("rpc_offload.zig");
 const DflashModel = dflash_mod.DflashModel;
 const VisionEncoder = vision_mod.VisionEncoder;
 const Weights = model_mod.Weights;
@@ -2534,7 +2535,64 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
 /// server's memory estimate and `runPrefillLlama` size the session correctly.
 fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     log.info("[llama] opening engine: {s}\n", .{params.llama_path});
-    const engine = try arch_llama.LlamaEngine.open(sch.allocator, params.llama_path, .{});
+
+    // ── ggml RPC layer offload (`--rpc`, rpc-offload-plan.md Part 1). The
+    //    preflight is the plan's step 4: remote FREE device memory counts as
+    //    capacity, an unreachable worker is a named refusal, and the refusal
+    //    quotes both sides. Local GGUF loads have no preflight today (llama.cpp
+    //    mmaps and fails on its own); a split load gets one because a model
+    //    half-resident on a dead peer is the failure this feature must not have.
+    var ep_buf: [rpc_offload.MAX_ENDPOINTS][]const u8 = undefined;
+    var endpoints: []const []const u8 = &.{};
+    var split_buf: [rpc_offload.MAX_ENDPOINTS + 16]f32 = undefined;
+    var split: []const f32 = &.{};
+    if (rpc_offload.g_endpoints.len > 0) {
+        endpoints = rpc_offload.parseEndpoints(rpc_offload.g_endpoints, &ep_buf) catch |err| {
+            log.err("[rpc] --rpc '{s}' is not a host:port list ({s})\n", .{ rpc_offload.g_endpoints, @errorName(err) });
+            return error.RpcConfigInvalid;
+        };
+        var remote_free: u64 = 0;
+        for (endpoints) |ep| {
+            const m = arch_llama.rpcDeviceMemory(sch.allocator, ep) orelse {
+                log.err("[rpc] worker unreachable: {s} — refusing the load (a model half-loaded on a dead peer is worse than none)\n", .{ep});
+                return error.RpcWorkerUnreachable;
+            };
+            log.info("[rpc] worker {s}: {d:.2} GB free / {d:.2} GB total\n", .{ ep, @as(f64, @floatFromInt(m.free)) / (1024.0 * 1024.0 * 1024.0), @as(f64, @floatFromInt(m.total)) / (1024.0 * 1024.0 * 1024.0) });
+            remote_free += m.free;
+        }
+        if (!skip_mem_preflight) {
+            const weights: u64 = if (params.entry.bytes_on_disk) |b| b else 0;
+            const cap = rpc_offload.Capacity{
+                .local_avail = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes()),
+                .remote_free = remote_free,
+                .remote_count = endpoints.len,
+            };
+            const req = loadRequirementBytes(weights);
+            log.info("[preflight] split load: weights ~{d:.2} GB, local {d:.2} GB + remote {d:.2} GB\n", .{
+                @as(f64, @floatFromInt(weights)) / (1024.0 * 1024.0 * 1024.0),
+                @as(f64, @floatFromInt(cap.local_avail)) / (1024.0 * 1024.0 * 1024.0),
+                @as(f64, @floatFromInt(cap.remote_free)) / (1024.0 * 1024.0 * 1024.0),
+            });
+            if (rpc_offload.insufficient(req, cap)) {
+                var msg: [512]u8 = undefined;
+                log.err("{s}\n", .{rpc_offload.refusalMessage(&msg, req, weights, cap)});
+                return error.InsufficientMemory;
+            }
+        }
+        if (rpc_offload.g_tensor_split.len > 0) {
+            const n_dev = arch_llama.localGpuCount() + endpoints.len;
+            split = rpc_offload.parseTensorSplit(rpc_offload.g_tensor_split, n_dev, &split_buf) catch |err| {
+                log.err("[rpc] --tensor-split '{s}' must list exactly {d} non-negative weights ({d} local GPU(s) + {d} worker(s)); got {s}\n", .{ rpc_offload.g_tensor_split, n_dev, arch_llama.localGpuCount(), endpoints.len, @errorName(err) });
+                return error.RpcConfigInvalid;
+            };
+        }
+        log.info("[rpc] offloading layers across {d} worker(s): {s}{s}\n", .{ endpoints.len, rpc_offload.g_endpoints, if (split.len > 0) " (explicit --tensor-split)" else " (split by free memory)" });
+    }
+
+    const engine = try arch_llama.LlamaEngine.open(sch.allocator, params.llama_path, .{
+        .rpc_endpoints = endpoints,
+        .tensor_split = split,
+    });
     errdefer engine.close();
     log.info("[llama] engine ready (EOS={d}, n_vocab={d})\n", .{ engine.eosToken(), engine.nVocab() });
 

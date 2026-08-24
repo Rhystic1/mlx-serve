@@ -92,3 +92,18 @@ with a hermetic test, per the html_console_test.mjs pattern.
 
 MLX-side anything (m4max owns MLX KV import separately). Windows/Linux MLX.
 Speed: this buys capacity; the split model runs at the slowest stage's pace.
+
+## Part 1 status (2026-08-23, windows-x64)
+
+Steps 1-4 shipped and proven on a loopback pair on the Windows box (worker
+and consumer on the same 5060 Ti): `--rpc-serve`, `--rpc`, `--tensor-split`,
+the preflight (remote free counts as capacity, refusal names both sides), and
+the no-silent-fallback rule (dead endpoint = named load failure). Build:
+GGML_RPC=ON + a libggml-rpc.so stage check in build-llama-cuda.sh; the
+Windows release zip already ships ggml-rpc.dll. Measured hop tax (step 6,
+LFM2.5-2.6B Q4, one boundary, loopback): decode 170 → ~125 tok/s, prefill
+~3000 → ~1500 tok/s. Story: docs/gotchas/server-http.md.
+
+Open, needs the Mac: step 5 (a model that fits neither box; the Mac must have
+RPC in its XCFramework — `zig build test -Dtest-filter="RPC backend is
+LOADED"` answers that) and the cross-machine numbers.

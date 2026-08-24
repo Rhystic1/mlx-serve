@@ -100,3 +100,19 @@ pub extern fn mlx_llama_session_pos(s: *Session) i32;
 pub extern fn mlx_llama_session_state_size(s: *Session) usize;
 pub extern fn mlx_llama_session_state_get(s: *Session, dst: [*]u8, cap: usize) usize;
 pub extern fn mlx_llama_session_state_set(s: *Session, src: [*]const u8, n: usize, n_tokens: i32, err: ?[*]u8, errlen: usize) i32;
+
+pub extern fn mlx_llama_backend_present(name: [*:0]const u8) bool;
+pub extern fn mlx_llama_backend_names(buf: [*]u8, cap: usize) i32;
+pub extern fn mlx_llama_open_ex(
+    gguf_path: [*:0]const u8,
+    n_gpu_layers: i32,
+    rpc_endpoints: ?[*]const [*:0]const u8,
+    n_rpc: i32,
+    tensor_split: ?[*]const f32,
+    err: ?[*]u8,
+    errlen: usize,
+) ?*Engine;
+pub extern fn mlx_llama_rpc_device_memory(endpoint: [*:0]const u8, free_out: ?*u64, total_out: ?*u64) bool;
+pub extern fn mlx_llama_rpc_local_device(name_buf: ?[*]u8, cap: usize, free_out: ?*u64, total_out: ?*u64) i32;
+pub extern fn mlx_llama_rpc_serve(endpoint: [*:0]const u8, cache_dir: ?[*:0]const u8, n_threads: i32, err: ?[*]u8, errlen: usize) bool;
+pub extern fn mlx_llama_local_gpu_count() i32;
