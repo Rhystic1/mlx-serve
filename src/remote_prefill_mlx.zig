@@ -27,6 +27,139 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
 const transformer = @import("transformer.zig");
+const rpc = @import("remote_prefill_client.zig");
+const proto = @import("remote_prefill.zig");
+const net = @import("lan_net.zig");
+const log = @import("log.zig");
+
+/// Worker model id to request when it differs from the local MLX pack's id
+/// (it always does: the worker serves a GGUF, e.g. "gemma-4-12b-it-Q4_K_M",
+/// the consumer an MLX pack, "gemma-4-12B-it-qat-4bit"). Borrowed from argv
+/// like `--api-key`. Null ⇒ request under the local id (only correct when the
+/// worker happens to serve the same id). Set by `--remote-prefill-model`.
+pub var g_remote_model: ?[]const u8 = null;
+
+pub fn kvDecodable(kv_type: []const u8) bool {
+    return std.mem.eql(u8, kv_type, "f16") or
+        std.mem.eql(u8, kv_type, "bf16") or
+        std.mem.eql(u8, kv_type, "q8_0");
+}
+
+pub const FetchOutcome = union(enum) {
+    blob: []u8,
+    fell_back: []const u8,
+};
+
+/// The MLX cross-engine exchange. Mirrors the GGUF client's socket loop but
+/// validates with `validateResponseMlx` (no byte-identity, any decodable KV
+/// type). Never fails: every problem is a `.fell_back` reason to log, and the
+/// caller cold-prefills locally.
+pub fn fetchMlx(
+    allocator: std.mem.Allocator,
+    base_url: []const u8,
+    remote_model: []const u8,
+    tokens: []const i32,
+    vocab: u32,
+    timeout_ms: i32,
+) FetchOutcome {
+    var url_buf: [1024]u8 = undefined;
+    const url = rpc.endpointUrl(&url_buf, base_url) orelse return .{ .fell_back = "unusable --remote-prefill URL" };
+    const ep = rpc.parseUrl(url) orelse return .{ .fell_back = "unusable --remote-prefill URL" };
+    if (ep.tls) return .{ .fell_back = "https worker not supported" };
+    const ip4 = rpc.parseDottedQuad(ep.host) orelse return .{ .fell_back = "worker host is not a dotted-quad IP" };
+
+    const body = rpc.buildRequestBody(allocator, remote_model, tokens) catch return .{ .fell_back = "prompt too large" };
+    defer allocator.free(body);
+    var head_buf: [512]u8 = undefined;
+    const head = rpc.buildRequestHead(&head_buf, ep, body.len) catch return .{ .fell_back = "unusable --remote-prefill URL" };
+
+    const s = net.connectTimeout(ip4, ep.port, timeout_ms) catch return .{ .fell_back = "worker connect failed" };
+    defer net.close(s);
+    net.writeAll(s, head) catch return .{ .fell_back = "worker connect failed" };
+    net.writeAll(s, body) catch return .{ .fell_back = "worker connect failed" };
+
+    var resp: std.ArrayList(u8) = .empty;
+    defer resp.deinit(allocator);
+    var chunk: [64 * 1024]u8 = undefined;
+    var declared: ?usize = null;
+    while (true) {
+        if (!net.waitReadable(s, timeout_ms)) return .{ .fell_back = "worker timed out" };
+        const n = net.read(s, &chunk) catch {
+            if (resp.items.len == 0) return .{ .fell_back = "worker read failed" };
+            break;
+        };
+        if (n == 0) break;
+        resp.appendSlice(allocator, chunk[0..n]) catch return .{ .fell_back = "blob too large" };
+        if (declared == null) {
+            if (rpc.splitResponse(resp.items)) |sp| {
+                if (rpc.readHeaders(sp.head).bytes) |b| {
+                    const want = std.fmt.parseInt(usize, std.mem.trim(u8, b, " \t"), 10) catch 0;
+                    if (want > rpc.MAX_BLOB_BYTES) return .{ .fell_back = "blob too large" };
+                    if (want > 0) declared = want;
+                }
+            }
+        }
+        if (declared) |want| {
+            if (rpc.splitResponse(resp.items)) |sp| if (sp.body.len >= want) break;
+        }
+    }
+
+    const sp = rpc.splitResponse(resp.items) orelse return .{ .fell_back = "worker response truncated" };
+    if (sp.status != 200) return .{ .fell_back = "worker returned an error status" };
+    const h = rpc.readHeaders(sp.head);
+    const decodable = if (h.kv_type) |k| kvDecodable(k) else false;
+    const exp = proto.Expected{ .model = remote_model, .n_tokens = tokens.len, .vocab = vocab, .model_bytes = 0, .body_len = sp.body.len };
+    if (proto.validateResponseMlx(h, exp, decodable)) |why| return .{ .fell_back = why };
+
+    const owned = allocator.dupe(u8, sp.body) catch return .{ .fell_back = "blob too large" };
+    return .{ .blob = owned };
+}
+
+/// One-shot MLX remote prefill: fetch, parse, import into `cache`. Returns the
+/// number of tokens now resident (N-1, the worker's contract) on success, or 0
+/// on any fallback (caller cold-prefills). Logs one line either way, matching
+/// the GGUF path's `[remote-prefill]` convention.
+pub fn tryImport(
+    allocator: std.mem.Allocator,
+    cache: *transformer.KVCache,
+    cfg: *const model_mod.ModelConfig,
+    base_url: []const u8,
+    remote_model: []const u8,
+    prompt: []const u32,
+    vocab: u32,
+    s: mlx.mlx_stream,
+) usize {
+    if (prompt.len < 2) return 0;
+    // N-1 contract: the worker prefills all but the last token, so the
+    // consumer decodes exactly the last one (the blob carries no logits).
+    const n = prompt.len - 1;
+    const i32_toks = allocator.alloc(i32, n) catch return 0;
+    defer allocator.free(i32_toks);
+    for (prompt[0..n], i32_toks) |t, *o| o.* = @intCast(t);
+
+    const outcome = fetchMlx(allocator, base_url, remote_model, i32_toks, vocab, rpc.DEFAULT_TIMEOUT_MS);
+    switch (outcome) {
+        .fell_back => |why| {
+            log.info("[remote-prefill] fell back: {s}\n", .{why});
+            return 0;
+        },
+        .blob => |blob| {
+            defer allocator.free(blob);
+            var parsed = parseBlob(allocator, blob, Layout.fromConfig(cfg)) catch |err| {
+                log.info("[remote-prefill] fell back: blob parse {s}\n", .{@errorName(err)});
+                return 0;
+            };
+            defer parsed.deinit();
+            importIntoCache(allocator, cache, cfg, &parsed, n, s) catch |err| {
+                log.info("[remote-prefill] fell back: import {s}\n", .{@errorName(err)});
+                cache.truncate(0, s) catch {};
+                return 0;
+            };
+            log.info("[remote-prefill] engaged {d} tokens (MLX import)\n", .{n});
+            return n;
+        },
+    }
+}
 
 pub const GGML_F16: i32 = 1;
 pub const GGML_Q8_0: i32 = 8;
@@ -34,6 +167,10 @@ pub const GGML_BF16: i32 = 30;
 
 pub const Q8_BLOCK: usize = 32;
 pub const Q8_BLOCK_BYTES: usize = 34;
+
+/// Below this the fixed-window blob (~178 MB q8) never pays; the operator can
+/// still tune with the same reuse-gated calibration the GGUF path uses.
+pub const MIN_MLX_TOKENS: usize = 256;
 
 pub const Error = error{
     Truncated,

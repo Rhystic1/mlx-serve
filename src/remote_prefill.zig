@@ -192,6 +192,41 @@ fn parseU64(s: []const u8) ?u64 {
     return std.fmt.parseInt(u64, std.mem.trim(u8, s, " \t"), 10) catch null;
 }
 
+/// Validation for an MLX consumer (v2 cross-engine path). The worker is a GGUF
+/// on llama.cpp; the consumer decodes on an MLX pack. Two of the GGUF checks
+/// CANNOT hold across engines and are deliberately dropped:
+///   - model file bytes: the MLX pack is not one GGUF file, so there is no
+///     size to match. The operator asserts base-model identity by configuring
+///     the remote id (`--remote-prefill-model`); shape is still enforced when
+///     the blob is parsed (layer count + row width), and a wrong model fails
+///     there rather than restoring garbage.
+///   - KV type equality: the MLX cache is bf16/quantized on its own terms and
+///     dequantizes the blob's rows, so any decodable worker type (f16, bf16,
+///     q8_0) is fine — equality would refuse every real worker.
+/// Everything that DOES cross unchanged is still checked: protocol version,
+/// the model id we asked for echoed back, token count, and vocab (a different
+/// base model has a different vocab, the cheapest real mismatch tripwire).
+pub fn validateResponseMlx(h: ResponseHeaders, e: Expected, decodable_kv: bool) ?[]const u8 {
+    const ver = h.version orelse return "missing " ++ H_VERSION;
+    if (parseU64(ver) != VERSION) return "unsupported " ++ H_VERSION;
+    const model = h.model orelse return "missing " ++ H_MODEL;
+    if (!std.mem.eql(u8, model, e.model)) return "model id mismatch";
+    const toks = h.tokens orelse return "missing " ++ H_TOKENS;
+    if (parseU64(toks) != e.n_tokens) return "token count mismatch";
+    const bytes = h.bytes orelse return "missing " ++ H_BYTES;
+    if (parseU64(bytes) != e.body_len) return "blob length mismatch";
+    const vocab = h.vocab orelse return "missing " ++ H_VOCAB;
+    if (parseU64(vocab) != e.vocab) return "vocab size mismatch";
+    const kv = h.kv_type orelse return "missing " ++ H_KV_TYPE;
+    if (std.mem.eql(u8, kv, "unknown")) return "worker reported an unknown KV cache type";
+    if (!decodable_kv) return "worker KV cache type not decodable by the MLX importer";
+    const swa = h.swa orelse return "missing " ++ H_SWA;
+    const swa_known = std.mem.eql(u8, swa, SWA_FULL_NAME) or std.mem.eql(u8, swa, SWA_WINDOWED_NAME);
+    if (!swa_known) return "unrecognized sliding-window mode";
+    if (e.body_len == 0) return "empty blob";
+    return null;
+}
+
 /// Format the eight reply headers (server side). Lines end in CRLF, ready to
 /// be spliced into a response head. `kv_type` / `swa` are the NAMES from
 /// `arch/llama.zig` (`kvTypeName`, `swaModeName`).

@@ -605,6 +605,15 @@ pub fn main(init: std.process.Init) !void {
             // error: the client refuses it at request time and prefills
             // locally, so a typo costs a log line, never a failed request.
             if (args[i].len > 0) remote_prefill_client.g_remote_prefill_url = args[i];
+        } else if (std.mem.eql(u8, args[i], "--remote-prefill-model") and i + 1 < args.len) {
+            i += 1;
+            // The worker's model id, for the MLX cross-engine path where the
+            // GGUF worker id differs from the local pack id. The importer only
+            // exists in MLX builds; on a GGUF-only build the flag is accepted
+            // and ignored (comptime-dead branch, so the module never imports).
+            if (comptime build_cfg.mlx_enabled) {
+                if (args[i].len > 0) @import("remote_prefill_mlx.zig").g_remote_model = args[i];
+            }
         } else if (std.mem.eql(u8, args[i], "--lan-name") and i + 1 < args.len) {
             i += 1;
             if (args[i].len > 0) server_mod.g_lan_name = args[i];

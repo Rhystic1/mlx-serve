@@ -36,6 +36,7 @@ const builtin = @import("builtin");
 const platform = @import("platform.zig");
 const mlx = if (@import("build_cfg.zig").mlx_enabled) @import("mlx.zig") else @import("mlx_stub.zig");
 const transformer_mod = if (@import("build_cfg.zig").mlx_enabled) @import("transformer.zig") else @import("transformer_stub.zig");
+const remote_prefill_mlx = if (@import("build_cfg.zig").mlx_enabled) @import("remote_prefill_mlx.zig") else struct {};
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = if (@import("build_cfg.zig").mlx_enabled) @import("generate.zig") else @import("generate_stub.zig");
 const gen_mod = if (@import("build_cfg.zig").mlx_enabled) @import("gen.zig") else @import("gen_stub.zig");
@@ -5422,6 +5423,47 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // slot's LoadedModel. Both stay resident for the slot's lifetime
     // because the conn thread holds a refcount on slot.model.
     const xfm_ptr: *Transformer = slot.model.transformer.?;
+
+    // Remote prefill for an MLX pack (v2, cross-engine): a GGUF worker on a
+    // faster backend prefills the SAME base model and ships its KV state, which
+    // `remote_prefill_mlx` decodes into this slot's MLX cache. Only fires for
+    // gemma-4 (the one importer arch), non-vision, no local reuse claim, and
+    // only when `--remote-prefill` is set. Any failure imports nothing and the
+    // cold prefill below runs unchanged. Skips the hot cache when it engages —
+    // the two both fill the cache from position 0 and are mutually exclusive.
+    var remote_mlx_matched: u32 = 0;
+    if (rpc.g_remote_prefill_url) |url| {
+        if (slot.vision_embeddings == null and xfm_ptr.config.isGemma4Layers() and
+            slot.full_prompt.len > remote_prefill_mlx.MIN_MLX_TOKENS and
+            slot.model.remote_prefill_cal.shouldTry())
+        {
+            const remote_model = remote_prefill_mlx.g_remote_model orelse slot.model.id;
+            const rt_start = std.Io.Timestamp.now(sch.io, .boot);
+            const n = remote_prefill_mlx.tryImport(
+                slot.allocator,
+                &slot.cache,
+                &xfm_ptr.config,
+                url,
+                remote_model,
+                slot.full_prompt,
+                @intCast(xfm_ptr.config.vocab_size),
+                xfm_ptr.s,
+            );
+            if (n > 0) {
+                const rt_ms: f64 = @floatFromInt(@divTrunc(std.Io.Timestamp.now(sch.io, .boot).nanoseconds - rt_start.nanoseconds, std.time.ns_per_ms));
+                slot.model.remote_prefill_cal.observeRemote(rt_ms, slot.full_prompt.len);
+                remote_mlx_matched = @intCast(n);
+                hot_matched = @intCast(n);
+                prefill_tokens = slot.full_prompt[n..];
+                slot.remote_prefilled = true;
+                slot.remote_prefill_tokens = @intCast(n);
+            } else {
+                slot.model.remote_prefill_cal.observeFailure();
+            }
+        }
+    }
+
+    if (remote_mlx_matched == 0) {
     if (slot.model.prefix_cache) |*hc| {
         if (slot.vision_embeddings == null) {
             // Only build a restore target when this request will actually
@@ -5479,6 +5521,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 mtp_target = null;
             }
         }
+    }
     }
 
     // Phase 1 (perf-plan): forward the SSM-checkpoint stride from the
