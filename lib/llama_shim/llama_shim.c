@@ -392,6 +392,7 @@ mlx_llama_session *mlx_llama_session_create_ex(mlx_llama_engine *e,
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     } else if (e->rpc_with_metal) {
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        fprintf(stderr, "[llama-shim] metal+rpc split: flash-attention forced OFF (ggml-org/llama.cpp#16657 workaround)\n");
     }
     if (type_k != 0) cp.type_k = (enum ggml_type)type_k;
     if (type_v != 0) cp.type_v = (enum ggml_type)type_v;
