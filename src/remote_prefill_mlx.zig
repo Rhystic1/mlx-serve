@@ -180,7 +180,15 @@ pub const Error = error{
     LayerCountMismatch,
     RowSizeMismatch,
     NoCells,
+    BadMagic,
+    GeometryMismatch,
 };
+
+/// llama.cpp b10472 writes an 8-byte preamble before the first cache in a
+/// `llama_state_seq_get_data` blob: a constant magic then a zero u32. It is
+/// written ONCE, not per-cache (the swa cache follows the base cache with no
+/// preamble of its own). Mapped empirically from a live worker blob.
+pub const STATE_MAGIC: u32 = 0xaf143cd8;
 
 /// What the consumer model expects the blob to be shaped like.
 pub const Layout = struct {
@@ -268,7 +276,12 @@ pub fn rowBytes(ggml_type: i32, n_elems: usize) Error!usize {
     };
 }
 
-fn parseBlock(allocator: std.mem.Allocator, r: *Reader, n_layer_expect: u32, row_elems: usize) (Error || std.mem.Allocator.Error)!Block {
+/// Row width (in ELEMENTS) is READ from the blob, not computed — llama.cpp's
+/// per-layer K/V geometry is the authority, and it can differ from the MLX
+/// cache's (gemma-4: llama.cpp stores global K at 512 elems, sliding at 2048;
+/// the MLX pack stores its own per-layer head_dim x n_kv_heads). Whether the
+/// two AGREE is a decode-correctness question checked at import time, not here.
+fn parseBlock(allocator: std.mem.Allocator, r: *Reader, n_layer_expect: u32) (Error || std.mem.Allocator.Error)!Block {
     const n_stream = try r.u32le();
     if (n_stream != 1) return error.MultiStream;
     const cell_count = try r.u32le();
@@ -295,22 +308,34 @@ fn parseBlock(allocator: std.mem.Allocator, r: *Reader, n_layer_expect: u32, row
         for (rows) |*rw| {
             const t = try r.i32le();
             const row_size: usize = @intCast(try r.u64le());
-            if (row_size != try rowBytes(t, row_elems)) return error.RowSizeMismatch;
+            if (t != GGML_F16 and t != GGML_BF16 and t != GGML_Q8_0) return error.UnsupportedType;
             rw.* = .{ .ggml_type = t, .row_size = row_size, .data = try r.take(row_size * cell_count) };
         }
     }
     return .{ .positions = positions, .keys = keys, .values = values };
 }
 
+/// Elements per row for a stored K/V row of the given ggml type.
+pub fn rowElems(ggml_type: i32, row_size: usize) Error!usize {
+    return switch (ggml_type) {
+        GGML_F16, GGML_BF16 => row_size / 2,
+        GGML_Q8_0 => (row_size / Q8_BLOCK_BYTES) * Q8_BLOCK,
+        else => error.UnsupportedType,
+    };
+}
+
 pub fn parseBlob(allocator: std.mem.Allocator, blob: []const u8, layout: Layout) (Error || std.mem.Allocator.Error)!Parsed {
     var r = Reader{ .buf = blob };
-    var global = try parseBlock(allocator, &r, layout.n_global, @as(usize, layout.n_kv_heads) * layout.global_hd);
+    // 8-byte preamble, once, before the base cache.
+    if ((try r.u32le()) != STATE_MAGIC) return error.BadMagic;
+    _ = try r.u32le();
+    var global = try parseBlock(allocator, &r, layout.n_global);
     errdefer {
         allocator.free(global.positions);
         allocator.free(global.keys);
         allocator.free(global.values);
     }
-    const sliding = try parseBlock(allocator, &r, layout.n_sliding, @as(usize, layout.n_kv_heads) * layout.sliding_hd);
+    const sliding = try parseBlock(allocator, &r, layout.n_sliding);
     _ = &global;
     return .{ .global = global, .sliding = sliding, .allocator = allocator };
 }
@@ -385,6 +410,14 @@ pub fn importIntoCache(
         const idx = if (is_global) gi else si;
         if (is_global) gi += 1 else si += 1;
 
+        // The blob's stored row width must equal what THIS MLX layer's cache
+        // expects (n_kv_heads x head_dim). gemma-4's llama.cpp geometry differs
+        // from the MLX pack's, so this refuses cleanly (→ local fallback)
+        // rather than reshaping mismatched data into garbage. A correct import
+        // for a divergent arch needs a per-layer transform, not a raw copy.
+        const blob_elems = try rowElems(block.keys[idx].ggml_type, block.keys[idx].row_size);
+        if (blob_elems != row_elems) return error.GeometryMismatch;
+
         const k = try hostToKv(buf[0..need], block.*, idx, .k, n_tokens, H, hd, s);
         defer _ = mlx.mlx_array_free(k);
         const v = try hostToKv(buf[0..need], block.*, idx, .v, n_tokens, H, hd, s);
@@ -426,6 +459,11 @@ const TestWriter = struct {
     fn u64le(self: *TestWriter, v: u64) !void {
         try self.list.appendSlice(testing.allocator, std.mem.asBytes(&std.mem.nativeToLittle(u64, v)));
     }
+    /// The 8-byte preamble llama.cpp writes once before the base cache.
+    fn preamble(self: *TestWriter) !void {
+        try self.u32le(STATE_MAGIC);
+        try self.u32le(0);
+    }
     /// One cache block in llama.cpp's own order: meta, then all K, then all V.
     fn block(self: *TestWriter, positions: []const i32, n_layer: u32, ggml_type: i32, row_size: usize, fill: u8) !void {
         try self.u32le(1);
@@ -453,6 +491,7 @@ test "remote-prefill mlx: parses a two-block blob and places cells by position" 
     const layout = Layout{ .n_global = 1, .n_sliding = 2, .n_kv_heads = 2, .global_hd = 4, .sliding_hd = 2 };
     var w = TestWriter{ .list = .empty };
     defer w.list.deinit(testing.allocator);
+    try w.preamble();
     // Global block: all 5 positions, f16 rows of 2*4 = 8 elems = 16 bytes.
     try w.block(&[_]i32{ 0, 1, 2, 3, 4 }, 1, GGML_F16, 16, 0);
     // Sliding block: only the window tail, in a scrambled cell order.
@@ -492,7 +531,20 @@ test "remote-prefill mlx: q8_0 rows dequantize as d * q" {
     try decodeRow(GGML_Q8_0, &row, &out);
     try testing.expectEqual(@as(f32, -64), out[0]);
     try testing.expectEqual(@as(f32, -48.5), out[31]);
-    try testing.expectEqual(@as(usize, 34), try rowBytes(GGML_Q8_0, 32));
-    try testing.expectError(error.RowSizeMismatch, rowBytes(GGML_Q8_0, 33));
-    try testing.expectError(error.UnsupportedType, rowBytes(2, 32));
+    // Row width is READ from the blob: 34 bytes q8_0 → 32 elems, 2048 bytes
+    // f16 → 1024 elems. This is what lets the importer detect a geometry that
+    // does not match the MLX cache and refuse cleanly.
+    try testing.expectEqual(@as(usize, 32), try rowElems(GGML_Q8_0, 34));
+    try testing.expectEqual(@as(usize, 1024), try rowElems(GGML_F16, 2048));
+    try testing.expectError(error.UnsupportedType, rowElems(2, 32));
+}
+
+test "remote-prefill mlx: a bad magic is refused, not misparsed" {
+    const layout = Layout{ .n_global = 1, .n_sliding = 1, .n_kv_heads = 2, .global_hd = 4, .sliding_hd = 4 };
+    var w = TestWriter{ .list = .empty };
+    defer w.list.deinit(testing.allocator);
+    try w.u32le(0xdeadbeef); // wrong magic
+    try w.u32le(0);
+    try w.block(&[_]i32{0}, 1, GGML_F16, 16, 0);
+    try testing.expectError(error.BadMagic, parseBlob(testing.allocator, w.list.items, layout));
 }
