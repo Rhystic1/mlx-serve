@@ -287,6 +287,26 @@ mlx_llama_engine *mlx_llama_open_ex(const char *gguf_path, int32_t n_gpu_layers,
     // being fully active (device MTL0, kernels compiled), silently defeating
     // this whole gate. Device names ("MTL0") were the tell.
     e->rpc_with_metal = (n_rpc > 0) && (ggml_backend_reg_by_name("MTL") != NULL);
+    // A sliding-window-attention checkpoint (gemma-3/4, gpt-oss) split over
+    // RPC from a Metal host corrupts decode into degenerate repeats --
+    // isolated live (m4max, 2026-08-24) across FOUR combinations: Metal+CUDA
+    // network RPC, Metal+CPU LOCAL RPC (no network, no CUDA), each with FA
+    // forced off. All four corrupted. The SAME rig with a non-SWA checkpoint
+    // (Qwen2.5-0.5B) over the identical Metal+CPU-RPC split decoded cleanly.
+    // So the fault tracks the SWA KV/mask path crossing the RPC device
+    // boundary, not the worker backend, the network, or flash-attention --
+    // FA-off (above) fixes a DIFFERENT bug (upstream #16657, Metal<->Metal)
+    // and does nothing for this one. There is no known workaround, so this
+    // is a load-time refusal rather than a silent corrupting load.
+    if (e->rpc_with_metal && llama_model_n_swa(model) > 0) {
+        llama_model_free(model);
+        free(e);
+        copy_err(err, errlen,
+            "sliding-window-attention models (gemma-3/4, gpt-oss, ...) cannot split over RPC from a Metal host: "
+            "llama.cpp corrupts decode across the Metal<->RPC boundary for SWA archs regardless of worker backend "
+            "(no known upstream fix as of b10472). Drop --rpc for this model, or run it Metal-only.");
+        return NULL;
+    }
     return e;
 }
 

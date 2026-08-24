@@ -4129,3 +4129,37 @@ real, confirmed, upstream-cited bug (#16657) for the Metal↔Metal case, costs
 nothing when RPC isn't in play, and is a strict safety improvement even if it
 turns out to be one of two required fixes for the Metal↔CUDA case rather than
 the whole fix.
+
+### Update (same day, again): isolated to SWA specifically, not FA/CUDA/network — load-time refusal added
+
+m4max ran the isolation this doc's previous update called for, entirely on
+the Mac: built upstream's `ggml-rpc-server` from the b10472 tree (target name
+is `ggml-rpc-server`, not `rpc-server`) and ran it CPU-only (`-d CPU`,
+`127.0.0.1`, no network, no CUDA) against a Metal-host consumer. Full matrix:
+
+| model | worker | result |
+|---|---|---|
+| gemma-4 (SWA) | CUDA, network | garbage |
+| gemma-4 (SWA) | CPU, local loopback | garbage |
+| gemma-4 (SWA) | none (Metal-only) | coherent |
+| Qwen2.5-0.5B (non-SWA) | CPU, local loopback, same split | coherent |
+
+FA was confirmed off in the SWA runs (the fix above engaged) and it made no
+difference. That rules out CUDA, the network, and flash-attention as the
+cause, and narrows it to exactly one property: whether the checkpoint has
+sliding-window-attention layers. Every SWA arch corrupts across a Metal+RPC
+boundary; every non-SWA arch (what the project's actual target models —
+DeepSeek-V4 MLA, Qwen3.8 full attention — are) splits cleanly.
+
+There is no known workaround for this one (unlike the FA case above), so
+`mlx_llama_open_ex` now refuses the load outright when `rpc_with_metal` is
+true and `llama_model_n_swa(model) > 0`: frees the model, returns NULL with a
+named error, before any session or decode work happens. This is a hard stop,
+not a warning — the alternative is a model that loads, answers a few tokens,
+and then silently degenerates, which is worse than a refusal at boot.
+
+Not yet done: filing this upstream (distinct from #16657, which is the
+Metal↔Metal FA bug — this is SWA-specific and reproduces with FA off). Also
+not yet tried: a newer llama.cpp pin, in case this has been fixed since
+b10472 — if a future bump clears it, the fix is to add a version gate to the
+refusal above, not just delete it, since older builds still need it.
