@@ -245,19 +245,24 @@ jobs:
           [ -f "$WEBP_LIB/libwebp.dylib" ] && cp "$WEBP_LIB/libwebp.dylib" "$STAGING/lib/"
           [ -f "$WEBP_LIB/libsharpyuv.dylib" ] && cp "$WEBP_LIB/libsharpyuv.dylib" "$STAGING/lib/"
 
-          # libllama (llama.cpp GGUF engine) — single self-contained dylib staged
-          # by scripts/fetch-llama.sh, install-name @rpath/libllama.dylib.
-          [ -f "lib/llama/lib/libllama.dylib" ] && cp "lib/llama/lib/libllama.dylib" "$STAGING/lib/"
+          # libllama (llama.cpp GGUF engine) + any libggml*.dylib beside it
+          # (separated staging from scripts/build-llama-macos.sh -- ggml dlopens
+          # its backends by filename from libggml's dir, so the set ships whole).
+          for f in lib/llama/lib/*.dylib; do [ -f "$f" ] && cp "$f" "$STAGING/lib/"; done
 
           install_name_tool -change \
             @rpath/libmlxc.dylib \
             @executable_path/lib/libmlxc.dylib \
             "$STAGING/mlx-serve"
 
-          install_name_tool -change \
-            @rpath/libllama.dylib \
-            @executable_path/lib/libllama.dylib \
-            "$STAGING/mlx-serve" 2>/dev/null || true
+          for name in libllama libggml libggml-base; do
+            install_name_tool -change \
+              @rpath/$name.dylib \
+              @executable_path/lib/$name.dylib \
+              "$STAGING/mlx-serve" 2>/dev/null || true
+          done
+          # Sibling deps inside the dylibs stay @rpath; give the CLI an rpath to lib/.
+          install_name_tool -add_rpath @executable_path/lib "$STAGING/mlx-serve" 2>/dev/null || true
 
           install_name_tool -change \
             @rpath/libmlx.dylib \
@@ -373,9 +378,9 @@ jobs:
           [ -f "$WEBP_LIB/libwebp.dylib" ] && cp "$WEBP_LIB/libwebp.dylib" "$CONTENTS/Frameworks/"
           [ -f "$WEBP_LIB/libsharpyuv.dylib" ] && cp "$WEBP_LIB/libsharpyuv.dylib" "$CONTENTS/Frameworks/"
 
-          # libllama (llama.cpp GGUF engine) — single self-contained dylib staged
-          # by scripts/fetch-llama.sh, install-name @rpath/libllama.dylib.
-          [ -f "lib/llama/lib/libllama.dylib" ] && cp "lib/llama/lib/libllama.dylib" "$CONTENTS/Frameworks/"
+          # libllama (llama.cpp GGUF engine) + any libggml*.dylib beside it
+          # (separated staging from scripts/build-llama-macos.sh). Mirrors app/build.sh.
+          for f in lib/llama/lib/*.dylib; do [ -f "$f" ] && cp "$f" "$CONTENTS/Frameworks/"; done
 
           # YbridOpus + YbridOgg dynamic frameworks (libopus/libogg) pulled by the
           # SwiftOGG SPM dep — VoicePreprocessor uses them to decode Telegram
@@ -402,10 +407,12 @@ jobs:
             "@executable_path/../Frameworks/libmlxc.dylib" \
             "$CONTENTS/MacOS/mlx-serve" 2>/dev/null || true
 
-          install_name_tool -change \
-            @rpath/libllama.dylib \
-            "@executable_path/../Frameworks/libllama.dylib" \
-            "$CONTENTS/MacOS/mlx-serve" 2>/dev/null || true
+          for name in libllama libggml libggml-base; do
+            install_name_tool -change \
+              @rpath/$name.dylib \
+              "@executable_path/../Frameworks/$name.dylib" \
+              "$CONTENTS/MacOS/mlx-serve" 2>/dev/null || true
+          done
 
           install_name_tool -change \
             "$(otool -L "$CONTENTS/Frameworks/libmlxc.dylib" | grep libmlx.dylib | head -1 | awk '{print $1}')" \

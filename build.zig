@@ -586,6 +586,16 @@ fn addLlamaLib(b: *std.Build, module: *std.Build.Module, os_tag: std.Target.Os.T
             // would otherwise hijack this link (pulling in /opt/homebrew's version + its
             // separate libggml). We want exactly the pinned dylib staged in lib/llama/lib.
             module.linkSystemLibrary("llama", .{ .use_pkg_config = .no });
+            // Two stagings share this path. fetch-llama.sh's XCFramework is ONE
+            // merged dylib (ggml inside). scripts/build-llama-macos.sh (Metal +
+            // ggml RPC, rpc-offload-plan.md) stages the SEPARATED layout, where
+            // ggml_version()/the backend registry live in libggml-base/libggml
+            // -- link them when they are there. Probed at configure time; after
+            // switching stagings `rm -rf .zig-cache`.
+            if (llamaStagedSeparated(b)) {
+                module.linkSystemLibrary("ggml", .{ .use_pkg_config = .no });
+                module.linkSystemLibrary("ggml-base", .{ .use_pkg_config = .no });
+            }
             // @loader_path resolves against the BINARY's own location at launch,
             // not the launching process's cwd. A bare relative string here (e.g.
             // "lib/llama/lib") gets baked verbatim into LC_RPATH when `zig build`
@@ -901,6 +911,13 @@ fn makeSharedModule(b: *std.Build, root: std.Build.LazyPath, o: SharedOpts) *std
 /// this host. Mirrors verifyMlxStage: fail loudly with the fix rather than let
 /// the linker emit a bare -lllama error. GGUF is the ONLY engine off Apple, so
 /// a missing stage there is fatal rather than a degraded build.
+/// True when lib/llama/lib holds the CMake-built separated layout (libggml-base
+/// beside libllama) rather than the merged XCFramework dylib.
+fn llamaStagedSeparated(b: *std.Build) bool {
+    buildRootHandle(b).access(b.graph.io, "lib/llama/lib/libggml-base.dylib", .{}) catch return false;
+    return true;
+}
+
 fn verifyLlamaStage(b: *std.Build, os_tag: std.Target.Os.Tag) void {
     const probe = switch (os_tag) {
         .macos => "lib/llama/lib/libllama.dylib",

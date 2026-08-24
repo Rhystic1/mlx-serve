@@ -347,9 +347,13 @@ if [ "$STAGE_FRAMEWORKS" = "1" ]; then
         [ -f "$WEBP_LIB/$wlib" ] && cp "$WEBP_LIB/$wlib" "$CONTENTS/Frameworks/"
     done
 
-    # libllama (llama.cpp GGUF engine) — single self-contained dylib staged by
-    # scripts/fetch-llama.sh. Bundled + signed exactly like the others.
-    [ -f "$PROJECT_ROOT/lib/llama/lib/libllama.dylib" ] && cp "$PROJECT_ROOT/lib/llama/lib/libllama.dylib" "$CONTENTS/Frameworks/"
+    # libllama (llama.cpp GGUF engine). fetch-llama.sh stages ONE merged dylib;
+    # scripts/build-llama-macos.sh (Metal + ggml RPC) stages libllama beside
+    # libggml*.dylib, which ggml dlopens BY FILENAME from libggml's own dir --
+    # so the whole set ships or the RPC/Metal backends silently vanish.
+    for f in "$PROJECT_ROOT"/lib/llama/lib/*.dylib; do
+        [ -f "$f" ] && cp "$f" "$CONTENTS/Frameworks/"
+    done
 
     # SwiftOGG's binary deps: YbridOpus + YbridOgg dynamic frameworks (libopus +
     # libogg). VoicePreprocessor uses them to decode Telegram Ogg/Opus voice notes,
@@ -402,13 +406,18 @@ if [ -f "$CONTENTS/Frameworks/libwebp.dylib" ]; then
     fi
 fi
 
-# Fix mlx-serve -> libllama dependency (@rpath/libllama.dylib -> bundled Frameworks)
-if [ -f "$CONTENTS/Frameworks/libllama.dylib" ]; then
-    install_name_tool -change \
-        "@rpath/libllama.dylib" \
-        "@executable_path/../Frameworks/libllama.dylib" \
-        "$CONTENTS/MacOS/mlx-serve" 2>/dev/null || true
-fi
+# Fix mlx-serve -> libllama / libggml dependencies (@rpath/<name> -> bundled
+# Frameworks). libggml* only exist in the separated staging; the loop is a
+# no-op otherwise. Sibling deps INSIDE the dylibs stay @rpath: the exe's
+# rpath covers Frameworks and dyld resolves @rpath along the load chain.
+for name in libllama libggml libggml-base; do
+    if [ -f "$CONTENTS/Frameworks/$name.dylib" ]; then
+        install_name_tool -change \
+            "@rpath/$name.dylib" \
+            "@executable_path/../Frameworks/$name.dylib" \
+            "$CONTENTS/MacOS/mlx-serve" 2>/dev/null || true
+    fi
+done
 
 # MLXCore (the Swift app) loads YbridOpus/YbridOgg via @rpath/Ybrid*.framework.
 # Point @rpath at the bundled Frameworks dir — SwiftPM's dev rpath into

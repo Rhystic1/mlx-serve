@@ -192,6 +192,8 @@ xcframework)
   cp "$FW_HEADERS"/*.h "$DEST_INC/"
 
   echo "$LLAMA_TAG" > "$STAMP"
+  echo "[fetch-llama] NOTE: the XCFramework has Metal only -- no ggml RPC backend."
+  echo "  For --rpc / --rpc-serve on this Mac run ./scripts/build-llama-macos.sh instead."
   echo "[fetch-llama] staged libllama ($LLAMA_TAG):"
   echo "  $DEST_LIB/libllama.dylib ($(du -h "$DEST_LIB/libllama.dylib" | cut -f1))"
   echo "  $(ls "$DEST_INC" | wc -l | tr -d ' ') headers in $DEST_INC"

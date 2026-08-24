@@ -17,6 +17,10 @@
 #define GGML_RPC_MAX_SERVERS 16
 
 #include <pthread.h>
+#ifdef __APPLE__
+#include <dlfcn.h>
+#include <limits.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -83,18 +87,32 @@ static void backend_init_once(void) {
     // any binary that is not the installed one. Loading is additive and
     // idempotent — a backend already registered is not registered twice — so
     // doing both is safe.
-#ifndef __APPLE__
-    // Apple only: the XCFramework merges llama + ggml + ggml-metal into ONE
-    // dylib with its backends compiled IN, so there is nothing to dlopen and
-    // nothing to link for it. Everywhere else ggml ships the backends as
-    // separate shared objects and this call is what registers them.
     const char *dir = getenv("MLX_LLAMA_BACKEND_DIR");
     if (dir && dir[0] != '\0') {
         ggml_backend_load_all_from_path(dir);
-    } else {
-        ggml_backend_load_all();
+        return;
+    }
+#ifdef __APPLE__
+    // Two macOS layouts share this shim: the XCFramework (one merged dylib,
+    // backends compiled in -- nothing to dlopen, load_all finds nothing and
+    // is harmless) and scripts/build-llama-macos.sh's separated dylibs, where
+    // libggml-metal / libggml-rpc sit BESIDE libggml. The registry's own
+    // search looks at the running executable's directory, which is wrong for
+    // zig-out/bin (backends live in lib/llama/lib), .zig-cache test binaries,
+    // and the app bundle (Frameworks/). The directory that is right in every
+    // layout is the one libggml itself was loaded from: ask dyld.
+    {
+        Dl_info info;
+        if (dladdr((const void *)&ggml_backend_load_all, &info) && info.dli_fname) {
+            char buf[PATH_MAX];
+            strncpy(buf, info.dli_fname, sizeof buf - 1);
+            buf[sizeof buf - 1] = '\0';
+            char *slash = strrchr(buf, '/');
+            if (slash) { *slash = '\0'; ggml_backend_load_all_from_path(buf); return; }
+        }
     }
 #endif
+    ggml_backend_load_all();
 }
 
 static void copy_err(char *err, size_t errlen, const char *msg) {
