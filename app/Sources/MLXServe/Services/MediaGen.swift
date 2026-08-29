@@ -498,6 +498,10 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// answers a named 400 saying where to get it. FL2VA packs only until the
     /// LoRA has been eyeballed on the REF2VA DiT.
     var supportsTurbo: Bool = false
+    /// Acc PDD distillation (alibaba-pai MiniMax-H3-Acc-LoRAs): 8-step (or
+    /// regrouped 4-step) Euler with a fused output-head bank. Exclusive with
+    /// Turbo. Both FL2VA and Ref2VA have a matching Acc file.
+    var supportsAcc: Bool = false
     /// Chained-window long clips (server `chain_windows`): N windows joined by
     /// fl2va keyframe conditioning, so the REF2VA pack cannot serve it.
     var supportsChainedWindows: Bool = false
@@ -989,6 +993,7 @@ struct VideoModelPreset: Identifiable, Hashable {
             // chain through), so both flags are the partition's complement —
             // derived here so the two fl2va presets cannot drift apart.
             supportsTurbo: !supportsReferences,
+            supportsAcc: true,
             supportsChainedWindows: !supportsReferences,
             supportsLastFrame: !supportsReferences,
             // MiniMax publishes no step count at all — no default, no range, no
@@ -1004,7 +1009,7 @@ struct VideoModelPreset: Identifiable, Hashable {
             stepsRange: 4...50,
             stepsHelp: "More steps mean more detail and steadier motion, and cost time in direct proportion. 16 is the fast tier, 30 is the default, 50 is for a final render. Fewer than 16 only works with a distilled few-step adapter.",
             testedStepsFloor: 16,
-            testedStepsFloorNote: "Under 16 steps this model needs a distilled few-step adapter — the engine-owned Turbo LoRA, or a community one attached under Style LoRAs. Without one the picture is rough and the soundtrack usually comes out garbled, and the fast recipe means those steps are not much cheaper each.",
+            testedStepsFloorNote: "Under 16 steps this model needs a distilled few-step adapter — the engine-owned Turbo LoRA, Acc (PDD 8-step), or a community one attached under Style LoRAs. Without one the picture is rough and the soundtrack usually comes out garbled, and the fast recipe means those steps are not much cheaper each.",
             testedFrameFloor: statedMin,
             testedFrameFloorNote: "below MiniMax's stated 4-second minimum. Good for trying a prompt or a step count cheaply; motion and the soundtrack degrade outside the trained range.",
             ditResidentGB: ditGB,
@@ -1949,6 +1954,9 @@ struct VideoGenRequest {
     var loras: [LoraAdapter] = []
     /// Turbo distillation LoRA (H3 fl2va): 4-step sampling, fast recipe off.
     var turbo: Bool = false
+    /// Acc PDD distillation (H3, both partitions): 8-step (or 4-step) Euler
+    /// plus the fused head bank. Exclusive with Turbo.
+    var acc: Bool = false
     /// Chained windows (H3 fl2va): number of `numFrames`-frame windows joined
     /// by keyframe conditioning. 1 = a single ordinary window.
     var chainWindows: Int = 1

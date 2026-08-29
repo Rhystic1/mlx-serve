@@ -27,6 +27,7 @@ const ltx = @import("ltx_video.zig");
 const diffvae_fwd = @import("ltx_diffvae_forward.zig");
 const ltx_audio = @import("ltx_audio.zig");
 const minimax_h3 = @import("minimax_h3.zig");
+const pdd_acc = @import("pdd_acc.zig");
 const hy3d = @import("hunyuan3d.zig");
 const hy3d_paint = @import("hunyuan3d_paint.zig");
 const glb_mod = @import("glb.zig");
@@ -3015,13 +3016,14 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     // the engine sums every attached delta on each linear.
     var lora_path_bufs: [lora_mod.MAX_LORAS][]u8 = undefined;
     var lora_scales: [lora_mod.MAX_LORAS]f32 = undefined;
-    const lora_n = parseLoraFields(allocator, body, &lora_path_bufs, &lora_scales) catch |err| switch (err) {
+    const lora_n_in = parseLoraFields(allocator, body, &lora_path_bufs, &lora_scales) catch |err| switch (err) {
         error.TooManyLoraPaths => return sendError(conn, 400, "too many 'lora_paths' (max 8)"),
         error.BadLoraPathsJson => return sendError(conn, 400, "invalid 'lora_paths' (must be a JSON array of strings)"),
         error.BadLoraScalesJson => return sendError(conn, 400, "invalid 'lora_scales' (numbers, comma/space separated, or a JSON array)"),
         error.OutOfMemory => return err,
     };
-    defer for (lora_path_bufs[0..lora_n]) |p| allocator.free(p);
+    defer for (lora_path_bufs[0..lora_n_in]) |p| allocator.free(p);
+    var lora_n: usize = lora_n_in;
     var lora_paths: [lora_mod.MAX_LORAS][]const u8 = undefined;
     for (lora_path_bufs[0..lora_n], 0..) |p, i| lora_paths[i] = p;
     // Paths are proven HERE, not inside the engine: H3 loads its DiT per
@@ -3033,20 +3035,97 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
             return sendError(conn, 400, "'lora_paths' must be absolute paths to readable .safetensors files");
     }
 
+    // Acc (PDD): trunk LoRA + head bank. Auto-detect an Acc file in
+    // lora_paths, or take acc_path / acc:true (pack-dir default). Exclusive
+    // with Turbo. The Acc path is peeled out of the style stack so it does
+    // not occupy two slots.
+    const acc_flag = sse.bodyWantsTrue(body, "acc");
+    var acc_path_owned: ?[]u8 = null;
+    defer if (acc_path_owned) |p| allocator.free(p);
+    if (extractJsonString(body, "acc_path")) |raw| {
+        const unesc = try jsonUnescape(allocator, raw);
+        if (unesc.len == 0) {
+            allocator.free(unesc);
+        } else acc_path_owned = unesc;
+    }
+    var acc_idx: ?usize = null;
+    for (lora_paths[0..lora_n], 0..) |p, i| {
+        if (lora_mod.detectPdd(allocator, p)) {
+            if (acc_idx != null) return sendError(conn, 400, "only one Acc file per request");
+            acc_idx = i;
+        }
+    }
+    if (acc_idx) |i| {
+        if (acc_path_owned) |p| {
+            if (!std.mem.eql(u8, p, lora_paths[i]))
+                return sendError(conn, 400, "acc_path and lora_paths name different Acc files");
+        } else {
+            acc_path_owned = try allocator.dupe(u8, lora_paths[i]);
+        }
+    }
+    if (acc_flag and acc_path_owned == null) {
+        const fname = if (engine.supports_refs) pdd_acc.REF2VA_FILENAME else pdd_acc.FL2VA_FILENAME;
+        acc_path_owned = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ engine.model_dir, fname });
+    }
+    const acc_on = acc_flag or acc_path_owned != null;
+    var acc_missing_buf: [320]u8 = undefined;
+    const acc_missing = pdd_acc.missingAccMessage(&acc_missing_buf);
+
     // Turbo: the 4-step distillation LoRA (larryvrh/MiniMax-H3-Turbo-Lora).
     // Steps default to 4, which is also the floor: on the ema_ckpt850 weights
     // the mirrors now ship, 4 steps is already sharp — the 6-8 default came
     // from ckpt500, which needed the extra steps to firm up. 30 stays the
-    // non-turbo default.
+    // non-turbo default. Acc is a different distill and cannot stack with it.
     const turbo = sse.bodyWantsTrue(body, "turbo");
+    if (acc_on and turbo)
+        return sendError(conn, 400, "Acc and Turbo are mutually exclusive");
     if (turbo and !engine.hasTurboLora(io, allocator))
         return sendError(conn, 400, "this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors");
 
+    var acc_partition_owned: ?[]u8 = null;
+    defer if (acc_partition_owned) |p| allocator.free(p);
+    if (extractJsonString(body, "acc_partition")) |raw| {
+        acc_partition_owned = try jsonUnescape(allocator, raw);
+    }
+
+    if (acc_on) {
+        const ap = acc_path_owned.?;
+        lora_mod.validatePath(ap) catch return sendError(conn, 400, acc_missing);
+        var w: usize = 0;
+        for (lora_paths[0..lora_n], 0..) |p, i| {
+            if (std.mem.eql(u8, p, ap)) continue;
+            if (pdd_acc.isDistillFilename(std.fs.path.basename(p)))
+                return sendError(conn, 400, "Acc and Turbo are mutually exclusive");
+            lora_paths[w] = p;
+            lora_scales[w] = lora_scales[i];
+            w += 1;
+        }
+        lora_n = w;
+        const file_part = pdd_acc.partitionFromName(null, std.fs.path.basename(ap));
+        const model_part: pdd_acc.Partition = if (engine.supports_refs) .ref2va else .fl2va;
+        pdd_acc.checkPartitionPairing(file_part, model_part) catch
+            return sendError(conn, 400, "Acc file partition does not match this pack (FL2VA Acc is for FL2VA, Ref2VA Acc is for Ref2VA)");
+    }
+
     const width: u32 = @intCast(extractJsonInt(body, "width") orelse 256);
     const height: u32 = @intCast(extractJsonInt(body, "height") orelse 256);
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse (if (turbo) @as(u64, 4) else 30));
+    const steps_field = extractJsonInt(body, "steps");
     const seed: u64 = @intCast(extractJsonInt(body, "seed") orelse 0);
     const requested_frames: u32 = @intCast(extractJsonInt(body, "num_frames") orelse 56);
+
+    const steps: u32 = if (acc_on) blk: {
+        const nfe_hint: u32 = if (steps_field) |sf| @intCast(sf) else 8;
+        var part_buf: [16]u32 = undefined;
+        const sizes = pdd_acc.resolvePartition(pdd_acc.FINE_STEPS, nfe_hint, acc_partition_owned, &part_buf) catch
+            return sendError(conn, 400, "Acc needs 4 or 8 steps (or a valid acc_partition of 4/8 blocks summing to 32)");
+        if (steps_field) |sf| {
+            if (sf != sizes.len)
+                return sendError(conn, 400, "Acc steps must equal the partition length");
+        }
+        if (sizes.len < 4)
+            return sendError(conn, 400, "Acc needs at least 4 steps");
+        break :blk @intCast(sizes.len);
+    } else @intCast(steps_field orelse (if (turbo) @as(u64, 4) else 30));
 
     if (width % 32 != 0 or height % 32 != 0)
         return sendError(conn, 400, "width and height must be multiples of 32");
@@ -3071,7 +3150,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         return sendError(conn, 400, reason);
     const want_stream = sse.bodyWantsTrue(body, "stream");
     const preview_req = sse.parsePreview(body);
-    log.info("[video] minimax-h3 {d}x{d} {d}f/window (requested {d}, snapped to the 17k+5 ladder) steps={d} turbo={} loras={d} chain={d} stream={} preview={}\n", .{ width, height, shape.frame_count, requested_frames, steps, turbo, lora_n, chain_windows, want_stream, preview_req.enabled });
+    log.info("[video] minimax-h3 {d}x{d} {d}f/window (requested {d}, snapped to the 17k+5 ladder) steps={d} turbo={} acc={} loras={d} chain={d} stream={} preview={}\n", .{ width, height, shape.frame_count, requested_frames, steps, turbo, acc_on, lora_n, chain_windows, want_stream, preview_req.enabled });
 
     // fl2va keyframes. NOT graceful (the a2vid rule: the user asked for THIS
     // frame): an undecodable image is a named 400, never a silent t2va. The
@@ -3184,6 +3263,10 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         .seed = seed,
         .fast = sse.bodyBool(body, "fast"),
         .turbo = turbo,
+        .acc = acc_on,
+        .acc_path = acc_path_owned,
+        .acc_partition = acc_partition_owned,
+        .acc_model_partition = if (engine.supports_refs) .ref2va else .fl2va,
         .lora_paths = lora_paths[0..lora_n],
         .lora_scales = lora_scales[0..lora_n],
         .chain_windows = chain_windows,
@@ -3204,6 +3287,17 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
             error.BadLoraPath => "'lora_paths' must be absolute paths to .safetensors files",
             error.TooManyLoras => "too many LoRA adapters (max 8, and turbo takes one of the slots)",
             error.TurboLoraIncomplete => "turbo_lora.safetensors is incomplete — re-download minimax_h3_turbo_4step_ckpt500.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora",
+            error.AccTurboExclusive => "Acc and Turbo are mutually exclusive",
+            error.AccFileMissing => acc_missing,
+            error.AccIncomplete => "Acc trunk LoRA is incomplete — expected 258 modules (PDD Acc omits final_layer.adaln)",
+            error.AccPartitionMismatch => "Acc file partition does not match this pack (FL2VA Acc is for FL2VA, Ref2VA Acc is for Ref2VA)",
+            error.AccBadPartition => "Acc needs 4 or 8 steps (or a valid acc_partition of 4/8 blocks summing to 32)",
+            error.AccOffGrid => "Acc sampler is off the trained PDD sigma grid",
+            error.AccMissingHeads => "Acc file is missing the PDD head bank (proj_out / audio_proj_out) — not a style LoRA",
+            error.AccNativeHeadOverwrite => "Acc PDD head bank cannot be copied onto the native output head",
+            error.AccLeftoverKeys => "Acc file has leftover tensors the converter does not map",
+            error.AccBadHeadShape => "Acc PDD head bank has the wrong shape",
+            error.AccHeadReadFailed => "Acc file could not be read (PDD head bank)",
             else => null,
         };
         if (named) |msg| {
@@ -3887,7 +3981,9 @@ pub fn estimatePeakResidentBytesIn(io: std.Io, dir: std.Io.Dir, model_type: []co
         const dit = h3DitResidentBytes(
             sz(io, dir, "transformer.safetensors"),
             minimax_h3.adalnPrecomputeOn(),
-        ) + sz(io, dir, "turbo_lora.safetensors");
+        ) + sz(io, dir, "turbo_lora.safetensors")
+            + sz(io, dir, pdd_acc.FL2VA_FILENAME)
+            + sz(io, dir, pdd_acc.REF2VA_FILENAME);
         return h3PeakBytes(
             sz(io, dir, "text_encoder.safetensors"),
             dit,
@@ -5350,6 +5446,9 @@ test "estimatePeakResidentBytes: minimax_h3 stages, other types keep the sum" {
     try tmp.dir.writeFile(io, .{ .sub_path = "turbo_lora.safetensors", .data = &b80 });
     try std.testing.expectEqual(405 + H3_ACTIVATION_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
     tmp.dir.deleteFile(io, "turbo_lora.safetensors") catch {};
+    try tmp.dir.writeFile(io, .{ .sub_path = pdd_acc.FL2VA_FILENAME, .data = &b80 });
+    try std.testing.expectEqual(405 + H3_ACTIVATION_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
+    tmp.dir.deleteFile(io, pdd_acc.FL2VA_FILENAME) catch {};
     // Any other media type: the plain sum over the dir (the safe default —
     // a backend without a declared residency plan must not under-bill).
     try std.testing.expectEqual(@as(u64, 1950), estimatePeakResidentBytesIn(io, tmp.dir, "flux2"));

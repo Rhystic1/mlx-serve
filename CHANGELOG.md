@@ -5,6 +5,7 @@
 ### Highlights
 
 - **Qwen 3.8 Flash Next runs natively.** Alibaba's 125B model with its huge n-gram memory, on Apple silicon. About 60 tok/s on an M4 Max, 78 with speculative decoding, ~70 GB of RAM for the 4-bit pack (`ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit`).
+- **MiniMax-H3 Acc (PDD).** alibaba-pai's 8-step (or regrouped 4-step) distillation: trunk LoRA plus a fused output-head bank, exclusive with Turbo. `POST /v1/video` `"acc": true`.
 - **It sees images and video.** Follow-up questions about the same picture answer instantly instead of re-reading it.
 - **Long prompts stay fast.** Sparse attention past 2k tokens runs on custom kernels, so an 8k-token prompt with speculative decoding no longer loses to plain decoding.
 - **Several chats at once.** Concurrent requests on Flash Next share one pass: 2 streams give 1.3x total throughput, 4 streams 1.8x. A single chat is as fast as before.

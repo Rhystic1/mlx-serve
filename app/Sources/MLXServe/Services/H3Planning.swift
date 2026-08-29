@@ -60,6 +60,9 @@ enum H3Plan {
     /// The Turbo LoRA rides resident beside the DiT when engaged (744 MB bf16
     /// on disk, rounded up — the server bills the real file the same way).
     static let turboLoraBytes: UInt64 = 800 * 1024 * 1024
+    /// Acc file on disk (~1.4 GB). Billed on the DiT term when Acc is engaged,
+    /// matching the server's pack-dir estimate.
+    static let accLoraBytes: UInt64 = 1500 * 1024 * 1024
 
     /// Peak unified memory for one generation, in bytes.
     ///
@@ -69,18 +72,20 @@ enum H3Plan {
     /// that samples cheaply still had to get the weights in.
     static func peakBytes(model: VideoModelPreset, width: Int, height: Int,
                           frames: Int, fast: Bool, turbo: Bool = false,
+                          acc: Bool = false,
                           promptTokens: Int = 250) -> UInt64 {
         let gb: UInt64 = 1024 * 1024 * 1024
         let stagedGB = model.stagedPeakGB > 0 ? model.stagedPeakGB : Double(model.approxRAMGB)
         let loadPeak = UInt64(stagedGB * Double(gb))
         guard model.backend == .minimaxH3 else { return UInt64(model.approxRAMGB) * gb }
         let r = rows(width: width, height: height, frames: frames, promptTokens: promptTokens)
-        // Turbo forces the fast recipe off server-side, so its callers pass
-        // fast=false and the broadcast cache never bills; the LoRA itself
-        // rides beside the DiT.
+        // Turbo and Acc both force the fast recipe off server-side, so callers
+        // pass fast=false and the broadcast cache never bills; the adapter
+        // itself rides beside the DiT. They are mutually exclusive.
         let sampling = UInt64(Double(model.ditResidentGB) * Double(gb))
             + (fast ? pabCacheBytes(rows: r) : 0)
             + (turbo ? turboLoraBytes : 0)
+            + (acc ? accLoraBytes : 0)
             + UInt64(r) * activationBytesPerRow
         return max(loadPeak, sampling)
     }
@@ -101,8 +106,9 @@ enum H3Plan {
     /// "nothing fits". A Mac too small to load the pack at all would otherwise
     /// see no warning at exactly 124 frames.
     static func fits(model: VideoModelPreset, width: Int, height: Int,
-                     frames: Int, fast: Bool, turbo: Bool = false, availableGB: Int) -> Bool {
-        peakBytes(model: model, width: width, height: height, frames: frames, fast: fast, turbo: turbo)
+                     frames: Int, fast: Bool, turbo: Bool = false,
+                     acc: Bool = false, availableGB: Int) -> Bool {
+        peakBytes(model: model, width: width, height: height, frames: frames, fast: fast, turbo: turbo, acc: acc)
             <= budgetBytes(availableGB: availableGB)
     }
 
@@ -519,5 +525,42 @@ enum TurboLoraFetch {
     static func isOnDisk(modelDir: String?) -> Bool {
         guard let modelDir else { return false }
         return FileManager.default.fileExists(atPath: (modelDir as NSString).appendingPathComponent(fileName))
+    }
+}
+
+/// Where the Acc PDD adapter comes from. Unlike Turbo it is a DIFFERENT
+/// Hugging Face repo (`alibaba-pai/MiniMax-H3-Acc-LoRAs`), downloaded into
+/// the pack dir under its original filename.
+enum AccLoraFetch {
+    static let hfRepoId = "alibaba-pai/MiniMax-H3-Acc-LoRAs"
+    static let hfURL = "https://huggingface.co/alibaba-pai/MiniMax-H3-Acc-LoRAs"
+    static let fl2vaFileName = "MiniMax-H3-FL2VA-Acc-8Step.safetensors"
+    static let ref2vaFileName = "MiniMax-H3-Ref2VA-Acc-8Step.safetensors"
+    static let approxMB = 1400
+
+    static func fileName(supportsReferences: Bool) -> String {
+        supportsReferences ? ref2vaFileName : fl2vaFileName
+    }
+
+    static func taskKey(packRepoId: String) -> String { "acc:" + packRepoId }
+
+    enum Decision: Equatable {
+        case ready
+        case fetch
+        case notNeeded
+        case unavailableRemotely
+    }
+
+    static func decide(accRequested: Bool, backendSupportsAcc: Bool,
+                       isRemote: Bool, fileOnDisk: Bool) -> Decision {
+        guard accRequested, backendSupportsAcc else { return .notNeeded }
+        if isRemote { return .unavailableRemotely }
+        return fileOnDisk ? .ready : .fetch
+    }
+
+    static func isOnDisk(modelDir: String?, supportsReferences: Bool) -> Bool {
+        guard let modelDir else { return false }
+        let name = fileName(supportsReferences: supportsReferences)
+        return FileManager.default.fileExists(atPath: (modelDir as NSString).appendingPathComponent(name))
     }
 }

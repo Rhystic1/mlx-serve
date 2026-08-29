@@ -34,6 +34,7 @@ const mage_flow = @import("mage_flow.zig");
 /// Runtime LoRA adapters, shared with the image/LTX backends — ONE loader for
 /// every adapter format we accept, Turbo included.
 const lora_mod = @import("lora.zig");
+const pdd_acc = @import("pdd_acc.zig");
 const gen_sse = @import("gen_sse.zig");
 /// Vision presentation math (grids, adaLN tags, mRoPE), pinned against
 /// ComfyUI's own output by `fixtures/minimax_h3_vision.json`.
@@ -1998,6 +1999,73 @@ pub const AdalnTables = struct {
     }
 };
 
+/// Fused PDD Acc output heads: one fp32 [out, in] pair per Euler block.
+/// Indexed by `select_block` on the current video sigma. Never copied onto
+/// the native `[96, 5376]` / `[32, 5376]` parameters — that is the Comfy crash.
+pub const AccHeads = struct {
+    allocator: std.mem.Allocator,
+    nfe: u32,
+    bounds: []f64,
+    video_w: []mlx.mlx_array,
+    video_b: []mlx.mlx_array,
+    audio_w: []mlx.mlx_array,
+    audio_b: []mlx.mlx_array,
+
+    pub fn deinit(self: *AccHeads) void {
+        for (self.video_w) |a| {
+            if (a.ctx != null) _ = mlx.mlx_array_free(a);
+        }
+        for (self.video_b) |a| {
+            if (a.ctx != null) _ = mlx.mlx_array_free(a);
+        }
+        for (self.audio_w) |a| {
+            if (a.ctx != null) _ = mlx.mlx_array_free(a);
+        }
+        for (self.audio_b) |a| {
+            if (a.ctx != null) _ = mlx.mlx_array_free(a);
+        }
+        self.allocator.free(self.video_w);
+        self.allocator.free(self.video_b);
+        self.allocator.free(self.audio_w);
+        self.allocator.free(self.audio_b);
+        self.allocator.free(self.bounds);
+        self.* = undefined;
+    }
+
+    pub fn blockIndex(self: *const AccHeads, sigma_v: f64) pdd_acc.AccError!u32 {
+        const mode: pdd_acc.OffGrid = if (envStr("MINIMAX_H3_ACC_OFF_GRID")) |v|
+            if (std.mem.eql(u8, v, "clamp")) .clamp else .err
+        else
+            .err;
+
+        return pdd_acc.selectBlock(sigma_v, self.bounds, mode);
+    }
+};
+
+fn hostF32Mat(data: []const f32, rows: u32, cols: u32, s: S) !mlx.mlx_array {
+    const sh = [_]c_int{ @intCast(rows), @intCast(cols) };
+    const src = mlx.mlx_array_new_data(data.ptr, &sh, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(src);
+    var c = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_contiguous(&c, src, false, s));
+    try mlx.check(mlx.mlx_array_eval(c));
+
+    return c;
+}
+
+fn hostF32Vec(data: []const f32, n: u32, s: S) !mlx.mlx_array {
+    const sh = [_]c_int{@intCast(n)};
+    const src = mlx.mlx_array_new_data(data.ptr, &sh, 1, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(src);
+    var c = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_contiguous(&c, src, false, s));
+    try mlx.check(mlx.mlx_array_eval(c));
+
+    return c;
+}
+
 pub const Model = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
@@ -2036,6 +2104,9 @@ pub const Model = struct {
     video_out_b: mlx.mlx_array,
     audio_out_w: mlx.mlx_array,
     audio_out_b: mlx.mlx_array,
+    /// Fused PDD Acc heads, indexed per Euler step. Null = native heads.
+    /// Never written onto `video_out_w` / `audio_out_w` (the Comfy crash).
+    acc: ?AccHeads,
 
     pub fn load(allocator: std.mem.Allocator, w: *const Weights, cfg: Config, dt: mlx.mlx_dtype, s: S) !Model {
         var m: Model = undefined;
@@ -2076,6 +2147,7 @@ pub const Model = struct {
         m.video_out_b = try ownWeightAs(w, allocator, "final_layer.video_out", ".bias", f32t, s);
         m.audio_out_w = try ownWeightAs(w, allocator, "final_layer.audio_out", ".weight", f32t, s);
         m.audio_out_b = try ownWeightAs(w, allocator, "final_layer.audio_out", ".bias", f32t, s);
+        m.acc = null;
         return m;
     }
 
@@ -2093,6 +2165,7 @@ pub const Model = struct {
         self.allocator.free(self.blocks);
         if (self.final_adaln) |*fa| fa.deinit();
         if (self.adaln_tables) |*t| t.deinit();
+        if (self.acc) |*a| a.deinit();
     }
 
     /// Force-materialize every weight in ONE eval. Without this the load is
@@ -2162,6 +2235,12 @@ pub const Model = struct {
             push.arr(vec, fa.bias);
             push.lp(vec, fa.lora);
         }
+        if (self.acc) |acc| {
+            for (acc.video_w) |x| push.arr(vec, x);
+            for (acc.video_b) |x| push.arr(vec, x);
+            for (acc.audio_w) |x| push.arr(vec, x);
+            for (acc.audio_b) |x| push.arr(vec, x);
+        }
         try mlx.check(mlx.mlx_eval(vec));
     }
 
@@ -2217,6 +2296,86 @@ pub const Model = struct {
         const fa = if (self.final_adaln) |*fa| fa else return error.LoraAfterAdalnPrecompute;
         bind(stack, "final_layer.adaln_proj.linear", &fa.lora, &rbuf, &counts);
         return counts;
+    }
+
+    /// Fuse the 32-interval PDD bank into nfe block heads and store them as
+    /// separate fp32 arrays. Must not mutate the native `video_out_*` /
+    /// `audio_out_*` parameters. Replaces any previous Acc attach.
+    pub fn attachAcc(self: *Model, heads: *const lora_mod.PddHeads, sizes: []const u32, s: S) !void {
+        self.detachAcc();
+        if (heads.video.n != pdd_acc.FINE_STEPS or heads.audio.n != pdd_acc.FINE_STEPS)
+            return error.AccBadHeadShape;
+        if (heads.video.out != pdd_acc.NATIVE_VIDEO_OUT or heads.audio.out != pdd_acc.NATIVE_AUDIO_OUT)
+            return error.AccBadHeadShape;
+        const nfe = sizes.len;
+        if (nfe == 0) return error.AccBadPartition;
+        var fine: [pdd_acc.FINE_STEPS + 1]f64 = undefined;
+        pdd_acc.fineSigmas(pdd_acc.VIDEO_SHIFT, pdd_acc.FINE_STEPS, fine[0..]);
+        const v_out = heads.video.out;
+        const v_in = heads.video.in_dim;
+        const a_out = heads.audio.out;
+        const a_in = heads.audio.in_dim;
+        const v_win = v_out * v_in;
+        const a_win = a_out * a_in;
+        const fw = try self.allocator.alloc(f32, nfe * v_win);
+        defer self.allocator.free(fw);
+        const fb = try self.allocator.alloc(f32, nfe * v_out);
+        defer self.allocator.free(fb);
+        const aw = try self.allocator.alloc(f32, nfe * a_win);
+        defer self.allocator.free(aw);
+        const ab = try self.allocator.alloc(f32, nfe * a_out);
+        defer self.allocator.free(ab);
+        pdd_acc.fuseHeads(
+            heads.video.w,
+            heads.video.b,
+            heads.video.n,
+            v_out,
+            v_in,
+            fine[0..],
+            sizes,
+            fw,
+            fb,
+        );
+        pdd_acc.fuseHeads(
+            heads.audio.w,
+            heads.audio.b,
+            heads.audio.n,
+            a_out,
+            a_in,
+            fine[0..],
+            sizes,
+            aw,
+            ab,
+        );
+
+        var acc: AccHeads = .{
+            .allocator = self.allocator,
+            .nfe = @intCast(nfe),
+            .bounds = try self.allocator.alloc(f64, nfe + 1),
+            .video_w = try self.allocator.alloc(mlx.mlx_array, nfe),
+            .video_b = try self.allocator.alloc(mlx.mlx_array, nfe),
+            .audio_w = try self.allocator.alloc(mlx.mlx_array, nfe),
+            .audio_b = try self.allocator.alloc(mlx.mlx_array, nfe),
+        };
+        for (acc.video_w) |*x| x.* = .{ .ctx = null };
+        for (acc.video_b) |*x| x.* = .{ .ctx = null };
+        for (acc.audio_w) |*x| x.* = .{ .ctx = null };
+        for (acc.audio_b) |*x| x.* = .{ .ctx = null };
+        errdefer acc.deinit();
+        pdd_acc.blockBoundaries(pdd_acc.FINE_STEPS, sizes, acc.bounds);
+        for (0..nfe) |i| {
+            acc.video_w[i] = try hostF32Mat(fw[i * v_win ..][0..v_win], v_out, v_in, s);
+            acc.video_b[i] = try hostF32Vec(fb[i * v_out ..][0..v_out], v_out, s);
+            acc.audio_w[i] = try hostF32Mat(aw[i * a_win ..][0..a_win], a_out, a_in, s);
+            acc.audio_b[i] = try hostF32Vec(ab[i * a_out ..][0..a_out], a_out, s);
+        }
+        self.acc = acc;
+        log.info("[minimax-h3] Acc fused {d} block heads (nfe={d})\n", .{ nfe, nfe });
+    }
+
+    pub fn detachAcc(self: *Model) void {
+        if (self.acc) |*a| a.deinit();
+        self.acc = null;
     }
 
     /// Materialize AdaLN for the whole schedule and RELEASE the 13B AdaLN
@@ -2505,9 +2664,20 @@ pub const Model = struct {
         const v_row = plan.runs[layout.segments.len - 1].mod_row / 3;
         const a_row = plan.runs[layout.segments.len - 2].mod_row / 3;
 
-        const vout = try self.finalHead(h, fmods[0], fmods[1], vseg, v_row, self.video_out_w, self.video_out_b, s);
+        var v_w = self.video_out_w;
+        var v_b = self.video_out_b;
+        var a_w = self.audio_out_w;
+        var a_b = self.audio_out_b;
+        if (self.acc) |*acc| {
+            const idx = try acc.blockIndex(sigma_v);
+            v_w = acc.video_w[idx];
+            v_b = acc.video_b[idx];
+            a_w = acc.audio_w[idx];
+            a_b = acc.audio_b[idx];
+        }
+        const vout = try self.finalHead(h, fmods[0], fmods[1], vseg, v_row, v_w, v_b, s);
         errdefer _ = mlx.mlx_array_free(vout);
-        const aout_raw = try self.finalHead(h, fmods[0], fmods[1], aseg, a_row, self.audio_out_w, self.audio_out_b, s);
+        const aout_raw = try self.finalHead(h, fmods[0], fmods[1], aseg, a_row, a_w, a_b, s);
         defer _ = mlx.mlx_array_free(aout_raw);
 
         // The sampler integrates a flat ODE on the VIDEO schedule. Scaling the
@@ -3200,6 +3370,15 @@ pub const GenRequest = struct {
     /// Loaded as the FIRST file of the same stack the user's adapters ride —
     /// it is a LoRA, so it gets no private code path.
     turbo: bool = false,
+    /// Acc distillation (alibaba-pai MiniMax-H3-Acc-LoRAs): trunk LoRA + PDD
+    /// head bank. Mutually exclusive with Turbo. Auto-detected when a
+    /// `lora_paths` entry is an Acc file, or set with `acc`/`acc_path`.
+    acc: bool = false,
+    acc_path: ?[]const u8 = null,
+    /// Optional `acc_partition` text (`"8,8,4,4,4,4"`). Null = nfe 4 or 8.
+    acc_partition: ?[]const u8 = null,
+    /// Pack partition for Acc pairing. Null = skip the check (hermetic tests).
+    acc_model_partition: ?pdd_acc.Partition = null,
     /// Style LoRAs stacked on the DiT: absolute `.safetensors` paths and their
     /// strengths (parallel arrays; a missing scale is 1.0 at the caller). They
     /// sum with each other and with Turbo, never merge — order is irrelevant
@@ -3479,6 +3658,7 @@ pub fn generate(
     progress: ?gen_sse.Progress,
     s: S,
 ) !GenResult {
+    if (req.turbo and (req.acc or req.acc_path != null)) return error.AccTurboExclusive;
     if (req.chain_windows > 1) return generateChain(allocator, io, paths, req, progress, s);
     return generateOne(allocator, io, paths, req, progress, s);
 }
@@ -3849,10 +4029,55 @@ fn generateOne(
     {
         // Adapters are loaded BEFORE the DiT and outlive it (declared first ⇒
         // its `defer` runs last), because every attached `Ref` points into
-        // this stack. Turbo is file 0 when asked for, then the user's, so a
-        // style LoRA and the distillation sum on the same linears.
+        // this stack. Acc or Turbo is file 0 when asked for, then the user's
+        // style LoRAs, so a style adapter and the distillation sum on the
+        // same linears. Acc and Turbo never share a stack.
         var stack: lora_mod.Stack = .{ .allocator = allocator };
         defer stack.deinit();
+        var acc_heads: ?lora_mod.PddHeads = null;
+        defer if (acc_heads) |*h| h.deinit(allocator);
+        var acc_path: ?[]const u8 = req.acc_path;
+        var acc_scale: f32 = 1.0;
+        var style_n: usize = 0;
+        var style_paths: [lora_mod.MAX_LORAS][]const u8 = undefined;
+        var style_scales: [lora_mod.MAX_LORAS]f32 = undefined;
+        for (req.lora_paths, 0..) |p, i| {
+            const sc: f32 = if (i < req.lora_scales.len) req.lora_scales[i] else 1.0;
+            if (lora_mod.detectPdd(allocator, p)) {
+                if (acc_path != null and !std.mem.eql(u8, acc_path.?, p))
+                    return error.AccTurboExclusive;
+                acc_path = p;
+                acc_scale = sc;
+                continue;
+            }
+            if (style_n >= lora_mod.MAX_LORAS) return error.TooManyLoras;
+            style_paths[style_n] = p;
+            style_scales[style_n] = sc;
+            style_n += 1;
+        }
+        const acc_on = req.acc or acc_path != null;
+        if (req.turbo and acc_on) return error.AccTurboExclusive;
+        if (req.acc and acc_path == null) return error.AccFileMissing;
+        if (acc_on) {
+            if (@abs(req.shift_video - pdd_acc.VIDEO_SHIFT) > 1e-9 or
+                @abs(req.shift_audio - pdd_acc.AUDIO_SHIFT) > 1e-9)
+                return error.AccBadPartition;
+            var part_buf: [16]u32 = undefined;
+            const sizes = try pdd_acc.resolvePartition(pdd_acc.FINE_STEPS, req.steps, req.acc_partition, &part_buf);
+            if (sizes.len != req.steps) return error.AccBadPartition;
+            for (style_paths[0..style_n]) |p| {
+                if (pdd_acc.isDistillFilename(std.fs.path.basename(p)))
+                    return error.AccTurboExclusive;
+            }
+            const loaded = try lora_mod.loadPddAcc(allocator, acc_path.?);
+            if (req.acc_model_partition) |mp|
+                try pdd_acc.checkPartitionPairing(loaded.heads.partition, mp);
+            acc_heads = loaded.heads;
+            stack.files[stack.count] = loaded.trunk;
+            stack.paths[stack.count] = try allocator.dupe(u8, acc_path.?);
+            stack.scales[stack.count] = acc_scale;
+            stack.count += 1;
+        }
         if (req.turbo) {
             const tp = paths.turbo_lora orelse return error.TurboLoraMissing;
             stack.files[stack.count] = try lora_mod.loadFile(allocator, tp, .minimax_h3);
@@ -3860,11 +4085,11 @@ fn generateOne(
             stack.scales[stack.count] = 1.0; // the file's alpha == rank
             stack.count += 1;
         }
-        if (req.lora_paths.len + stack.count > lora_mod.MAX_LORAS) return error.TooManyLoras;
-        for (req.lora_paths, 0..) |p, i| {
+        if (style_n + stack.count > lora_mod.MAX_LORAS) return error.TooManyLoras;
+        for (style_paths[0..style_n], 0..) |p, i| {
             stack.files[stack.count] = try lora_mod.loadFile(allocator, p, .minimax_h3);
             stack.paths[stack.count] = try allocator.dupe(u8, p);
-            stack.scales[stack.count] = if (i < req.lora_scales.len) req.lora_scales[i] else 1.0;
+            stack.scales[stack.count] = style_scales[i];
             stack.count += 1;
         }
 
@@ -3886,21 +4111,32 @@ fn generateOne(
             const counts = try model.attachLoras(&stack);
             for (stack.paths[0..stack.count], stack.scales[0..stack.count], counts[0..stack.count], 0..) |p, sc, n, i| {
                 const is_turbo = req.turbo and i == 0;
+                const is_acc = acc_on and i == 0;
                 // Engagement is COUNTED and logged per file: a rejected or
                 // half-matching adapter is otherwise a silent no-op that looks
                 // exactly like a working one.
                 log.info("[minimax-h3] lora {d}/{d}: {d}/{d} modules, scale {d:.2}{s} — {s}\n", .{
                     i + 1,          stack.count, n, Model.LORA_TARGETS, sc,
-                    if (is_turbo) " (turbo)" else "", std.fs.path.basename(p),
+                    if (is_turbo) " (turbo)" else if (is_acc) " (acc)" else "", std.fs.path.basename(p),
                 });
                 // The Turbo file names every target; anything less is a broken
-                // artifact, not a smaller speedup. A style LoRA legitimately
-                // targets a subset, but matching NOTHING means the file is for
-                // another architecture and the user would wait an hour for an
-                // unchanged render.
+                // artifact, not a smaller speedup. Acc omits the final AdaLN
+                // (258 vs 259) — that is the recorded completeness bar. A
+                // style LoRA legitimately targets a subset, but matching
+                // NOTHING means the file is for another architecture.
                 if (is_turbo and n < Model.LORA_TARGETS) return error.TurboLoraIncomplete;
+                if (is_acc and n < pdd_acc.ACC_TRUNK_TARGETS) return error.AccIncomplete;
                 if (n == 0) return error.LoraNoMatch;
             }
+            if (acc_heads) |*h| {
+                var part_buf: [16]u32 = undefined;
+                const sizes = try pdd_acc.resolvePartition(pdd_acc.FINE_STEPS, req.steps, req.acc_partition, &part_buf);
+                try model.attachAcc(h, sizes, s);
+            }
+        } else if (acc_heads) |*h| {
+            var part_buf: [16]u32 = undefined;
+            const sizes = try pdd_acc.resolvePartition(pdd_acc.FINE_STEPS, req.steps, req.acc_partition, &part_buf);
+            try model.attachAcc(h, sizes, s);
         }
         // AdaLN precompute must run while the trunk is still lazy — see
         // precomputeAdaln. Default ON: it is what keeps the DiT residency at
@@ -3935,8 +4171,9 @@ fn generateOne(
         // only on every k-th mid-schedule step and reuses the cached output
         // between — the branch is ~70% of a 768p step. Cache cost: one
         // [S, hidden] bf16 per block (~20 GB at 768p, ~1.4 GB at 256px).
-        const speed = resolveSpeed(req.fast, req.turbo, envStr("MINIMAX_H3_STEP_CACHE"), envStr("MINIMAX_H3_ATTN_BCAST"));
-        log.info("[minimax-h3] speed recipe: step-cache {d:.3}, attn-broadcast k={d} (fast={any}, turbo={})\n", .{ speed.step_cache, speed.bcast_k, req.fast, req.turbo });
+        const distilled = req.turbo or acc_on;
+        const speed = resolveSpeed(req.fast, distilled, envStr("MINIMAX_H3_STEP_CACHE"), envStr("MINIMAX_H3_ATTN_BCAST"));
+        log.info("[minimax-h3] speed recipe: step-cache {d:.3}, attn-broadcast k={d} (fast={any}, turbo={}, acc={})\n", .{ speed.step_cache, speed.bcast_k, req.fast, req.turbo, acc_on });
         const bcast_k: u32 = speed.bcast_k;
         var attn_bcast: ?AttnBroadcast = if (bcast_k > 1) try AttnBroadcast.init(allocator, model.blocks.len) else null;
         defer if (attn_bcast) |*ab| ab.deinit();
@@ -4008,7 +4245,7 @@ fn generateOne(
                 // Δσa itself; the non-turbo arm keeps the validated
                 // first-order form (this path is only reachable under turbo
                 // when the env forces the cache back on).
-                const askip = if (req.turbo)
+                const askip = if (distilled)
                     timeShiftSigma(sigmas[i + 1], req.shift_video, req.shift_audio) - timeShiftSigma(sigma, req.shift_video, req.shift_audio)
                 else
                     dsigma * timeShiftSlope(sigma, req.shift_video, req.shift_audio);
@@ -4084,7 +4321,7 @@ fn generateOne(
             _ = mlx.mlx_array_free(video_x);
             video_x = nv;
 
-            const da = try scalarLike(@floatCast(audioStepFactor(req.turbo, sigma, sigmas[i + 1], req.shift_video, req.shift_audio)), out.audio, s);
+            const da = try scalarLike(@floatCast(audioStepFactor(distilled, sigma, sigmas[i + 1], req.shift_video, req.shift_audio)), out.audio, s);
             defer _ = mlx.mlx_array_free(da);
             const stepa = try mulA(out.audio, da, s);
             defer _ = mlx.mlx_array_free(stepa);
@@ -6411,6 +6648,38 @@ test "minimax h3: resolveSpeed — turbo forces the recipe off, env still strong
     c = resolveSpeed(null, true, "0.05", "2");
     try testing.expectEqual(@as(f64, 0.05), c.step_cache);
     try testing.expectEqual(@as(u32, 2), c.bcast_k);
+}
+
+test "minimax h3: Acc forces the fast recipe off like turbo" {
+    // Acc is the same distilled-step class: pass turbo=true into resolveSpeed
+    // (generate wires `turbo or acc`). Giant Euler legs make the velocity
+    // cache's slow-drift premise false.
+    const c = resolveSpeed(true, true, null, null);
+    try testing.expectEqual(@as(f64, 0), c.step_cache);
+    try testing.expectEqual(@as(u32, 0), c.bcast_k);
+}
+
+test "minimax h3: Acc nfe=8 knots match PDD 12t/(1+11t)" {
+    const a = testing.allocator;
+    const sig = try sigmaSchedule(a, 8, SIGMA_SHIFT_VIDEO);
+    defer a.free(sig);
+    var fine: [9]f64 = undefined;
+    pdd_acc.fineSigmas(pdd_acc.VIDEO_SHIFT, 8, &fine);
+    for (sig, fine) |sv, fv| try testing.expect(@abs(sv - fv) < 1e-6);
+}
+
+test "minimax h3: Acc+Turbo refused before any load" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    try testing.expectError(error.AccTurboExclusive, generate(
+        testing.allocator,
+        io,
+        .{ .tokenizer_dir = "/tmp", .text_encoder = "/tmp/x", .dit = "/tmp/x", .vae = "/tmp/x" },
+        .{ .prompt = "x", .turbo = true, .acc = true },
+        null,
+        s,
+    ));
 }
 
 test "minimax h3: audioStepFactor — exact mapped delta under turbo, first-order otherwise" {

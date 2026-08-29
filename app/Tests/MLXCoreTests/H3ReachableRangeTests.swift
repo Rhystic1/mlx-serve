@@ -127,5 +127,9 @@ final class H3ReachableRangeTests: XCTestCase {
                       "a reachable low step count with no warning is the other half of this bug")
         XCTAssertTrue(source.contains("framesAdvisory"),
                       "a reachable short clip needs the same sentence")
+        XCTAssertTrue(source.contains("accEngaged"),
+                      "Acc must qualify as distilled sampling, not a Style LoRA")
+        XCTAssertTrue(source.contains("Acc (PDD 8-step distillation)"),
+                      "Acc is a dedicated toggle, exclusive with Turbo")
     }
 }

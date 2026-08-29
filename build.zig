@@ -204,7 +204,12 @@ pub fn build(b: *std.Build) void {
     test_mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
     test_mod.addIncludePath(b.path("lib/jinja_cpp"));
     test_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
-    test_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = &.{"-O2"} });
+    // Same wrapping-shift trap as `addPreviewTest`: Debug UBSan aborts in
+    // `stbiw__jpg_writeBits` (`bitBuf <<= 8`). JPEG tests live on this graph.
+    test_mod.addCSourceFile(.{
+        .file = b.path("lib/stb_image_write_impl.c"),
+        .flags = &.{ "-O2", "-fno-sanitize=undefined" },
+    });
     test_mod.addIncludePath(b.path("lib"));
     test_mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     test_mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });

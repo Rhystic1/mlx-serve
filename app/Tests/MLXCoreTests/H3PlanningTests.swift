@@ -567,3 +567,77 @@ extension H3PlanningTests {
                       "src/gen.zig no longer spells \(TurboLoraFetch.fileName) — the app would fetch a file the server never looks for")
     }
 }
+
+extension H3PlanningTests {
+
+    func testAccLoraFetchDecision() {
+        XCTAssertEqual(
+            AccLoraFetch.decide(accRequested: true, backendSupportsAcc: true,
+                                isRemote: false, fileOnDisk: false),
+            .fetch)
+        XCTAssertEqual(
+            AccLoraFetch.decide(accRequested: true, backendSupportsAcc: true,
+                                isRemote: false, fileOnDisk: true),
+            .ready)
+        XCTAssertEqual(
+            AccLoraFetch.decide(accRequested: false, backendSupportsAcc: true,
+                                isRemote: false, fileOnDisk: false),
+            .notNeeded)
+        XCTAssertEqual(
+            AccLoraFetch.decide(accRequested: true, backendSupportsAcc: false,
+                                isRemote: false, fileOnDisk: false),
+            .notNeeded)
+        XCTAssertEqual(
+            AccLoraFetch.decide(accRequested: true, backendSupportsAcc: true,
+                                isRemote: true, fileOnDisk: false),
+            .unavailableRemotely)
+    }
+
+    func testAccLoraFileNamesMatchWhatTheServerLooksFor() throws {
+        XCTAssertEqual(AccLoraFetch.fl2vaFileName, "MiniMax-H3-FL2VA-Acc-8Step.safetensors")
+        XCTAssertEqual(AccLoraFetch.ref2vaFileName, "MiniMax-H3-Ref2VA-Acc-8Step.safetensors")
+        XCTAssertEqual(AccLoraFetch.fileName(supportsReferences: false), AccLoraFetch.fl2vaFileName)
+        XCTAssertEqual(AccLoraFetch.fileName(supportsReferences: true), AccLoraFetch.ref2vaFileName)
+        XCTAssertEqual(AccLoraFetch.hfRepoId, "alibaba-pai/MiniMax-H3-Acc-LoRAs")
+        XCTAssertEqual(AccLoraFetch.taskKey(packRepoId: "ddalcu/h3"), "acc:ddalcu/h3")
+
+        let repo = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let genZig = try String(contentsOf: repo.appendingPathComponent("src/gen.zig"), encoding: .utf8)
+        XCTAssertTrue(genZig.contains("pdd_acc.FL2VA_FILENAME"),
+                      "src/gen.zig must bill Acc via pdd_acc.FL2VA_FILENAME")
+        XCTAssertTrue(genZig.contains("pdd_acc.REF2VA_FILENAME"),
+                      "src/gen.zig must bill Acc via pdd_acc.REF2VA_FILENAME")
+        let pdd = try String(contentsOf: repo.appendingPathComponent("src/pdd_acc.zig"), encoding: .utf8)
+        XCTAssertTrue(pdd.contains("\"\(AccLoraFetch.fl2vaFileName)\""),
+                      "src/pdd_acc.zig no longer spells \(AccLoraFetch.fl2vaFileName)")
+        XCTAssertTrue(pdd.contains("\"\(AccLoraFetch.ref2vaFileName)\""),
+                      "src/pdd_acc.zig no longer spells \(AccLoraFetch.ref2vaFileName)")
+        XCTAssertTrue(pdd.contains(AccLoraFetch.hfRepoId),
+                      "src/pdd_acc.zig no longer spells \(AccLoraFetch.hfRepoId)")
+    }
+
+    func testAccLoraSelectionPicksTheAdapterAndNoOtherWeights() {
+        let entries: [[String: Any]] = [
+            ["path": "README.md", "type": "file", "size": 4_000],
+            ["path": "config.json", "type": "file", "size": 80],
+            ["path": AccLoraFetch.fl2vaFileName, "type": "file", "size": 1_400_000_000],
+            ["path": AccLoraFetch.ref2vaFileName, "type": "file", "size": 1_400_000_000],
+            ["path": "unrelated.safetensors", "type": "file", "size": 99],
+        ]
+        let needed = DownloadManager.selectNeededFiles(
+            from: entries,
+            selection: FileSelection(
+                excludeSubstrings: [".json", ".md", ".txt", ".jinja", ".model", ".bin"],
+                keepSafetensors: [AccLoraFetch.fl2vaFileName]))
+        let paths = needed.map(\.0)
+        XCTAssertTrue(paths.contains(AccLoraFetch.fl2vaFileName))
+        XCTAssertFalse(paths.contains(AccLoraFetch.ref2vaFileName))
+        XCTAssertFalse(paths.contains("unrelated.safetensors"))
+        XCTAssertFalse(paths.contains("README.md"))
+        XCTAssertFalse(paths.contains("config.json"))
+    }
+}

@@ -143,6 +143,26 @@ else
   echo "FAIL: turbo still 400s with turbo_lora.safetensors present: $(cat "$TMP/b5.json" | head -c 200)"; rc=1
 fi
 
+# ── [3a] Acc PDD: Turbo combo is refused BEFORE any Acc file is read, and a
+# missing Acc file is a named 400 pointing at the HF repo (never a silent
+# style-LoRA apply that drops the head bank).
+CODE=$(curl -s -o "$TMP/b5acc.json" -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/video/generations" \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"x\",\"turbo\":true,\"acc\":true}")
+if [ "$CODE" = "400" ] && grep -q "mutually exclusive" "$TMP/b5acc.json"; then
+  echo "PASS: Acc and Turbo together is a named 400"
+else
+  echo "FAIL: expected Acc+Turbo exclusive 400, got $CODE: $(cat "$TMP/b5acc.json" | head -c 200)"; rc=1
+fi
+CODE=$(curl -s -o "$TMP/b5acc2.json" -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/video/generations" \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"x\",\"acc\":true}")
+if [ "$CODE" = "400" ] && grep -q "alibaba-pai/MiniMax-H3-Acc-LoRAs" "$TMP/b5acc2.json"; then
+  echo "PASS: Acc without the file is a named 400 pointing at the HF repo"
+else
+  echo "FAIL: expected missing-Acc 400 naming the HF repo, got $CODE: $(cat "$TMP/b5acc2.json" | head -c 200)"; rc=1
+fi
+
 # ── [3b] Stacked style LoRAs on H3: the request surface is the SAME
 # `lora_paths`/`lora_scales` grammar the image and LTX handlers take, so a
 # malformed one is a named 400 from the shared parser rather than a field

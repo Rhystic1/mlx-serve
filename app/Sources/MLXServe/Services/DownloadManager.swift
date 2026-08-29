@@ -923,6 +923,45 @@ class DownloadManager: ObservableObject {
         startPackFile(repoId: repoId, fileName: TurboLoraFetch.fileName, onFinish: onFinish)
     }
 
+    /// Fetch the Acc PDD adapter from `alibaba-pai/MiniMax-H3-Acc-LoRAs` into
+    /// an H3 pack that is already on disk. Task key is `acc:<pack>` so it
+    /// cannot collide with a full pack download or a Turbo fetch.
+    func startAccLora(packRepoId: String, fileName: String, onFinish: @escaping @MainActor () -> Void = {}) {
+        let taskKey = AccLoraFetch.taskKey(packRepoId: packRepoId)
+        if let running = activeTasks[taskKey] {
+            Task { @MainActor in
+                _ = await running.value
+                onFinish()
+            }
+            return
+        }
+        let packDir = existingModelDir(for: packRepoId)
+        mediaBundleRepos.insert(packRepoId)
+        mediaBundleRepos.insert(AccLoraFetch.hfRepoId)
+        packFileFetches.insert(taskKey)
+        let srcRepo = AccLoraFetch.hfRepoId
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.download(repoId: srcRepo,
+                                selection: FileSelection(
+                                    excludeSubstrings: [".json", ".md", ".txt", ".jinja", ".model", ".bin"],
+                                    keepSafetensors: [fileName]),
+                                alertOnFailure: true,
+                                destDirOverride: packDir)
+            self.finalizeCancelledPackFile(repoId: srcRepo, fileName: fileName, packDir: packDir)
+            self.packFileFetches.remove(taskKey)
+            self.activeTasks.removeValue(forKey: taskKey)
+            onFinish()
+        }
+        activeTasks[taskKey] = task
+    }
+
+    func cancelAccLora(packRepoId: String) {
+        let taskKey = AccLoraFetch.taskKey(packRepoId: packRepoId)
+        guard packFileFetches.contains(taskKey) else { return }
+        activeTasks[taskKey]?.cancel()
+    }
+
     /// Fetch ONE file of a pack that is already on disk, beside its weights:
     /// the Turbo adapter above, and the ACE-Step cover tokenizer
     /// (`fsq.safetensors`) for packs downloaded before cover mode — that one

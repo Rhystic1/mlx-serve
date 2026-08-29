@@ -838,7 +838,11 @@ Four-part fix, each half load-bearing:
 - `startTurboLora` downloads INTO the pack's resolved dir (`download(destDirOverride:)`) — an adapter's whole point is to sit beside weights that already exist.
 - The Turbo toggle's off-flip cancels an in-flight fetch via `cancelTurboLora`, which is surgical (drops the one file's `.partial` + sidecar) and a NO-OP with nothing running — the generic `cancel(_:)` no-task fallback wipes the repo's whole download dir, which for an adapter fetch is a live 40-69 GB pack.
 
-Guards: `discovery skips an incomplete media pack` + `probeModelDir refuses…` (model_discovery.zig), `incompleteMediaDir` (gen.zig), `tests/test_model_rescan.sh` (incl. server-survives-the-refused-load), `TurboLoraFetchTargetTests`.
+Guards: `discovery skips an incomplete media pack` + `probeModelDir refuses…` (model_discovery.zig), `incompleteMediaDir` (gen.zig), `tests/test_model_rescan.sh` (incl. server-survives-the-refused-load), `TurboLoraFetchTargetTests`. Acc fetch uses the same destDirOverride contract from a *different* HF repo (`AccLoraFetchTargetTests`).
+
+## Acc is not a style LoRA — the PDD head bank is the distill (MiniMax-H3)
+
+alibaba-pai MiniMax-H3-Acc-LoRAs ship rank-64 trunk factors AND a 32-interval PDD output-head bank in one file. Treating Acc as A/B deltas only (the style-LoRA path) silently drops the bank; applying the packed `[3072,5376]` / `[1024,5376]` tensors onto native `[96,5376]` / `[32,5376]` heads is the Comfy crash. Detection peels `HEAD_KEYS` before the generic stack; fusion is Δσ-weighted over the trained video-shift-12 knots (`pdd_acc_core.fuse_heads`); per-step indexing stores 8 (or 4) separate fp32 heads. Acc and Turbo are mutually exclusive. Completeness after convert is 258 modules (Turbo's 259th is `final_layer.adaln_proj.linear`, which Acc omits). Guard: `src/pdd_acc.zig`, `lora.loadFile skips Acc PDD head-bank tensors`, `tests/test_h3_acc.sh`.
 
 ## A directory-entry filter that skips symlinks measures an HF-cache model at ZERO (live 2026-08-09)
 

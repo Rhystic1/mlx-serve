@@ -177,7 +177,7 @@ final class VideoGenService: ObservableObject {
                     ? H3TimeEstimate.livePricing(model: request.model,
                                                  width: request.width, height: request.height,
                                                  frames: request.numFrames, steps: steps,
-                                                 fast: !request.bestQuality && !request.turbo)
+                                                 fast: !request.bestQuality && !request.turbo && !request.acc)
                     : (0, 0)
                 let startedAt = ProcessInfo.processInfo.systemUptime
                 for try await ev in api.streamGeneration(
@@ -459,7 +459,10 @@ final class VideoGenService: ObservableObject {
         // Turbo + chained windows: capability-gated like every H3 field above,
         // and emitted only when engaged — the server's defaults are the
         // absent-field behavior.
-        if request.model.supportsTurbo, request.turbo { body["turbo"] = true }
+        // Acc and Turbo are mutually exclusive server-side; never emit both
+        // even if persisted state still has both flags.
+        if request.model.supportsTurbo, request.turbo, !request.acc { body["turbo"] = true }
+        if request.model.supportsAcc, request.acc { body["acc"] = true }
         if request.model.supportsChainedWindows, request.chainWindows > 1 {
             body["chain_windows"] = request.chainWindows
         }
@@ -558,13 +561,16 @@ final class VideoGenService: ObservableObject {
             lines.append("stg_scale: \(String(format: "%.2f", request.stgScale))")
         }
         if request.model.supportsFastRecipe {
-            lines.append("fast_recipe: \(!request.bestQuality && !request.turbo)")
+            lines.append("fast_recipe: \(!request.bestQuality && !request.turbo && !request.acc)")
         }
         if request.model.supportsDiffusionDecoder {
             lines.append("decoder: \(request.diffusionDecoder ? "diffusion" : "convolution")")
         }
         if request.model.supportsTurbo {
             lines.append("turbo: \(request.turbo)")
+        }
+        if request.model.supportsAcc {
+            lines.append("acc: \(request.acc)")
         }
         if request.model.supportsChainedWindows {
             lines.append("chain_windows: \(max(request.chainWindows, 1))")

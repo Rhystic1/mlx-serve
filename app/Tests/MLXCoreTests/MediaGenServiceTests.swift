@@ -213,6 +213,39 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertNil(body["chain_windows"])
     }
 
+    func testAccIsOnEveryH3PartitionAndExclusiveWithTurboOnTheWire() {
+        XCTAssertTrue(VideoModelPreset.minimaxH3.supportsAcc)
+        XCTAssertTrue(VideoModelPreset.minimaxH3Q4.supportsAcc)
+        XCTAssertTrue(VideoModelPreset.minimaxH3Ref2VA.supportsAcc)
+        for p in VideoModelPreset.all where p.backend != .minimaxH3 {
+            XCTAssertFalse(p.supportsAcc, "\(p.id) must not advertise Acc")
+        }
+
+        var req = VideoGenRequest(model: .minimaxH3, prompt: "p", width: 960, height: 544,
+                                  numFrames: 124, fps: 24, mode: .oneStage, steps: 8, cfgScale: 1.0)
+        var body = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
+        XCTAssertNil(body["acc"], "off by default")
+
+        req.acc = true
+        body = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
+        XCTAssertEqual(body["acc"] as? Bool, true)
+        XCTAssertNil(body["turbo"])
+
+        // Both flags set: Acc wins on the wire. The server 400s the combo.
+        req.turbo = true
+        body = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
+        XCTAssertEqual(body["acc"] as? Bool, true)
+        XCTAssertNil(body["turbo"], "Acc and Turbo must never both be in the body")
+
+        var ref = VideoGenRequest(model: .minimaxH3Ref2VA, prompt: "p", width: 960, height: 544,
+                                  numFrames: 124, fps: 24, mode: .oneStage, steps: 8, cfgScale: 1.0)
+        ref.acc = true
+        ref.turbo = true
+        body = VideoGenService.requestBody(model: "m", prompt: "p", request: ref, firstFrameB64: nil)
+        XCTAssertEqual(body["acc"] as? Bool, true)
+        XCTAssertNil(body["turbo"])
+    }
+
     func testTurboBillsTheLoraBesideTheDiT() {
         // Turbo forces the recipe off (fast: false) and adds the resident
         // LoRA to the sampling term. On the REAL packs the staged load floor
@@ -231,6 +264,21 @@ final class MediaGenServiceTests: XCTestCase {
         let b = H3Plan.peakBytes(model: tiny, width: 960, height: 544, frames: 124, fast: false)
         let t = H3Plan.peakBytes(model: tiny, width: 960, height: 544, frames: 124, fast: false, turbo: true)
         XCTAssertEqual(t - b, H3Plan.turboLoraBytes)
+    }
+
+    func testAccBillsTheFileBesideTheDiT() {
+        let base = H3Plan.peakBytes(model: .minimaxH3, width: 960, height: 544,
+                                    frames: 124, fast: false)
+        let accReal = H3Plan.peakBytes(model: .minimaxH3, width: 960, height: 544,
+                                       frames: 124, fast: false, acc: true)
+        XCTAssertGreaterThanOrEqual(accReal, base)
+
+        var tiny = VideoModelPreset.minimaxH3
+        tiny.stagedPeakGB = 1
+        tiny.ditResidentGB = 1
+        let b = H3Plan.peakBytes(model: tiny, width: 960, height: 544, frames: 124, fast: false)
+        let a = H3Plan.peakBytes(model: tiny, width: 960, height: 544, frames: 124, fast: false, acc: true)
+        XCTAssertEqual(a - b, H3Plan.accLoraBytes)
     }
 
     func testStreamStartFailureSurfacesTheServersOwnMessage() {
@@ -1325,6 +1373,8 @@ extension MediaGenServiceTests {
         // own module names and sums them with the Turbo distillation.
         XCTAssertTrue(h3.supportsLoRA)
         XCTAssertTrue(VideoModelPreset.minimaxH3Ref2VA.supportsLoRA)
+        XCTAssertTrue(h3.supportsAcc)
+        XCTAssertTrue(VideoModelPreset.minimaxH3Ref2VA.supportsAcc)
 
         // It writes its own soundtrack jointly with the frames, so there is no
         // audio INPUT to condition on.

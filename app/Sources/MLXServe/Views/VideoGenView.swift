@@ -90,6 +90,9 @@ struct VideoGenView: View {
     @State private var diffusionDecoder: Bool = false
     /// Turbo distillation LoRA (H3 fl2va): 4-step sampling, recipe off.
     @State private var turbo: Bool = false
+    /// Acc PDD distillation (H3, both partitions): 8-step (or 4-step) Euler.
+    /// Exclusive with Turbo — flipping one clears the other.
+    @State private var acc: Bool = false
     /// Hydration guard — see ImageGenView for the full rationale.
     @State private var hydrating: Bool = false
     @State private var didHydrate: Bool = false
@@ -458,20 +461,24 @@ struct VideoGenView: View {
     /// Soft hint when the chosen length looks too aggressive for the Mac's
     /// total RAM at the current resolution. Doesn't block — the user might
     /// know better (e.g. they just freed memory).
-    private var turboEngaged: Bool { turbo && model.supportsTurbo }
-    /// What the server's recipe actually runs: turbo forces it off, so every
-    /// plan/estimate call reads THIS, never `!bestQuality` alone.
-    private var effectiveFast: Bool { !bestQuality && !turboEngaged }
-    /// The steps slider under turbo offers the LoRA's own trained range.
+    private var turboEngaged: Bool { turbo && model.supportsTurbo && !accEngaged }
+    private var accEngaged: Bool { acc && model.supportsAcc }
+    /// What the server's recipe actually runs: Turbo and Acc both force it
+    /// off, so every plan/estimate call reads THIS, never `!bestQuality` alone.
+    private var effectiveFast: Bool { !bestQuality && !turboEngaged && !accEngaged }
+    /// The steps slider under Acc is the trained 8-step (or regrouped 4-step)
+    /// grid; under Turbo the LoRA's own 4...16; otherwise the preset range.
     private var effectiveStepsRange: ClosedRange<Int> {
-        turboEngaged ? 4...16 : model.stepsRange
+        if accEngaged { return 4...8 }
+        if turboEngaged { return 4...16 }
+
+        return model.stepsRange
     }
 
-    /// Whether a few-step adapter is driving this render: the engine-owned
-    /// Turbo toggle, or any attached Style LoRA. The REF2VA pack has no Turbo
-    /// toggle at all — a community distillation loaded here is the ONLY way it
-    /// samples in 4 steps — so the LoRA list is load-bearing, not a nicety.
-    private var distilledSampling: Bool { turboEngaged || !loras.isEmpty }
+    /// Whether a few-step adapter is driving this render: Acc, Turbo, or any
+    /// attached Style LoRA. Acc is the engine-owned 8-step distill on BOTH
+    /// partitions; REF2VA still has no Turbo toggle.
+    private var distilledSampling: Bool { turboEngaged || accEngaged || !loras.isEmpty }
 
     /// guess.
     private var frameRAMWarning: String? {
@@ -492,13 +499,13 @@ struct VideoGenView: View {
         // fits" and "nothing fits", and a Mac too small to load the pack saw
         // no warning at all at exactly 124 frames.
         guard !H3Plan.fits(model: model, width: effectiveSize.width, height: effectiveSize.height,
-                           frames: numFrames, fast: effectiveFast, turbo: turboEngaged, availableGB: total) else { return nil }
+                           frames: numFrames, fast: effectiveFast, turbo: turboEngaged, acc: accEngaged, availableGB: total) else { return nil }
         let gib = 1024.0 * 1024.0 * 1024.0
         let need = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
-                                           frames: numFrames, fast: effectiveFast, turbo: turboEngaged)) / gib
+                                           frames: numFrames, fast: effectiveFast, turbo: turboEngaged, acc: accEngaged)) / gib
         var out = String(format: "Needs about %.0f GB at this size and length; your Mac has %d GB. ", need, total)
         let floorFits = H3Plan.fits(model: model, width: effectiveSize.width, height: effectiveSize.height,
-                                    frames: cap, fast: effectiveFast, turbo: turboEngaged, availableGB: total)
+                                    frames: cap, fast: effectiveFast, turbo: turboEngaged, acc: accEngaged, availableGB: total)
         out += floorFits && cap < numFrames ? "About \(cap) frames fits here" : "Try a smaller resolution"
         if effectiveFast {
             let slow = Double(H3Plan.peakBytes(model: model, width: effectiveSize.width, height: effectiveSize.height,
@@ -964,7 +971,9 @@ struct VideoGenView: View {
             // Steps — more steps = more detail/smoother motion, but slower.
             intSliderRow("Steps", value: $steps, range: effectiveStepsRange,
                          help: "Denoising steps. More = more detail and smoother motion, but slower.")
-            Text(turboEngaged ? "4 steps is sharp on this adapter and is the floor; more steps still help a little. If the picture shows over-sharp grain, drop the LoRA scale to 0.8-0.95; if it ghosts, raise it to 1.05-1.2." : model.stepsHelp)
+            Text(accEngaged
+                 ? "Acc is distilled for 8 Euler steps (or 4 by regrouping the trained blocks). Other counts need a matching acc_partition and are refused."
+                 : (turboEngaged ? "4 steps is sharp on this adapter and is the floor; more steps still help a little. If the picture shows over-sharp grain, drop the LoRA scale to 0.8-0.95; if it ghosts, raise it to 1.05-1.2." : model.stepsHelp))
                 .font(.caption2).foregroundStyle(.secondary)
             // The low end is REACHABLE and only advised against, so the pane
             // can load a community few-step adapter the way the server can.
@@ -1039,6 +1048,10 @@ struct VideoGenView: View {
                     .help("Runs the Turbo distillation LoRA: 4 steps instead of 30, about twice as fast end to end. Slightly softer detail and harder light than a full render. The adapter ships with the model; packs downloaded before it existed fetch it once, on the first run with this on.")
                     .onChange(of: turbo) { _, on in
                         guard !hydrating else { return }
+                        if on {
+                            acc = false
+                            downloads.cancelAccLora(packRepoId: model.repo)
+                        }
                         // Snap steps into the mode's own range: 4 is what the
                         // adapter is distilled for, 30 the full render default.
                         steps = on ? 4 : min(model.stepsRange.upperBound, max(model.stepsRange.lowerBound, 30))
@@ -1064,6 +1077,34 @@ struct VideoGenView: View {
                         .font(.caption2).foregroundStyle(.secondary)
                 }
             }
+            if model.supportsAcc {
+                Toggle("Acc (PDD 8-step distillation)", isOn: $acc)
+                    .font(.caption)
+                    .help("Runs alibaba-pai's Acc adapter: trunk LoRA plus a fused PDD output-head bank on the trained 8-step (or regrouped 4-step) Euler grid. Exclusive with Turbo. Missing file downloads once from Hugging Face into this pack.")
+                    .onChange(of: acc) { _, on in
+                        guard !hydrating else { return }
+                        if on {
+                            turbo = false
+                            downloads.cancelTurboLora(repoId: model.repo)
+                        }
+                        steps = on ? 8 : min(model.stepsRange.upperBound, max(model.stepsRange.lowerBound, 30))
+                        persist()
+                        if on, accFetchDecision == .fetch {
+                            downloads.startAccLora(
+                                packRepoId: model.repo,
+                                fileName: AccLoraFetch.fileName(supportsReferences: model.supportsReferences))
+                        } else if !on {
+                            downloads.cancelAccLora(packRepoId: model.repo)
+                        }
+                    }
+                if accFetchDecision == .fetch {
+                    Text("Acc needs a ~\(AccLoraFetch.approxMB) MB adapter from \(AccLoraFetch.hfRepoId) — it downloads once into this pack, and Generate waits for it.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                } else if accFetchDecision == .unavailableRemotely {
+                    Text("Acc runs on the Mac hosting this model; it needs the Acc file in ITS copy of the pack.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
             if model.supportsDiffusionDecoder {
                 Toggle("Diffusion decoder (sharper, slower)", isOn: $diffusionDecoder)
                     .font(.caption)
@@ -1073,9 +1114,9 @@ struct VideoGenView: View {
                 Toggle("Max quality (slower)", isOn: $bestQuality)
                     .font(.caption)
                     .help("Off (default): the fast recipe — step caching + attention reuse, about 2.8x faster at 768p. On: every denoising step is fully computed; marginally better detail for final renders.")
-                    // Under turbo the recipe is already off server-side; a
-                    // toggle that could not change anything is a dead control.
-                    .disabled(turboEngaged)
+                    // Under Turbo or Acc the recipe is already off server-side;
+                    // a toggle that could not change anything is a dead control.
+                    .disabled(turboEngaged || accEngaged)
             }
             Toggle("Keep model loaded after generating", isOn: $keepResident)
                 .font(.caption)
@@ -1405,9 +1446,11 @@ struct VideoGenView: View {
         numFrames = s.numFrames
         fps = s.fps
         mode = s.mode
-        // Turbo restores BEFORE the steps clamp: its range reaches below the
-        // preset's floor, and clamping first would bounce a saved 8 up to 16.
-        turbo = s.turbo && model.supportsTurbo
+        // Turbo and Acc restore BEFORE the steps clamp: their ranges reach
+        // below the preset's floor, and clamping first would bounce a saved
+        // 8 up to 16. Acc wins if both were persisted — they cannot combine.
+        acc = s.acc && model.supportsAcc
+        turbo = s.turbo && model.supportsTurbo && !acc
         // Clamp into the slider ranges — a value persisted by the old wider
         // steppers (Steps unbounded, CFG 0…20) would otherwise sit off-scale.
         steps = min(effectiveStepsRange.upperBound, max(effectiveStepsRange.lowerBound, s.steps))
@@ -1450,6 +1493,7 @@ struct VideoGenView: View {
         s.bestQuality = bestQuality
         s.diffusionDecoder = diffusionDecoder
         s.turbo = turbo
+        s.acc = acc
         s.promptHeight = PromptEditorHeight.clamp(promptHeight)
         s.loras = loras
         s.save()
@@ -1484,9 +1528,10 @@ struct VideoGenView: View {
         let s = model.settings(quality)
         mode = s.mode
         // A quality tier describes a FULL render — its step counts are the
-        // non-turbo schedule's — so picking one turns turbo off rather than
-        // clamping the tier's 30 steps into turbo's 16-step ceiling.
+        // non-distill schedule's — so picking one turns Turbo and Acc off
+        // rather than clamping the tier's 30 steps into a 4- or 8-step ceiling.
         turbo = false
+        acc = false
         // Clamp into the backend's range: a preset switch carrying a value the
         // new model's slider cannot show leaves the control off-scale.
         steps = min(model.stepsRange.upperBound, max(model.stepsRange.lowerBound, s.steps))
@@ -1552,6 +1597,7 @@ struct VideoGenView: View {
             // Belt-and-braces with the requestBody gate (turbo state survives
             // preset switches, like the reference files below).
             turbo: turboEngaged,
+            acc: accEngaged,
             // Gated here too: the stepper's value survives a preset switch,
             // and only the fl2va partition has a keyframe row to chain.
             chainWindows: model.supportsChainedWindows ? chainWindows : 1,
@@ -1580,6 +1626,15 @@ struct VideoGenView: View {
         // ON from a previous session, or the fetch it started can still be in
         // flight. `startTurboLora` attaches to a running transfer rather than
         // starting a second one, so both paths converge on one download.
+        if accFetchDecision == .fetch {
+            downloads.startAccLora(
+                packRepoId: model.repo,
+                fileName: AccLoraFetch.fileName(supportsReferences: model.supportsReferences)) {
+                service.generate(req, server: server)
+            }
+
+            return
+        }
         if turboFetchDecision == .fetch {
             downloads.startTurboLora(repoId: model.repo) {
                 service.generate(req, server: server)
@@ -1592,6 +1647,17 @@ struct VideoGenView: View {
 
     /// Whether this pane's current selection needs the Turbo adapter fetched.
     /// The file lives in the pack, so a LAN model's is not ours to complete.
+    private var accFetchDecision: AccLoraFetch.Decision {
+        AccLoraFetch.decide(
+            accRequested: acc,
+            backendSupportsAcc: model.supportsAcc,
+            isRemote: lanModel != nil,
+            fileOnDisk: AccLoraFetch.isOnDisk(
+                modelDir: ServerManager.resolveModelDir(repo: model.repo),
+                supportsReferences: model.supportsReferences)
+        )
+    }
+
     private var turboFetchDecision: TurboLoraFetch.Decision {
         TurboLoraFetch.decide(
             turboRequested: turbo,

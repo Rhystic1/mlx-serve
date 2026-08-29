@@ -42,6 +42,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
+const pdd_acc = @import("pdd_acc.zig");
 
 /// Non-owning adapter reference installed on a linear layer. `at`/`bt` are
 /// pre-transposed bf16 so the hot path is two plain matmuls.
@@ -96,6 +97,11 @@ pub fn parseKey(key: []const u8) ?KeyInfo {
         .{ ".lora_up.weight", Role.b },
         .{ ".lora.up.default.weight", Role.b },
         .{ ".lora.up.weight", Role.b },
+        // Original alibaba-pai Acc files omit `.weight` on lora_down/up.
+        .{ ".lora_down", Role.a },
+        .{ ".lora_up", Role.b },
+        .{ ".lora_A", Role.a },
+        .{ ".lora_B", Role.b },
         .{ ".alpha", Role.alpha },
     };
     inline for (suffixes) |sf| {
@@ -654,6 +660,11 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
         file_scale orelse 1.0,
         if (file_scale == null) " (file declares no alpha)" else " from the file's own alpha",
     });
+    if (pdd_acc.detectFromFilename(std.fs.path.basename(path))) {
+        log.warn("[lora] {s} looks like a MiniMax-H3 Acc file; PDD heads are ignored on the generic loader — use Acc mode\n", .{
+            std.fs.path.basename(path),
+        });
+    }
 
     var partials = std.StringHashMap(Partial).init(allocator);
     defer {
@@ -676,7 +687,15 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
             _ = mlx.mlx_array_free(value);
             break;
         }
-        const info = parseKey(std.mem.span(key.?)) orelse {
+        const kspan = std.mem.span(key.?);
+        // PDD Acc head-bank tensors are NOT LoRA factors. Feeding a packed
+        // `[3072, 5376]` `proj_out.weight` into a native `[96, 5376]` head is
+        // the Comfy crash; skip them here and load Acc through `loadPddAcc`.
+        if (pdd_acc.isHeadKey(kspan)) {
+            _ = mlx.mlx_array_free(value);
+            continue;
+        }
+        const info = parseKey(kspan) orelse {
             _ = mlx.mlx_array_free(value);
             continue;
         };
@@ -761,6 +780,560 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
     return .{ .allocator = allocator, .entries = try entries.toOwnedSlice(allocator) };
 }
 
+pub fn detectPdd(allocator: std.mem.Allocator, path: []const u8) bool {
+    return pdd_acc.detectPddPath(allocator, path);
+}
+
+pub const FineBank = struct {
+    w: []f32,
+    b: []f32,
+    n: u32,
+    out: u32,
+    in_dim: u32,
+
+    pub fn deinit(self: *FineBank, allocator: std.mem.Allocator) void {
+        allocator.free(self.w);
+        allocator.free(self.b);
+        self.* = undefined;
+    }
+};
+
+pub const PddHeads = struct {
+    video: FineBank,
+    audio: FineBank,
+    partition: ?pdd_acc.Partition,
+    alpha: f32,
+
+    pub fn deinit(self: *PddHeads, allocator: std.mem.Allocator) void {
+        self.video.deinit(allocator);
+        self.audio.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const PddAccLoad = struct {
+    trunk: File,
+    heads: PddHeads,
+
+    pub fn deinit(self: *PddAccLoad) void {
+        self.heads.deinit(self.trunk.allocator);
+        self.trunk.deinit();
+    }
+};
+
+const HostTen = struct {
+    data: []f32,
+    rows: usize,
+    cols: usize,
+};
+
+fn copyToHostF32(allocator: std.mem.Allocator, arr: mlx.mlx_array, s: mlx.mlx_stream) ![]f32 {
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, arr, .float32, s));
+    var c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_contiguous(&c, f, false, s));
+    try mlx.check(mlx.mlx_array_eval(c));
+    const n = mlx.mlx_array_size(c);
+    const ptr = mlx.mlx_array_data_float32(c) orelse return error.AccHeadReadFailed;
+    const out = try allocator.alloc(f32, n);
+    @memcpy(out, ptr[0..n]);
+
+    return out;
+}
+
+fn hostShape2(arr: mlx.mlx_array) struct { rows: usize, cols: usize } {
+    const sh = mlx.getShape(arr);
+    if (sh.len == 0) return .{ .rows = 1, .cols = 1 };
+    if (sh.len == 1) return .{ .rows = 1, .cols = @intCast(sh[0]) };
+
+    return .{ .rows = @intCast(sh[0]), .cols = @intCast(sh[1]) };
+}
+
+fn popHost(sd: *std.StringHashMap(HostTen), key: []const u8) ?HostTen {
+    const kv = sd.fetchRemove(key) orelse return null;
+    sd.allocator.free(kv.key);
+
+    return kv.value;
+}
+
+fn popHostDown(sd: *std.StringHashMap(HostTen), buf: []u8, comptime fmt: []const u8, args: anytype) ?HostTen {
+    const k = std.fmt.bufPrint(buf, fmt, args) catch return null;
+    if (popHost(sd, k)) |ten| return ten;
+    const k2 = std.fmt.bufPrint(buf, fmt ++ ".weight", args) catch return null;
+
+    return popHost(sd, k2);
+}
+
+fn fileFromConverted(
+    allocator: std.mem.Allocator,
+    converted: []pdd_acc.ConvertedLora,
+    s: mlx.mlx_stream,
+) !File {
+    var entries: std.ArrayList(Entry) = .empty;
+    errdefer {
+        for (entries.items) |*e| {
+            allocator.free(e.module);
+            _ = mlx.mlx_array_free(e.at);
+            _ = mlx.mlx_array_free(e.bt);
+        }
+        entries.deinit(allocator);
+    }
+    for (converted) |c| {
+        const ash = [_]c_int{ @intCast(c.a_rows), @intCast(c.a_cols) };
+        const bsh = [_]c_int{ @intCast(c.b_rows), @intCast(c.b_cols) };
+        const aarr = mlx.mlx_array_new_data(c.a.ptr, &ash, 2, .float32);
+        defer _ = mlx.mlx_array_free(aarr);
+        const barr = mlx.mlx_array_new_data(c.b.ptr, &bsh, 2, .float32);
+        defer _ = mlx.mlx_array_free(barr);
+        const at = try prepTransposed(aarr, s);
+        errdefer _ = mlx.mlx_array_free(at);
+        const bt = try prepTransposed(barr, s);
+        errdefer _ = mlx.mlx_array_free(bt);
+        const rank: f32 = @floatFromInt(c.a_rows);
+        try entries.append(allocator, .{
+            .module = try allocator.dupe(u8, c.module),
+            .at = at,
+            .bt = bt,
+            .scale = c.alpha / rank,
+        });
+    }
+
+    return .{ .allocator = allocator, .entries = try entries.toOwnedSlice(allocator) };
+}
+
+fn convertOriginalAcc(
+    allocator: std.mem.Allocator,
+    sd: *std.StringHashMap(HostTen),
+    alpha: f32,
+) ![]pdd_acc.ConvertedLora {
+    var out: std.ArrayList(pdd_acc.ConvertedLora) = .empty;
+    errdefer {
+        for (out.items) |*c| c.deinit(allocator);
+        out.deinit(allocator);
+    }
+    var kbuf: [160]u8 = undefined;
+
+    const emit_plain = struct {
+        fn f(
+            alloc: std.mem.Allocator,
+            map: *std.StringHashMap(HostTen),
+            kb: []u8,
+            dst: []const u8,
+            src: []const u8,
+            half_swap: bool,
+            al: f32,
+            list: *std.ArrayList(pdd_acc.ConvertedLora),
+        ) !bool {
+            const down_fmt = "{s}.lora_down";
+            const up_fmt = "{s}.lora_up";
+            const a_ten = popHostDown(map, kb, down_fmt, .{src}) orelse return false;
+            defer alloc.free(a_ten.data);
+            const b_ten = popHostDown(map, kb, up_fmt, .{src}) orelse return error.AccIncomplete;
+            defer alloc.free(b_ten.data);
+            var b_data = b_ten.data;
+            var b_owned = false;
+            if (half_swap) {
+                b_data = try pdd_acc.convertFc1Up(alloc, .{
+                    .data = b_ten.data,
+                    .rows = b_ten.rows,
+                    .cols = b_ten.cols,
+                });
+                b_owned = true;
+            }
+            errdefer if (b_owned) alloc.free(b_data);
+            const a_copy = try alloc.dupe(f32, a_ten.data);
+            errdefer alloc.free(a_copy);
+            const b_copy = if (b_owned) b_data else try alloc.dupe(f32, b_ten.data);
+            try list.append(alloc, .{
+                .module = try alloc.dupe(u8, dst),
+                .a = a_copy,
+                .a_rows = a_ten.rows,
+                .a_cols = a_ten.cols,
+                .b = b_copy,
+                .b_rows = b_ten.rows,
+                .b_cols = b_ten.cols,
+                .alpha = al,
+            });
+
+            return true;
+        }
+    }.f;
+
+    var i: u32 = 0;
+    while (i < 50) : (i += 1) {
+        const src = std.fmt.bufPrint(&kbuf, "transformer_blocks.{d}", .{i}) catch continue;
+        const src_owned = try allocator.dupe(u8, src);
+        defer allocator.free(src_owned);
+        var qbuf: [160]u8 = undefined;
+        const qk = std.fmt.bufPrint(&qbuf, "{s}.attn.to_q.lora_down", .{src_owned}) catch continue;
+        if (sd.get(qk) == null) {
+            const qk2 = std.fmt.bufPrint(&qbuf, "{s}.attn.to_q.lora_down.weight", .{src_owned}) catch continue;
+            if (sd.get(qk2) == null) continue;
+        }
+        var downs: [3]pdd_acc.HostMat = undefined;
+        var ups: [3]pdd_acc.HostMat = undefined;
+        var down_own: [3]HostTen = undefined;
+        var up_own: [3]HostTen = undefined;
+        const branches = .{ "to_q", "to_k", "to_v" };
+        inline for (branches, 0..) |br, bi| {
+            down_own[bi] = popHostDown(sd, &qbuf, "{s}.attn.{s}.lora_down", .{ src_owned, br }) orelse return error.AccIncomplete;
+            up_own[bi] = popHostDown(sd, &qbuf, "{s}.attn.{s}.lora_up", .{ src_owned, br }) orelse return error.AccIncomplete;
+            downs[bi] = .{ .data = down_own[bi].data, .rows = down_own[bi].rows, .cols = down_own[bi].cols };
+            ups[bi] = .{ .data = up_own[bi].data, .rows = up_own[bi].rows, .cols = up_own[bi].cols };
+        }
+        defer for (down_own) |ten| allocator.free(ten.data);
+        defer for (up_own) |ten| allocator.free(ten.data);
+        const qkv = try pdd_acc.convertQkv(allocator, downs, ups, alpha);
+        const dst = try std.fmt.allocPrint(allocator, "blocks.{d}.attn.qkv_proj", .{i});
+        try out.append(allocator, .{
+            .module = dst,
+            .a = qkv.a,
+            .a_rows = qkv.a_rows,
+            .a_cols = qkv.a_cols,
+            .b = qkv.b,
+            .b_rows = qkv.b_rows,
+            .b_cols = qkv.b_cols,
+            .alpha = qkv.alpha,
+        });
+        const dst_out = try std.fmt.allocPrint(allocator, "blocks.{d}.attn.out_proj", .{i});
+        defer allocator.free(dst_out);
+        const src_out = try std.fmt.allocPrint(allocator, "{s}.attn.to_out.0", .{src_owned});
+        defer allocator.free(src_out);
+        if (!try emit_plain(allocator, sd, &qbuf, dst_out, src_out, false, alpha, &out))
+            return error.AccIncomplete;
+        const dst_fc1 = try std.fmt.allocPrint(allocator, "blocks.{d}.mlp.fc1", .{i});
+        defer allocator.free(dst_fc1);
+        const src_fc1 = try std.fmt.allocPrint(allocator, "{s}.ff.net.0.proj", .{src_owned});
+        defer allocator.free(src_fc1);
+        if (!try emit_plain(allocator, sd, &qbuf, dst_fc1, src_fc1, true, alpha, &out))
+            return error.AccIncomplete;
+        const dst_fc2 = try std.fmt.allocPrint(allocator, "blocks.{d}.mlp.fc2", .{i});
+        defer allocator.free(dst_fc2);
+        const src_fc2 = try std.fmt.allocPrint(allocator, "{s}.ff.net.2", .{src_owned});
+        defer allocator.free(src_fc2);
+        if (!try emit_plain(allocator, sd, &qbuf, dst_fc2, src_fc2, false, alpha, &out))
+            return error.AccIncomplete;
+        const src_ad = try std.fmt.allocPrint(allocator, "{s}.adaln_proj.linear", .{src_owned});
+        defer allocator.free(src_ad);
+        const dst_ad = try std.fmt.allocPrint(allocator, "blocks.{d}.adaln_proj.linear", .{i});
+        defer allocator.free(dst_ad);
+        if (!try emit_plain(allocator, sd, &qbuf, dst_ad, src_ad, false, alpha, &out))
+            return error.AccIncomplete;
+    }
+    i = 0;
+    while (i < 2) : (i += 1) {
+        const src_owned = try std.fmt.allocPrint(allocator, "token_refiner.refiner_blocks.{d}", .{i});
+        defer allocator.free(src_owned);
+        var qbuf: [160]u8 = undefined;
+        const qk = std.fmt.bufPrint(&qbuf, "{s}.attn.to_q.lora_down", .{src_owned}) catch continue;
+        if (sd.get(qk) == null) {
+            const qk2 = std.fmt.bufPrint(&qbuf, "{s}.attn.to_q.lora_down.weight", .{src_owned}) catch continue;
+            if (sd.get(qk2) == null) continue;
+        }
+        var downs: [3]pdd_acc.HostMat = undefined;
+        var ups: [3]pdd_acc.HostMat = undefined;
+        var down_own: [3]HostTen = undefined;
+        var up_own: [3]HostTen = undefined;
+        const branches = .{ "to_q", "to_k", "to_v" };
+        inline for (branches, 0..) |br, bi| {
+            down_own[bi] = popHostDown(sd, &qbuf, "{s}.attn.{s}.lora_down", .{ src_owned, br }) orelse return error.AccIncomplete;
+            up_own[bi] = popHostDown(sd, &qbuf, "{s}.attn.{s}.lora_up", .{ src_owned, br }) orelse return error.AccIncomplete;
+            downs[bi] = .{ .data = down_own[bi].data, .rows = down_own[bi].rows, .cols = down_own[bi].cols };
+            ups[bi] = .{ .data = up_own[bi].data, .rows = up_own[bi].rows, .cols = up_own[bi].cols };
+        }
+        defer for (down_own) |ten| allocator.free(ten.data);
+        defer for (up_own) |ten| allocator.free(ten.data);
+        const qkv = try pdd_acc.convertQkv(allocator, downs, ups, alpha);
+        const dst = try std.fmt.allocPrint(allocator, "token_refiner.blocks.{d}.attn.qkv_proj", .{i});
+        try out.append(allocator, .{
+            .module = dst,
+            .a = qkv.a,
+            .a_rows = qkv.a_rows,
+            .a_cols = qkv.a_cols,
+            .b = qkv.b,
+            .b_rows = qkv.b_rows,
+            .b_cols = qkv.b_cols,
+            .alpha = qkv.alpha,
+        });
+        const dst_out = try std.fmt.allocPrint(allocator, "token_refiner.blocks.{d}.attn.out_proj", .{i});
+        defer allocator.free(dst_out);
+        const src_out = try std.fmt.allocPrint(allocator, "{s}.attn.to_out.0", .{src_owned});
+        defer allocator.free(src_out);
+        if (!try emit_plain(allocator, sd, &qbuf, dst_out, src_out, false, alpha, &out))
+            return error.AccIncomplete;
+        const dst_fc1 = try std.fmt.allocPrint(allocator, "token_refiner.blocks.{d}.mlp.fc1", .{i});
+        defer allocator.free(dst_fc1);
+        const src_fc1 = try std.fmt.allocPrint(allocator, "{s}.ff.net.0.proj", .{src_owned});
+        defer allocator.free(src_fc1);
+        if (!try emit_plain(allocator, sd, &qbuf, dst_fc1, src_fc1, true, alpha, &out))
+            return error.AccIncomplete;
+        const dst_fc2 = try std.fmt.allocPrint(allocator, "token_refiner.blocks.{d}.mlp.fc2", .{i});
+        defer allocator.free(dst_fc2);
+        const src_fc2 = try std.fmt.allocPrint(allocator, "{s}.ff.net.2", .{src_owned});
+        defer allocator.free(src_fc2);
+        if (!try emit_plain(allocator, sd, &qbuf, dst_fc2, src_fc2, false, alpha, &out))
+            return error.AccIncomplete;
+    }
+
+    // Per-module `.alpha` tensors and any unused extras: leftover alphas are
+    // consumed (file-wide alpha already applied); anything else is a refuse.
+    var leftover_it = sd.iterator();
+    var leftover_n: usize = 0;
+    while (leftover_it.next()) |e| {
+        if (std.mem.endsWith(u8, e.key_ptr.*, ".alpha")) continue;
+        leftover_n += 1;
+    }
+    if (leftover_n != 0) return error.AccLeftoverKeys;
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn ingestHead(
+    allocator: std.mem.Allocator,
+    w_opt: *?mlx.mlx_array,
+    b_opt: *?mlx.mlx_array,
+    native_out: usize,
+    s: mlx.mlx_stream,
+) !FineBank {
+    const w_arr = w_opt.* orelse return error.AccMissingHeads;
+    const b_arr = b_opt.* orelse return error.AccMissingHeads;
+    defer {
+        _ = mlx.mlx_array_free(w_arr);
+        _ = mlx.mlx_array_free(b_arr);
+        w_opt.* = null;
+        b_opt.* = null;
+    }
+    const wsh_c = mlx.getShape(w_arr);
+    var wsh_buf: [4]usize = undefined;
+    for (wsh_c, 0..) |d, i| wsh_buf[i] = @intCast(d);
+    const parsed = try pdd_acc.parseHeadWeightShape(wsh_buf[0..wsh_c.len], native_out);
+    const bsh_c = mlx.getShape(b_arr);
+    var bsh_buf: [4]usize = undefined;
+    for (bsh_c, 0..) |d, i| bsh_buf[i] = @intCast(d);
+    const bparsed = try pdd_acc.parseHeadBiasShape(bsh_buf[0..bsh_c.len], native_out);
+    if (parsed.n != bparsed.n or parsed.out != bparsed.out) return error.AccBadHeadShape;
+    const w = try copyToHostF32(allocator, w_arr, s);
+    errdefer allocator.free(w);
+    const b = try copyToHostF32(allocator, b_arr, s);
+    errdefer allocator.free(b);
+
+    return .{
+        .w = w,
+        .b = b,
+        .n = @intCast(parsed.n),
+        .out = @intCast(parsed.out),
+        .in_dim = @intCast(parsed.in),
+    };
+}
+
+/// Load a MiniMax-H3 Acc file: peel the PDD head bank, convert the trunk
+/// LoRA onto our module names, never copy the packed bank onto a native head.
+pub fn loadPddAcc(allocator: std.mem.Allocator, path: []const u8) !PddAccLoad {
+    try validatePath(path);
+    const pathz = try allocator.dupeSentinel(u8, path, 0);
+    defer allocator.free(pathz);
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+
+    var tensor_map = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
+    var meta_map = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta_map);
+    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, pathz, s));
+    const file_scale = fileAlphaScale(allocator, meta_map);
+
+    const meta_alpha: f32 = if (metaGet(meta_map, "lora_alpha")) |v|
+        std.fmt.parseFloat(f32, v) catch 64.0
+    else
+        64.0;
+    const meta_part = pdd_acc.partitionFromName(metaGet(meta_map, "pdd_partition"), std.fs.path.basename(path));
+
+    var proj_w: ?mlx.mlx_array = null;
+    var proj_b: ?mlx.mlx_array = null;
+    var aud_w: ?mlx.mlx_array = null;
+    var aud_b: ?mlx.mlx_array = null;
+    var rest = std.StringHashMap(HostTen).init(allocator);
+    defer {
+        var it = rest.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            allocator.free(e.value_ptr.data);
+        }
+        rest.deinit();
+        inline for (.{ &proj_w, &proj_b, &aud_w, &aud_b }) |slot| {
+            if (slot.*) |a| _ = mlx.mlx_array_free(a);
+        }
+    }
+
+    var converted_format = false;
+    var partials = std.StringHashMap(Partial).init(allocator);
+    defer {
+        var pit = partials.iterator();
+        while (pit.next()) |e| {
+            if (e.value_ptr.a.ctx != null) _ = mlx.mlx_array_free(e.value_ptr.a);
+            if (e.value_ptr.b.ctx != null) _ = mlx.mlx_array_free(e.value_ptr.b);
+            allocator.free(e.key_ptr.*);
+        }
+        partials.deinit();
+    }
+
+    const iter = mlx.mlx_map_string_to_array_iterator_new(tensor_map);
+    defer _ = mlx.mlx_map_string_to_array_iterator_free(iter);
+    while (true) {
+        var key: ?[*:0]const u8 = null;
+        var value = mlx.mlx_array_new();
+        const ret = mlx.mlx_map_string_to_array_iterator_next(&key, &value, iter);
+        if (ret != 0 or key == null) {
+            _ = mlx.mlx_array_free(value);
+            break;
+        }
+        const kspan = std.mem.span(key.?);
+        if (std.mem.eql(u8, kspan, "proj_out.weight")) {
+            if (proj_w) |old| _ = mlx.mlx_array_free(old);
+            proj_w = value;
+            continue;
+        }
+        if (std.mem.eql(u8, kspan, "proj_out.bias")) {
+            if (proj_b) |old| _ = mlx.mlx_array_free(old);
+            proj_b = value;
+            continue;
+        }
+        if (std.mem.eql(u8, kspan, "audio_proj_out.weight")) {
+            if (aud_w) |old| _ = mlx.mlx_array_free(old);
+            aud_w = value;
+            continue;
+        }
+        if (std.mem.eql(u8, kspan, "audio_proj_out.bias")) {
+            if (aud_b) |old| _ = mlx.mlx_array_free(old);
+            aud_b = value;
+            continue;
+        }
+        // Converted Acc files already use our module names (`blocks.N.qkv_proj`).
+        // Original alibaba-pai files use `transformer_blocks` + `lora_down` and
+        // need convertOriginalAcc — do not treat those as converted just because
+        // a stray `.lora_A.weight` suffix appears.
+        if (std.mem.indexOf(u8, kspan, "transformer_blocks.") != null or
+            std.mem.indexOf(u8, kspan, ".lora_down") != null)
+        {
+            converted_format = false;
+        } else if (std.mem.indexOf(u8, kspan, "qkv_proj") != null or
+            std.mem.startsWith(u8, kspan, "diffusion_model.blocks.") or
+            std.mem.endsWith(u8, kspan, ".lora_A.weight"))
+        {
+            converted_format = true;
+        }
+        if (converted_format) {
+            const info = parseKey(kspan) orelse {
+                _ = mlx.mlx_array_free(value);
+                continue;
+            };
+            const gop = try partials.getOrPut(info.module);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try allocator.dupe(u8, info.module);
+                gop.value_ptr.* = .{ .flat = info.flat };
+            }
+            switch (info.role) {
+                .a => {
+                    if (gop.value_ptr.a.ctx != null) _ = mlx.mlx_array_free(gop.value_ptr.a);
+                    gop.value_ptr.a = value;
+                },
+                .b => {
+                    if (gop.value_ptr.b.ctx != null) _ = mlx.mlx_array_free(gop.value_ptr.b);
+                    gop.value_ptr.b = value;
+                },
+                .alpha => {
+                    gop.value_ptr.alpha = scalarValue(value, s);
+                    _ = mlx.mlx_array_free(value);
+                },
+            }
+            continue;
+        }
+        const sh = hostShape2(value);
+        const data = copyToHostF32(allocator, value, s) catch {
+            _ = mlx.mlx_array_free(value);
+            return error.AccHeadReadFailed;
+        };
+        _ = mlx.mlx_array_free(value);
+        const gop = try rest.getOrPut(kspan);
+        if (!gop.found_existing) gop.key_ptr.* = try allocator.dupe(u8, kspan);
+        if (gop.found_existing) allocator.free(gop.value_ptr.data);
+        gop.value_ptr.* = .{ .data = data, .rows = sh.rows, .cols = sh.cols };
+    }
+
+    if (proj_w == null or proj_b == null or aud_w == null or aud_b == null)
+        return error.AccMissingHeads;
+    var video = try ingestHead(allocator, &proj_w, &proj_b, pdd_acc.NATIVE_VIDEO_OUT, s);
+    errdefer video.deinit(allocator);
+    var audio = try ingestHead(allocator, &aud_w, &aud_b, pdd_acc.NATIVE_AUDIO_OUT, s);
+    errdefer audio.deinit(allocator);
+
+    var trunk: File = undefined;
+    if (converted_format) {
+        var entries: std.ArrayList(Entry) = .empty;
+        errdefer {
+            for (entries.items) |*e| {
+                allocator.free(e.module);
+                _ = mlx.mlx_array_free(e.at);
+                _ = mlx.mlx_array_free(e.bt);
+            }
+            entries.deinit(allocator);
+        }
+        var pit = partials.iterator();
+        while (pit.next()) |e| {
+            const p = e.value_ptr;
+            if (p.a.ctx == null or p.b.ctx == null) continue;
+            const full_rank: c_int = mlx.getShape(p.a)[0];
+            var canon_bufs: [MAX_FANOUT]CanonBuf = undefined;
+            var canon_out: [MAX_FANOUT]CanonMatch = undefined;
+            const matches = canonicalize(e.key_ptr.*, p.flat, .minimax_h3, &canon_bufs, &canon_out);
+            for (matches) |m| {
+                const idx = splitIndex(m.split);
+                const at = try prepTransposed(p.a, s);
+                errdefer _ = mlx.mlx_array_free(at);
+                const bt = if (idx) |si| try prepTransposedThird(p.b, si, s) else try prepTransposed(p.b, s);
+                errdefer _ = mlx.mlx_array_free(bt);
+                const scale: f32 = if (p.alpha) |al|
+                    al / @as(f32, @floatFromInt(full_rank))
+                else
+                    file_scale orelse 1.0;
+                try entries.append(allocator, .{
+                    .module = try allocator.dupe(u8, m.canon),
+                    .at = at,
+                    .bt = bt,
+                    .scale = scale,
+                });
+            }
+        }
+        trunk = .{ .allocator = allocator, .entries = try entries.toOwnedSlice(allocator) };
+    } else {
+        const converted = try convertOriginalAcc(allocator, &rest, meta_alpha);
+        defer {
+            for (converted) |*c| c.deinit(allocator);
+            allocator.free(converted);
+        }
+        trunk = try fileFromConverted(allocator, converted, s);
+    }
+    errdefer trunk.deinit();
+    log.info("[lora] Acc {s}: {d} trunk modules, video heads {d}x{d}x{d}, audio {d}x{d}x{d}\n", .{
+        std.fs.path.basename(path),
+        trunk.entries.len,
+        video.n, video.out, video.in_dim,
+        audio.n, audio.out, audio.in_dim,
+    });
+
+    return .{
+        .trunk = trunk,
+        .heads = .{
+            .video = video,
+            .audio = audio,
+            .partition = meta_part,
+            .alpha = meta_alpha,
+        },
+    };
+}
+
 /// `Split` → which third (0/1/2) of a 3-way fused source it draws from, or
 /// `null` for an already-1:1 (`.none`) match.
 fn splitIndex(sp: Split) ?u2 {
@@ -842,6 +1415,13 @@ test "parseKey classifies diffusers + kohya LoRA keys and strips wrappers" {
     // non-LoRA keys are ignored
     try testing.expect(parseKey("blocks.2.mlp.gate.weight") == null);
     try testing.expect(parseKey("bn.running_mean") == null);
+    // Original Acc files omit `.weight` on lora_down/up.
+    const od = parseKey("transformer_blocks.0.attn.to_q.lora_down").?;
+    try testing.expectEqual(Role.a, od.role);
+    try testing.expectEqualStrings("transformer_blocks.0.attn.to_q", od.module);
+    const ou = parseKey("transformer_blocks.0.attn.to_q.lora_up").?;
+    try testing.expectEqual(Role.b, ou.role);
+    try testing.expect(parseKey("proj_out.weight") == null);
 }
 
 test "delta computes scale·(x@Aᵀ)@Bᵀ" {
@@ -1354,4 +1934,171 @@ test "loadFile rejects a MISSING file before mlx can kill the process" {
     try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, buf[0..root_len], .generic));
     try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, "rel/lora.safetensors", .generic));
     try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, "", .generic));
+}
+
+test "loadFile skips Acc PDD head-bank tensors (Comfy crash class)" {
+    // A packed [6,4] proj_out is 3× a native-out-2 head. Copying it onto the
+    // native linear is how Comfy crashed; the generic loader must ignore it
+    // and still attach the trunk LoRA pair.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/MiniMax-H3-FL2VA-Acc-8Step.safetensors", .{buf[0..root_len]});
+    defer testing.allocator.free(path);
+
+    const tmap = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(tmap);
+    var pw: [6 * 4]f32 = @splat(1);
+    var pb: [6]f32 = @splat(0);
+    var aw: [6 * 4]f32 = @splat(1);
+    var ab: [6]f32 = @splat(0);
+    var la: [2 * 4]f32 = @splat(0.1);
+    var lb: [4 * 2]f32 = @splat(0.2);
+    const psh = [_]c_int{ 6, 4 };
+    const bsh = [_]c_int{6};
+    const ash = [_]c_int{ 2, 4 };
+    const lsh = [_]c_int{ 4, 2 };
+    const parr = mlx.mlx_array_new_data(&pw, &psh, 2, .float32);
+    const pbarr = mlx.mlx_array_new_data(&pb, &bsh, 1, .float32);
+    const aarr = mlx.mlx_array_new_data(&aw, &psh, 2, .float32);
+    const abarr = mlx.mlx_array_new_data(&ab, &bsh, 1, .float32);
+    const laarr = mlx.mlx_array_new_data(&la, &ash, 2, .float32);
+    const lbarr = mlx.mlx_array_new_data(&lb, &lsh, 2, .float32);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "proj_out.weight", parr);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "proj_out.bias", pbarr);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "audio_proj_out.weight", aarr);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "audio_proj_out.bias", abarr);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "blocks.0.attn.qkv_proj.lora_A.weight", laarr);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "blocks.0.attn.qkv_proj.lora_B.weight", lbarr);
+    _ = mlx.mlx_array_free(parr);
+    _ = mlx.mlx_array_free(pbarr);
+    _ = mlx.mlx_array_free(aarr);
+    _ = mlx.mlx_array_free(abarr);
+    _ = mlx.mlx_array_free(laarr);
+    _ = mlx.mlx_array_free(lbarr);
+    const mmap = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(mmap);
+    const pathz = try testing.allocator.dupeSentinel(u8, path, 0);
+    defer testing.allocator.free(pathz);
+    try mlx.check(mlx.mlx_save_safetensors(pathz, tmap, mmap));
+
+    var file = try loadFile(testing.allocator, path, .minimax_h3);
+    defer file.deinit();
+    try testing.expect(file.find("proj_out") == null);
+    try testing.expect(file.find("audio_proj_out") == null);
+    try testing.expect(file.find("final_layer.video_out") == null);
+    try testing.expect(file.find("blocks.0.attn.qkv_proj") != null);
+}
+
+test "loadPddAcc peels heads and converts one original qkv/fc1 block" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/tiny-pdd-acc.safetensors", .{buf[0..root_len]});
+    defer testing.allocator.free(path);
+
+    const tmap = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(tmap);
+    const n_fine: c_int = 2;
+    const v_out: c_int = 96;
+    const a_out: c_int = 32;
+    const in_h: c_int = 4;
+    const vw = try testing.allocator.alloc(f32, @intCast(n_fine * v_out * in_h));
+    defer testing.allocator.free(vw);
+    @memset(vw, 1);
+    const vb = try testing.allocator.alloc(f32, @intCast(n_fine * v_out));
+    defer testing.allocator.free(vb);
+    @memset(vb, 0);
+    const aw = try testing.allocator.alloc(f32, @intCast(n_fine * a_out * in_h));
+    defer testing.allocator.free(aw);
+    @memset(aw, 1);
+    const ab = try testing.allocator.alloc(f32, @intCast(n_fine * a_out));
+    defer testing.allocator.free(ab);
+    @memset(ab, 0);
+    const vsh = [_]c_int{ n_fine, v_out, in_h };
+    const vbsh = [_]c_int{ n_fine, v_out };
+    const ash = [_]c_int{ n_fine, a_out, in_h };
+    const absh = [_]c_int{ n_fine, a_out };
+    const vw_a = mlx.mlx_array_new_data(vw.ptr, &vsh, 3, .float32);
+    const vb_a = mlx.mlx_array_new_data(vb.ptr, &vbsh, 2, .float32);
+    const aw_a = mlx.mlx_array_new_data(aw.ptr, &ash, 3, .float32);
+    const ab_a = mlx.mlx_array_new_data(ab.ptr, &absh, 2, .float32);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "proj_out.weight", vw_a);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "proj_out.bias", vb_a);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "audio_proj_out.weight", aw_a);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "audio_proj_out.bias", ab_a);
+    _ = mlx.mlx_array_free(vw_a);
+    _ = mlx.mlx_array_free(vb_a);
+    _ = mlx.mlx_array_free(aw_a);
+    _ = mlx.mlx_array_free(ab_a);
+
+    const r: c_int = 2;
+    const o: c_int = 3;
+    const h: c_int = 4;
+    const ffn: c_int = 2;
+    var down = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
+    var up_q = [_]f32{ 1, 0, 0, 1, 2, 0 };
+    var up_k = [_]f32{ 3, 0, 0, 3, 4, 0 };
+    var up_v = [_]f32{ 5, 0, 0, 5, 6, 0 };
+    var up_o = [_]f32{ 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08 };
+    var down_o = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6 };
+    var down_fc1 = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
+    var up_fc1 = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 }; // [2f=4, r=2]
+    var down_fc2 = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
+    var up_fc2 = [_]f32{ 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08 };
+    var down_ad = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
+    var up_ad = [_]f32{ 1, 0, 0, 1, 2, 0 };
+    const dsh = [_]c_int{ r, h };
+    const ush = [_]c_int{ o, r };
+    const osh = [_]c_int{ h, r };
+    const dosh = [_]c_int{ r, o };
+    const fc1ush = [_]c_int{ 2 * ffn, r };
+    const fc2dsh = [_]c_int{ r, ffn };
+    const fc2ush = [_]c_int{ h, r };
+    const put = struct {
+        fn f(map: mlx.mlx_map_string_to_array, name: [*:0]const u8, data: []f32, sh: []const c_int) void {
+            const arr = mlx.mlx_array_new_data(data.ptr, sh.ptr, @intCast(sh.len), .float32);
+            _ = mlx.mlx_map_string_to_array_insert(map, name, arr);
+            _ = mlx.mlx_array_free(arr);
+        }
+    }.f;
+    put(tmap, "transformer_blocks.0.attn.to_q.lora_down", &down, &dsh);
+    put(tmap, "transformer_blocks.0.attn.to_q.lora_up", &up_q, &ush);
+    put(tmap, "transformer_blocks.0.attn.to_k.lora_down", &down, &dsh);
+    put(tmap, "transformer_blocks.0.attn.to_k.lora_up", &up_k, &ush);
+    put(tmap, "transformer_blocks.0.attn.to_v.lora_down", &down, &dsh);
+    put(tmap, "transformer_blocks.0.attn.to_v.lora_up", &up_v, &ush);
+    put(tmap, "transformer_blocks.0.attn.to_out.0.lora_down", &down_o, &dosh);
+    put(tmap, "transformer_blocks.0.attn.to_out.0.lora_up", &up_o, &osh);
+    put(tmap, "transformer_blocks.0.ff.net.0.proj.lora_down", &down_fc1, &dsh);
+    put(tmap, "transformer_blocks.0.ff.net.0.proj.lora_up", &up_fc1, &fc1ush);
+    put(tmap, "transformer_blocks.0.ff.net.2.lora_down", &down_fc2, &fc2dsh);
+    put(tmap, "transformer_blocks.0.ff.net.2.lora_up", &up_fc2, &fc2ush);
+    put(tmap, "transformer_blocks.0.adaln_proj.linear.lora_down", &down_ad, &dsh);
+    put(tmap, "transformer_blocks.0.adaln_proj.linear.lora_up", &up_ad, &ush);
+
+    const mmap = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(mmap);
+    _ = mlx.mlx_map_string_to_string_insert(mmap, "lora_alpha", "64.0");
+    const pathz = try testing.allocator.dupeSentinel(u8, path, 0);
+    defer testing.allocator.free(pathz);
+    try mlx.check(mlx.mlx_save_safetensors(pathz, tmap, mmap));
+
+    var acc = try loadPddAcc(testing.allocator, path);
+    defer acc.trunk.deinit();
+    defer acc.heads.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 2), acc.heads.video.n);
+    try testing.expectEqual(@as(u32, 96), acc.heads.video.out);
+    try testing.expectEqual(@as(u32, 32), acc.heads.audio.out);
+    try testing.expect(acc.trunk.find("blocks.0.attn.qkv_proj") != null);
+    try testing.expect(acc.trunk.find("blocks.0.attn.out_proj") != null);
+    try testing.expect(acc.trunk.find("blocks.0.mlp.fc1") != null);
+    try testing.expect(acc.trunk.find("blocks.0.mlp.fc2") != null);
+    try testing.expect(acc.trunk.find("blocks.0.adaln_proj.linear") != null);
+    try testing.expect(acc.trunk.find("proj_out") == null);
+    try testing.expectEqual(@as(usize, 5), acc.trunk.entries.len);
 }

@@ -319,9 +319,9 @@ test "parsePreview is off by default and clamps frames / max_side" {
 test "preview SSE event carries JPEG b64 and is absent when the flag is off" {
     var sv: [2]std.posix.fd_t = undefined;
     try std.testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    const stream: std.Io.net.Stream = .{ .socket = .{ .handle = sv[0], .address = undefined } };
     var conn: Conn = undefined;
-    conn.stream = .{ .socket = .{ .handle = sv[0], .address = undefined } };
-    conn.ollama_sink = null;
+    Conn.init(&conn, stream, std.testing.io);
 
     var sctx = StreamCtx{
         .conn = &conn,

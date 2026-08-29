@@ -124,6 +124,7 @@ final class VideoSettingsSidecarTests: XCTestCase {
         XCTAssertFalse(text.contains("reference_audio_"))
         XCTAssertTrue(text.contains("fast_recipe: true"))
         XCTAssertTrue(text.contains("turbo: false"))
+        XCTAssertTrue(text.contains("acc: false"))
         XCTAssertTrue(text.contains("chain_windows: 1"))
     }
 
@@ -135,6 +136,17 @@ final class VideoSettingsSidecarTests: XCTestCase {
         let text = VideoGenService.settingsText(req, modelId: "h3")
         XCTAssertTrue(text.contains("turbo: true"))
         XCTAssertTrue(text.contains("fast_recipe: false"))
+    }
+
+    func testAccRecordsFastRecipeAsDisabled() {
+        var req = VideoGenRequest(model: .minimaxH3, prompt: "p", width: 960, height: 544,
+                                  numFrames: 90, fps: 24, mode: .oneStage,
+                                  steps: 8, cfgScale: 1.0)
+        req.acc = true
+        let text = VideoGenService.settingsText(req, modelId: "h3")
+        XCTAssertTrue(text.contains("acc: true"))
+        XCTAssertTrue(text.contains("fast_recipe: false"))
+        XCTAssertFalse(text.contains("turbo: true"))
     }
 
     func testSidecarPathAndAtomicWrite() throws {
