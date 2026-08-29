@@ -49,6 +49,12 @@ pub fn build(b: *std.Build) void {
         verifyMlxStage(b);
     }
 
+    // Hermetic Latent2RGB/JPEG tests: no MLX, no Homebrew webp. Linux Cloud
+    // Agents (and `zig build preview-test` on a Mac) run this graph only.
+    // Native query — do not inherit the macOS 26.2 minos default_target.
+    addPreviewTest(b, b.resolveTargetQuery(.{}));
+    if (builtin.os.tag != .macos) return;
+
     // App version. Release builds pass it explicitly (app/build.sh computes the
     // next CalVer from the GitHub releases and stamps it into app/Info.plist;
     // the release workflow passes the tag). A plain `zig build` used to fall
@@ -268,6 +274,32 @@ pub fn build(b: *std.Build) void {
     const ios_include = b.option([]const u8, "ios-include", "Include dir for webp/stb headers when cross-compiling the iOS lib") orelse "/opt/homebrew/include";
     addIosLib(b, version, ios_include, .{ .step = "ios-lib", .abi = .none, .sdk = "iphoneos" });
     addIosLib(b, version, ios_include, .{ .step = "ios-lib-sim", .abi = .simulator, .sdk = "iphonesimulator" });
+}
+
+/// Hermetic Latent2RGB + JPEG tests. No MLX, no Homebrew — the only `zig build`
+/// graph that is valid on Linux (issue #208).
+fn addPreviewTest(b: *std.Build, target: std.Build.ResolvedTarget) void {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/preview.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    // stb JPEG bit-packer relies on wrapping left shifts of a signed int.
+    // Zig's Debug C frontend traps that (`bitBuf <<= 8`); this graph is the
+    // Linux-runnable test, so compile the C without UBSan.
+    mod.addCSourceFile(.{
+        .file = b.path("lib/stb_image_write_impl.c"),
+        .flags = &.{ "-O2", "-fno-sanitize=undefined" },
+    });
+    mod.addIncludePath(b.path("lib"));
+    const tests = b.addTest(.{
+        .name = "preview-test",
+        .root_module = mod,
+    });
+    const run = b.addRunArtifact(tests);
+    const step = b.step("preview-test", "Hermetic JPEG / Latent2RGB preview tests (no MLX)");
+    step.dependOn(&run.step);
 }
 
 /// `zig build vz-agent` → `zig-out/guest/vz-agent` (static aarch64 Linux ELF),

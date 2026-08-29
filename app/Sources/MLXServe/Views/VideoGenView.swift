@@ -1316,6 +1316,13 @@ struct VideoGenView: View {
                     ContentUnavailableView("No generation yet", systemImage: "film", description: Text("Enter a prompt and press Generate."))
                 case .running(let step, let total, let message):
                     VStack(spacing: 12) {
+                        if let img = service.livePreview {
+                            Image(nsImage: img)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(maxHeight: 220)
+                                .clipShape(RoundedRectangle(cornerRadius: 6))
+                        }
                         ProgressView(value: Double(step), total: max(1, Double(total)))
                             .progressViewStyle(.linear)
                             .frame(width: 240)

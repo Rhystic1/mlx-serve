@@ -30,3 +30,15 @@ export PATH="$PWD/.zig-toolchain:$PATH"
 ./scripts/fetch-llama.sh && ./scripts/build-mlx.sh   # once, and again on a pin bump
 zig build -Doptimize=ReleaseFast                     # always ReleaseFast; Debug is 2-4x slower
 ```
+
+## Hermetic tests (Linux too)
+
+The server itself is macOS / Apple Silicon only. The per-step preview encoder (`src/preview.zig` + `src/jpeg.zig`) has no MLX dependency and is the graph Cloud Agents can run:
+
+```bash
+./scripts/fetch-zig.sh
+export PATH="$PWD/.zig-toolchain:$PATH"
+zig build preview-test
+```
+
+On a Mac, `zig build test` also compiles those files as part of the full suite.

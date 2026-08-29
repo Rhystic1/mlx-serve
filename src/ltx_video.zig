@@ -3011,7 +3011,67 @@ pub const ProgressWindow = struct {
     label: []const u8 = "Generating",
     base: u32 = 0,
     total: u32 = 0, // 0 → use the sampler's own step count
+    /// Latent volume for opt-in per-step JPEG (#208). Zero F → no preview.
+    preview_f: u32 = 0,
+    preview_h: u32 = 0,
+    preview_w: u32 = 0,
+    preview_first_frame: bool = false,
 };
+
+fn copyArrayF32(alloc: std.mem.Allocator, x: mlx.mlx_array, s: S) ![]f32 {
+    const f = try asF32(x, s);
+    defer _ = mlx.mlx_array_free(f);
+    var c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_contiguous(&c, f, false, s));
+    try mlx.check(mlx.mlx_array_eval(c));
+    const n: usize = mlx.mlx_array_size(c);
+    const raw = mlx.mlx_array_data_float32(c) orelse return error.NoData;
+    return alloc.dupe(f32, raw[0..n]);
+}
+
+/// Predicted clean video x0 (already unguided/guided) → Latent2RGB JPEG.
+/// Failures fall back to a preview-less progress event.
+fn tryEmitLtxPreview(
+    p: Progress,
+    alloc: std.mem.Allocator,
+    win: ProgressWindow,
+    step: u32,
+    total: u32,
+    x0_tokens: mlx.mlx_array,
+    s: S,
+) void {
+    if (!p.wantsPreview() or win.preview_f == 0 or win.preview_h == 0 or win.preview_w == 0) {
+        p.emit(win.label, step, total);
+        return;
+    }
+    const frame = renderLtxPreview(alloc, p.preview_opts, win, x0_tokens, s) catch {
+        p.emit(win.label, step, total);
+        return;
+    };
+    defer alloc.free(frame.jpeg);
+    p.emitPreview(win.label, step, total, frame);
+}
+
+fn renderLtxPreview(
+    alloc: std.mem.Allocator,
+    opts: @import("preview.zig").Opts,
+    win: ProgressWindow,
+    x0_tokens: mlx.mlx_array,
+    s: S,
+) !@import("preview.zig").Encoded {
+    const preview_mod = @import("preview.zig");
+    const shp = mlx.getShape(x0_tokens);
+    if (shp.len < 3) return error.BadLatentShape;
+    const nv: u32 = @intCast(shp[1]);
+    if (nv != win.preview_f * win.preview_h * win.preview_w) return error.BadLatentShape;
+    const vol = try unpatchifyVideo(x0_tokens, win.preview_f, win.preview_h, win.preview_w, s);
+    defer _ = mlx.mlx_array_free(vol);
+    const cpu = try copyArrayF32(alloc, vol, s);
+    defer alloc.free(cpu);
+    const c: u32 = 128;
+    return preview_mod.jpegFromLatent(alloc, cpu, c, win.preview_f, win.preview_h, win.preview_w, opts, win.preview_first_frame);
+}
 
 /// One guided x0 prediction for both modalities (reference guided_denoise_loop
 /// steps 1-5): conditional forward, plus the unconditional / STG-perturbed /
@@ -3174,7 +3234,7 @@ pub fn ditSampleCfg(
         _ = mlx.mlx_array_eval(vx);
         _ = mlx.mlx_array_eval(ax);
         if (progress) |p| {
-            p.emit(win.label, win.base + @as(u32, @intCast(i + 1)), total);
+            tryEmitLtxPreview(p, alloc, win, win.base + @as(u32, @intCast(i + 1)), total, x0.v, s);
             // Client hung up (progress write failed) → stop burning GPU on a
             // video nobody will receive; the queued next request unblocks.
             if (p.cancelled()) {
@@ -3555,7 +3615,8 @@ pub fn ditSampleRes2s(
         _ = mlx.mlx_array_eval(vx);
         _ = mlx.mlx_array_eval(ax);
         if (progress) |p| {
-            p.emit(win.label, win.base + @as(u32, @intCast(step + 1)), total);
+            // d2.v is the second-stage x0 prediction (the later, refined one).
+            tryEmitLtxPreview(p, alloc, win, win.base + @as(u32, @intCast(step + 1)), total, d2.v, s);
             // vx/ax are released by the function's errdefers.
             if (p.cancelled()) return error.Cancelled;
         }
@@ -4157,7 +4218,15 @@ pub fn generateVideoFrames(
 
     // ── denoise ──
     const total_steps: u32 = @intCast(sigmas.len - 1);
-    const final = try ditSampleCfg(transformer, alloc, cfg, sampler_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, sampler_vpos, apos, sigmas, vp, ap, cond_mask, clean_v, null, progress, .{ .label = "Generating", .base = 0, .total = total_steps }, s);
+    const final = try ditSampleCfg(transformer, alloc, cfg, sampler_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, sampler_vpos, apos, sigmas, vp, ap, cond_mask, clean_v, null, progress, .{
+        .label = "Generating",
+        .base = 0,
+        .total = total_steps,
+        .preview_f = F,
+        .preview_h = H,
+        .preview_w = W,
+        .preview_first_frame = cond_image != null,
+    }, s);
     defer _ = mlx.mlx_array_free(final.v);
     // final.a (audio latent [1, Na, 128]) is transferred to the caller below for
     // optional audio decode; if anything fails before then, free it.
@@ -4483,7 +4552,15 @@ pub fn generateVideoFramesTwoStage(
 
     const stage1_v = if (cond1) |c| c.init_latent else noise_v1;
     const stage1_vpos = if (cond1) |c| c.positions else vpos1;
-    const win1 = ProgressWindow{ .label = "Stage 1", .base = 0, .total = total };
+    const win1 = ProgressWindow{
+        .label = "Stage 1",
+        .base = 0,
+        .total = total,
+        .preview_f = F,
+        .preview_h = H1,
+        .preview_w = W1,
+        .preview_first_frame = cond_image_half != null,
+    };
     const out1 = if (opts.hq)
         try ditSampleRes2s(transformer, alloc, cfg, stage1_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, stage1_vpos, apos, sigmas1, vp, ap1, if (cond1) |c| c.mask else null, if (cond1) |c| c.clean else null, audio_cond, seed, progress, win1, s)
     else
@@ -4545,7 +4622,15 @@ pub fn generateVideoFramesTwoStage(
 
     const stage2_v = if (cond2) |c| c.init_latent else noisy_v2;
     const stage2_vpos = if (cond2) |c| c.positions else vpos2;
-    const out2 = try ditSampleCfg(dit2, alloc, cfg, stage2_v, noisy_a2, pos.video, pos.audio, null, null, stage2_vpos, apos, sigmas2, .{}, .{}, if (cond2) |c| c.mask else null, if (cond2) |c| c.clean else null, null, progress, .{ .label = "Stage 2", .base = opts.stage1_steps, .total = total }, s);
+    const out2 = try ditSampleCfg(dit2, alloc, cfg, stage2_v, noisy_a2, pos.video, pos.audio, null, null, stage2_vpos, apos, sigmas2, .{}, .{}, if (cond2) |c| c.mask else null, if (cond2) |c| c.clean else null, null, progress, .{
+        .label = "Stage 2",
+        .base = opts.stage1_steps,
+        .total = total,
+        .preview_f = F,
+        .preview_h = H2,
+        .preview_w = W2,
+        .preview_first_frame = cond_image_full != null,
+    }, s);
     defer _ = mlx.mlx_array_free(out2.v);
     // stage-2 audio replaces stage-1 as the decoded track.
     _ = mlx.mlx_array_free(audio1.?);

@@ -51,6 +51,9 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertEqual(body["seed"] as? Int, 42)
         // first_frame_image stays conditional — absent when there's no image.
         XCTAssertNil(body["first_frame_image"])
+        XCTAssertEqual(body["preview"] as? Bool, true)
+        XCTAssertEqual(body["preview_frames"] as? Int, 1)
+        XCTAssertEqual(body["preview_max_side"] as? Int, 256)
     }
 
     func testDiffusionDecoderFieldIsGatedOnThePacksOwnCapability() {
@@ -1470,7 +1473,7 @@ extension MediaGenServiceTests {
         // Adapters DO travel — H3 resolves them against its own module names.
         XCTAssertEqual(body["lora_paths"] as? [String], ["/tmp/some.safetensors"])
         // The fields every backend needs must still be there.
-        for k in ["model", "prompt", "num_frames", "height", "width", "steps", "seed"] {
+        for k in ["model", "prompt", "num_frames", "height", "width", "steps", "seed", "preview", "preview_frames", "preview_max_side"] {
             XCTAssertNotNil(body[k], "\(k) must always be sent")
         }
 
