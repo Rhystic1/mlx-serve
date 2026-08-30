@@ -203,8 +203,9 @@ pub const NgramTable = struct {
         std.posix.munmap(self.map);
     }
 
-    /// Dequantize one row into `out[0..dim]` (MLX affine layout: element i
-    /// sits at bits [(i % per_word) * bits ..] of word i / per_word).
+    /// Dequantize one row into `out[0..dim]` (mx.quantize packing: element i
+    /// sits at bit offset i * bits of the little-endian u32 stream and may
+    /// straddle a word boundary at 3/5/6 bits).
     pub fn row(self: *const NgramTable, r: u64, out: []f32) void {
         std.debug.assert(r < self.rows and out.len >= self.dim);
         const words = self.map[self.w_off + r * self.wcols * 4 ..][0 .. self.wcols * 4];
@@ -214,12 +215,15 @@ pub const NgramTable = struct {
     }
 
     fn dequantRow(self: *const NgramTable, words: []const u8, scales: []const u8, biases: []const u8, out: []f32) void {
-        const per_word: u32 = 32 / self.bits;
         const mask: u32 = (@as(u32, 1) << @intCast(self.bits)) - 1;
         var i: u32 = 0;
         while (i < self.dim) : (i += 1) {
-            const word = std.mem.readInt(u32, words[(i / per_word) * 4 ..][0..4], .little);
-            const q: u32 = (word >> @intCast((i % per_word) * self.bits)) & mask;
+            const off = i * self.bits;
+            const w = off / 32;
+            const shift = off % 32;
+            var v: u64 = std.mem.readInt(u32, words[w * 4 ..][0..4], .little);
+            if (shift + self.bits > 32) v |= @as(u64, std.mem.readInt(u32, words[w * 4 + 4 ..][0..4], .little)) << 32;
+            const q: u32 = @truncate((v >> @intCast(shift)) & mask);
             const g = i / self.group_size;
             const sc = bf16ToF32(std.mem.readInt(u16, scales[g * 2 ..][0..2], .little));
             const bi = bf16ToF32(std.mem.readInt(u16, biases[g * 2 ..][0..2], .little));
@@ -439,6 +443,40 @@ test "ngram table row dequant follows the MLX affine nibble layout" {
     try testing.expectEqual(@as(f32, 0.5 * 15 + 1.0), out[31]);
     t.row(1, &out);
     try testing.expectEqual(@as(f32, 5.0), out[13]);
+}
+
+test "ngram table row dequant reads the dense mx.quantize packing at every width" {
+    // mx.quantize packs element i at bit offset i*bits of the little-endian
+    // u32 stream (wcols = dim*bits/32); at 3/5/6 bits elements straddle words.
+    // dim 32, one group, q[i] = i % 4, scale 1, bias 0 ⇒ out[i] == i % 4.
+    inline for ([_]u32{ 2, 3, 4, 5, 6, 8 }) |bits| {
+        const wcols = 32 * bits / 32;
+        var packed_words: [8]u32 = @splat(0);
+        var i: u32 = 0;
+        while (i < 32) : (i += 1) {
+            const off = i * bits;
+            const q: u64 = i % 4;
+            const w = off / 32;
+            packed_words[w] |= @truncate(q << @intCast(off % 32));
+            if (off % 32 + bits > 32) packed_words[w + 1] |= @truncate(q >> @intCast(32 - off % 32));
+        }
+        var hbuf: [256]u8 = undefined;
+        const header = try std.fmt.bufPrint(&hbuf, "{{\"__metadata__\":{{\"bits\":\"{d}\",\"group_size\":\"32\"}},\"weight\":{{\"dtype\":\"U32\",\"shape\":[1,{d}],\"data_offsets\":[0,{d}]}},\"scales\":{{\"dtype\":\"BF16\",\"shape\":[1,1],\"data_offsets\":[{d},{d}]}},\"biases\":{{\"dtype\":\"BF16\",\"shape\":[1,1],\"data_offsets\":[{d},{d}]}}}}", .{ bits, wcols, wcols * 4, wcols * 4, wcols * 4 + 2, wcols * 4 + 2, wcols * 4 + 4 });
+        const total = 8 + 256 + wcols * 4 + 4;
+        const buf = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), total);
+        defer std.heap.page_allocator.free(buf);
+        @memset(buf, ' ');
+        std.mem.writeInt(u64, buf[0..8], 256, .little);
+        @memcpy(buf[8 .. 8 + header.len], header);
+        const data = buf[264..];
+        for (0..wcols) |w| std.mem.writeInt(u32, data[w * 4 ..][0..4], packed_words[w], .little);
+        std.mem.writeInt(u16, data[wcols * 4 ..][0..2], 0x3F80, .little);
+        std.mem.writeInt(u16, data[wcols * 4 + 2 ..][0..2], 0, .little);
+        const t = try NgramTable.parse(buf, buf[8..264], 264);
+        var out: [32]f32 = undefined;
+        t.row(0, &out);
+        for (out, 0..) |v, k| try testing.expectEqual(@as(f32, @floatFromInt(k % 4)), v);
+    }
 }
 
 /// Module-owned state for one loaded qwen4_exp model: the n-gram hash and
