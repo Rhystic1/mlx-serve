@@ -385,6 +385,14 @@ and they are listed because they made that work possible.
     layout and its dual sigma schedule. Its layout/schedule output is executed
     directly as a parity oracle by `tests/dump_minimax_h3_layout.py`; the
     fixtures it produces are golden values, not source.
+  * ComfyUI's `comfy/latent_formats.py` and `latent_preview.py` (GPL-3.0), the
+    reference for the per-step denoise preview: the published latent-to-RGB
+    fits `LTXAV` (128 channels) and `MiniMaxH3Video` (24), and the
+    `Latent2RGBPreviewer` + `preview_to_image` arithmetic they are applied
+    with. `tests/dump_latent_rgb_factors.py` EXECUTES those classes to emit
+    `src/latent_rgb.zig` and `src/fixtures/latent_rgb.json`; the coefficients
+    and reference outputs it produces are golden values, not source, and no
+    ComfyUI code is transcribed or shipped.
   * Larryvrh/ComfyUI-MiniMax-H3-Turbo (Apache-2.0), whose `_turbo_sampler`
     is the reference for stepping H3's audio stream by the exact mapped
     delta-sigma at low step counts (`minimax_h3.audioStepFactor`). The Turbo

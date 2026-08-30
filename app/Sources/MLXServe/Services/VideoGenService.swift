@@ -492,12 +492,16 @@ final class VideoGenService: ObservableObject {
             // `match` is the server's default; only an opt-out is stated.
             if request.refImageSize != .match { body["ref_image_size"] = request.refImageSize.rawValue }
         }
-        // Per-step JPEG previews on the SSE stream (issue #208). The pane
-        // always streams, so this is the honest opt-in; absent stays the
-        // default off for other clients.
-        body["preview"] = true
-        body["preview_frames"] = 1
-        body["preview_max_side"] = 256
+        // Per-step latent previews on the SSE stream (issue #208), opt-in from
+        // the pane's own toggle. Absent = off, so a client that never asks
+        // pays nothing; asking costs an x0 solve plus a host copy of the
+        // previewed frames on every step.
+        if request.livePreview {
+            body["preview"] = true
+            body["preview_frames"] = 1
+            body["preview_max_side"] = 256
+        }
+
         return body
     }
 

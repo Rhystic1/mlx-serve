@@ -3448,7 +3448,8 @@ fn renderH3Preview(
     const idx = preview_mod.temporalIndices(&idx_buf, latent_t, opts.frames, first_frame);
     const n: u32 = @intCast(idx.len);
     const hw: usize = @as(usize, lat_h) * @as(usize, lat_w);
-    const packed_lat = try allocator.alloc(f32, 24 * @as(usize, n) * hw);
+    const c: usize = preview_mod.minimax_h3.channels();
+    const packed_lat = try allocator.alloc(f32, c * @as(usize, n) * hw);
     defer allocator.free(packed_lat);
     for (idx, 0..) |ti, fi| {
         const sl = try sliceLatentT(vol, @intCast(ti), s);
@@ -3456,12 +3457,12 @@ fn renderH3Preview(
         const cpu = try copyArrayF32(allocator, sl, s);
         defer allocator.free(cpu);
         // sl is [1,24,1,H,W] → C*H*W channel-major.
-        if (cpu.len < 24 * hw) return error.BadLatentShape;
-        for (0..24) |ci| {
+        if (cpu.len < c * hw) return error.BadLatentShape;
+        for (0..c) |ci| {
             @memcpy(packed_lat[ci * @as(usize, n) * hw + fi * hw ..][0..hw], cpu[ci * hw ..][0..hw]);
         }
     }
-    return preview_mod.jpegFromLatent(allocator, packed_lat, 24, n, lat_h, lat_w, .{
+    return preview_mod.jpegFromLatent(allocator, preview_mod.minimax_h3, packed_lat, n, lat_h, lat_w, .{
         .enabled = true,
         .frames = n,
         .max_side = opts.max_side,

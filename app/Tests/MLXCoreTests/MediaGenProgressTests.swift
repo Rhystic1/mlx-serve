@@ -93,7 +93,10 @@ final class MediaGenProgressTests: XCTestCase {
         XCTAssertEqual(MediaSSE.classify(ev), .progress(step: 8, total: 30, stage: "Generating"))
         XCTAssertEqual(MediaSSE.previewJPEG(ev), Data([0xFF, 0xD8, 0xFF, 0x00]))
         XCTAssertNil(MediaSSE.previewJPEG(["type": "progress", "step": 1]))
-        XCTAssertEqual(MediaSSE.previewJPEG(["image": b64]), Data([0xFF, 0xD8, 0xFF, 0x00]))
+        // `preview` is the ONE key the server emits. Reading invented aliases
+        // would make a typo look like a working client.
+        XCTAssertNil(MediaSSE.previewJPEG(["image": b64]))
+        XCTAssertNil(MediaSSE.previewJPEG(["b64_json": b64]))
     }
 
     func testStageNamesTheEnginesEmitBecomeReadableLabels() {
